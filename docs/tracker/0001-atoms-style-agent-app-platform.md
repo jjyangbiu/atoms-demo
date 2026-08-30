@@ -96,7 +96,7 @@ status: open
 
 ### 后端模块划分
 
-- **auth**：注册/登录/登出，passlib(bcrypt) 密码哈希，JWT（Bearer），用户数据隔离的依赖注入守卫。
+- **auth**：注册/登录/登出，密码哈希直接用 `bcrypt` 库（实现时修正：passlib 已停止维护，改用官方 bcrypt 库，哈希格式兼容），JWT（Bearer），用户数据隔离的依赖注入守卫。
 - **projects**：项目与生成文件的 CRUD、属主鉴权、文件落盘（`{存储根}/{项目id}/` 目录，写入前做路径穿越防护，仅允许白名单扩展名）。
 - **agent**：LangChain 工具调用智能体编排。工具集：`read_file` / `write_file` / `edit_file` / `search_templates`（RAG 检索）。工程师模式为单智能体循环；团队模式为两阶段（产品经理 prompt 产出 PRD → 用户确认消息 → 工程师循环）。全量流式经 SSE 推送：文本 delta 事件 + 工具调用事件 + 完成/失败事件。
 - **generation-limits**：令牌桶式限流——每用户每小时生成次数上限 + 全局同时进行中的生成并发上限；超限返回 429 及重试时间。

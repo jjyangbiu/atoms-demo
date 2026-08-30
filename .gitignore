@@ -179,3 +179,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Node / frontend
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# 运行时数据（SQLite、生成文件、Milvus）
+backend/data/
