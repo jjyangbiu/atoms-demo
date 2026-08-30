@@ -3,6 +3,7 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 pydantic-settings>=2.3
 sqlalchemy>=2.0
+langchain-openai>=1.0
 bcrypt>=4.1
 PyJWT>=2.8
 pytest>=8.2

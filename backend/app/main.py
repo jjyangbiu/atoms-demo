@@ -4,9 +4,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import sessionmaker
 
+from .agent.model import default_model_factory
 from .config import Settings, get_settings
 from .db import Base, make_engine
-from .routers import auth
+from .routers import auth, projects
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -14,6 +15,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="atoms-demo API", version="0.1.0")
     app.state.settings = settings
+    # 测试可替换为可编程伪模型工厂（见 tests/fake_model.py）
+    app.state.model_factory = default_model_factory
 
     engine = make_engine(settings.database_url)
     Base.metadata.create_all(engine)
@@ -29,6 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(auth.router)
+    app.include_router(projects.router)
 
     @app.get("/api/health")
     def health() -> dict:

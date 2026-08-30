@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -18,4 +18,50 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Project(Base):
+    """项目：用户创建的应用构建单元（见 CONTEXT.md）。"""
+
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # engineer | team（team 模式在后续工单交付）
+    mode: Mapped[str] = mapped_column(String(16), default="engineer", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ProjectFile(Base):
+    """生成文件索引：内容以磁盘为准，此表为索引。"""
+
+    __tablename__ = "project_files"
+    __table_args__ = (UniqueConstraint("project_id", "path"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    path: Mapped[str] = mapped_column(String(256), nullable=False)
+    size: Mapped[int] = mapped_column(default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class Message(Base):
+    """对话历史：含智能体文本与工具事件（kind=event 时 content 为 JSON）。"""
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    # user | pm | engineer | system
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    # text | prd | event
+    kind: Mapped[str] = mapped_column(String(16), default="text", nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

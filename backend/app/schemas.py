@@ -26,3 +26,32 @@ class UserOut(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+class CreateProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    mode: str = Field(default="engineer", pattern=r"^(engineer|team)$")
+
+
+class ProjectOut(BaseModel):
+    id: int
+    name: str
+    mode: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SendMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class MessageOut(BaseModel):
+    id: int
+    role: str
+    kind: str
+    content: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

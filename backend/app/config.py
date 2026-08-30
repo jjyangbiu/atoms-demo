@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     # 逗号分隔的前端来源（本地开发用）
     cors_origins: str = "http://localhost:5173"
 
+    # LLM（OpenAI 兼容），默认 MiniMax-M3；API Key 经环境变量注入，测试不依赖
+    llm_base_url: str = "https://api.minimaxi.com/v1"
+    llm_model: str = "MiniMax-M3"
+    llm_api_key: str = ""
+    llm_temperature: float = 0.2
+    # 智能体单次生成的最大工具循环步数与失败重试次数
+    agent_max_steps: int = 20
+    agent_max_retries: int = 2
+
 
 @lru_cache
 def get_settings() -> Settings:

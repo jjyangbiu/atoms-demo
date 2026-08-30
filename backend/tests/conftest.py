@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from fake_model import FakeModel
 
 
 @pytest.fixture
@@ -53,3 +54,10 @@ def login(client: TestClient, username: str, password: str) -> str:
 def auth_headers(client, registered_user) -> dict:
     token = login(client, registered_user["username"], registered_user["password"])
     return {"Authorization": f"Bearer {token}"}
+
+
+def use_fake_model(app, script: list) -> FakeModel:
+    """把应用的可编程伪模型工厂装上，返回伪模型实例供断言。"""
+    model = FakeModel(script)
+    app.state.model_factory = lambda settings: model
+    return model

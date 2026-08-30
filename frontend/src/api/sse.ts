@@ -1,0 +1,52 @@
+/**
+ * SSE 消费：fetch + ReadableStream（EventSource 无法携带 Authorization，故不用）。
+ * 事件协议与后端约定一致：每行 `data: {json}`，事件含 type 字段
+ * （text | tool | done | error）。
+ */
+
+import { ApiError, getToken } from '@/api/client'
+
+export interface SseEvent {
+  type: 'text' | 'tool' | 'done' | 'error' | string
+  [key: string]: unknown
+}
+
+export async function streamPost(
+  path: string,
+  body: unknown,
+  onEvent: (event: SseEvent) => void,
+): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const token = getToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  const resp = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) })
+  if (!resp.ok || !resp.body) {
+    let detail = resp.statusText
+    try {
+      const data = await resp.json()
+      if (typeof data?.detail === 'string') detail = data.detail
+    } catch {
+      /* 非 JSON 错误体 */
+    }
+    throw new ApiError(resp.status, detail)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+    for (const frame of frames) {
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('data: ')) {
+          onEvent(JSON.parse(line.slice(6)) as SseEvent)
+        }
+      }
+    }
+  }
+}
