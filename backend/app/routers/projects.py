@@ -13,23 +13,31 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..agent.loop import run_generation
-from ..agent.prompts import CLARIFIER_SYSTEM_PROMPT, SPEC_AGENT_SYSTEM_PROMPT, build_system_prompt
+from ..agent.prompts import (
+    BREAKER_SYSTEM_PROMPT,
+    CLARIFIER_SYSTEM_PROMPT,
+    SPEC_AGENT_SYSTEM_PROMPT,
+    build_system_prompt,
+)
 from ..agent.tools import (
     FileSandbox,
     SandboxViolation,
+    build_breaker_tools,
     build_clarify_tools,
     build_tools,
     execute_tool,
+    parse_ticket_payload,
     resolve_sandboxed,
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
-from ..models import Message, Project, ProjectFile, Publication, Snapshot, User, _utcnow
+from ..models import Message, Project, ProjectFile, Publication, Snapshot, Ticket, User, _utcnow
 from ..rag.store import maybe_knowledge_store
 from ..rate_limit import RateLimitRejected
 from ..schemas import (
     ConfirmConsensusRequest,
     ConfirmPrdRequest,
     ConfirmSpecRequest,
+    ConfirmTicketsRequest,
     CreateProjectRequest,
     FileContentOut,
     FileOut,
@@ -38,6 +46,7 @@ from ..schemas import (
     SendMessageRequest,
     SnapshotDetailOut,
     SnapshotOut,
+    TicketOut,
 )
 from ..snapshots import (
     create_snapshot,
@@ -126,6 +135,7 @@ def delete_project(
     db.execute(delete(ProjectFile).where(ProjectFile.project_id == project_id))
     db.execute(delete(Publication).where(Publication.project_id == project_id))
     db.execute(delete(Snapshot).where(Snapshot.project_id == project_id))
+    db.execute(delete(Ticket).where(Ticket.project_id == project_id))
     db.delete(project)
     db.commit()
     shutil.rmtree(project_dir(request, project_id), ignore_errors=True)
@@ -170,7 +180,8 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
             # 工具事件行、思考过程行与引导性系统消息不入上下文（工单 0010）
             continue
         if m.role == "user":
-            # 含 prd_confirm：确认消息（可含追加意见）以用户消息呈现，后续迭代可见（工单 0010）
+            # 含 prd_confirm/consensus_confirm/spec_confirm/tickets_confirm：
+            # 确认消息（可含追加意见）以用户消息呈现，后续阶段可见（工单 0010/0015/0016/0017）
             history.append(HumanMessage(content=m.content))
         elif m.kind == "prd":
             history.append(AIMessage(content=f"以下是我起草的 PRD：\n\n{m.content}"))
@@ -180,6 +191,9 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
         elif m.kind == "spec":
             # 需求规格入上下文：重新起草与后续实现都以最新规格为准（工单 0016）
             history.append(AIMessage(content=f"以下是澄清后起草的需求规格：\n\n{m.content}"))
+        elif m.kind == "tickets":
+            # 工单清单入上下文：重新拆解在旧清单基础上调整，执行阶段可见清单（工单 0017）
+            history.append(AIMessage(content=f"以下是拆解出的工单清单（JSON）：\n\n{m.content}"))
         else:
             history.append(AIMessage(content=m.content))
     if window > 0:
@@ -262,6 +276,31 @@ def _spec_state(db: Session, project_id: int) -> str:
     return "confirmed" if confirmed is not None else "pending"
 
 
+def _tickets_state(db: Session, project_id: int) -> str:
+    """团队模式的工单清单状态（工单 0017）：none | pending | confirmed。
+
+    与 _spec_state 同构，从对话历史推导：最近一条 tickets 消息之后是否存在确认消息。
+    """
+    last_tickets_id = db.scalar(
+        select(Message.id)
+        .where(Message.project_id == project_id, Message.kind == "tickets")
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    if last_tickets_id is None:
+        return "none"
+    confirmed = db.scalar(
+        select(Message.id)
+        .where(
+            Message.project_id == project_id,
+            Message.kind == "tickets_confirm",
+            Message.id > last_tickets_id,
+        )
+        .limit(1)
+    )
+    return "confirmed" if confirmed is not None else "pending"
+
+
 def _has_any_message(db: Session, project_id: int) -> bool:
     """项目是否已有对话消息：推导首建流水线是否已进入（名额语义，工单 0015 / ADR 0003）。
 
@@ -319,7 +358,7 @@ def _sse_response(stream) -> StreamingResponse:
 # 模型调用（工程师生成等）在入口处接受限流检查：
 # 超限直接 429（携带建议重试时间与 Retry-After 头），不落用户消息、不调模型；
 # 引导类响应（如未确认 PRD 的提示）不调模型，不计入限额；
-# 首建流水线内的后续阶段（澄清续轮、共识/规格确认）不另计数（ADR 0003）。
+# 首建流水线内的后续阶段（澄清续轮、共识/规格确认、拆单、工单清单确认）不另计数（ADR 0003）。
 # 全局名额自接受起占用，流结束（成功/失败/断流）时释放。
 
 
@@ -520,6 +559,138 @@ async def _spec_stream(request: Request, project_id: int, user_text: str, histor
     yield _sse({"type": "done", "text": spec_text})
 
 
+class _SubmitTicketsInvoked(Exception):
+    """拆单智能体调用 submit_tickets 的控制流信号：携工单清单 JSON 终止循环。"""
+
+    def __init__(self, raw: str):
+        self.raw = raw
+        super().__init__("submit_tickets")
+
+
+async def _break_stream(request: Request, project_id: int, user_text: str, history: list):
+    """拆单流（工单 0017）：规格确认后拆解为纵向切片工单清单卡片。
+
+    拆单智能体唯一工具是 submit_tickets（无任何文件工具，同澄清范式）：
+    - 清单非法（解析/校验失败）→ 错误文案经 ToolMessage 回传模型自行修正；
+    - 清单合法 → 以 tickets 事件外发并落库；旧的待确认清单整批替换，
+      新清单的序号在历史最大值上续编。不写文件、不留快照。
+    """
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    try:
+        model = request.app.state.model_factory(settings)
+    except Exception as e:  # noqa: BLE001 — 与其他阶段一致，环境问题以 error 事件收尾
+        yield _sse({"type": "error", "detail": str(e)})
+        return
+
+    def breaker_executor(tools, name, args):
+        if name == "submit_tickets":
+            raw = str((args or {}).get("tickets", ""))
+            tickets, reason = parse_ticket_payload(raw)
+            if tickets is None:
+                # 非法清单交还模型修正，不中断循环（重试上限兜底）
+                return False, f"工单清单不合法：{reason} 请修正后重新调用 submit_tickets。"
+            raise _SubmitTicketsInvoked(raw)
+        return execute_tool(tools, name, args)
+
+    submitted_raw: str | None = None
+    done_data: dict | None = None
+    errored = False
+    thinking_parts: list[str] = []
+    try:
+        async for event in run_generation(
+            model,
+            build_breaker_tools(),
+            breaker_executor,
+            BREAKER_SYSTEM_PROMPT,
+            history,
+            user_text,
+            max_steps=settings.agent_max_steps,
+            max_retries=settings.agent_max_retries,
+        ):
+            if event.type == "done":
+                done_data = event.data
+            else:
+                if event.type == "error":
+                    errored = True
+                if event.type == "thinking":
+                    thinking_parts.append(event.data.get("content", ""))
+                # submit_tickets 的工具事件不外发：拆单对用户只呈现清单卡片（同澄清）
+                if event.type != "tool":
+                    yield _sse({"type": event.type, **event.data})
+    except _SubmitTicketsInvoked as invoked:
+        submitted_raw = invoked.raw
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+        _persist_partial_thinking(session_factory, project_id, "breaker_agent", thinking_parts)
+        yield _sse({"type": "error", "detail": f"拆单中断: {e}"})
+        return
+    except BaseException:
+        # 刷新/断流触发的生成器关闭：落库已流出的思考后照旧退出（同澄清流）
+        _persist_partial_thinking(session_factory, project_id, "breaker_agent", thinking_parts)
+        raise
+
+    if submitted_raw is None:
+        # 模型未调 submit_tickets：拆解未收敛，明示错误（提示词已要求必调工具）
+        if not errored:
+            yield _sse({"type": "error", "detail": "拆单未产出工单清单"})
+        return
+
+    # 产出工单清单：卡片内容外发并落库，等待用户确认后才进入执行期（确认门，ADR 0003）
+    yield _sse({"type": "tickets", "content": submitted_raw})
+    try:
+        with session_factory() as session:
+            thinking_text = "".join(thinking_parts).strip()
+            if thinking_text:
+                session.add(
+                    Message(
+                        project_id=project_id,
+                        role="breaker_agent",
+                        kind="thinking",
+                        content=thinking_text,
+                    )
+                )
+            session.add(
+                Message(
+                    project_id=project_id,
+                    role="breaker_agent",
+                    kind="tickets",
+                    content=submitted_raw,
+                )
+            )
+            # 重新拆解取代旧清单：先取历史最大序号再删旧的待确认工单，新清单续编；
+            # 已确认的清单不可被重拆（分流已拦截），无需在此设防。
+            # blocked_by 提交时按清单内 1 起编号，落库时换算为续编后的 seq，保证引用不悬空（工单 0017）
+            base_seq = session.scalar(
+                select(Ticket.seq).where(Ticket.project_id == project_id).order_by(Ticket.seq.desc())
+            ) or 0
+            session.execute(
+                delete(Ticket).where(Ticket.project_id == project_id, Ticket.status == "open")
+            )
+            parsed, _ = parse_ticket_payload(submitted_raw)
+            for item in parsed or []:
+                seq = base_seq + item["seq"]
+                session.add(
+                    Ticket(
+                        project_id=project_id,
+                        seq=seq,
+                        title=item["title"],
+                        deliverable=item["deliverable"],
+                        blocked_by=json.dumps(
+                            [base_seq + b for b in item["blocked_by"]], ensure_ascii=False
+                        ),
+                        status="open",
+                    )
+                )
+            project_row = session.get(Project, project_id)
+            if project_row is not None:
+                project_row.updated_at = _utcnow()
+            session.commit()
+    except Exception as e:  # noqa: BLE001 — 工单落库失败须明示，不得静默断流
+        yield _sse({"type": "error", "detail": f"工单清单保存失败: {e}"})
+        return
+    yield _sse({"type": "done", "text": submitted_raw})
+
+
 class _StartBuildInvoked(Exception):
     """澄清智能体调用 start_build 的控制流信号：携需求共识摘要立即终止循环。"""
 
@@ -648,9 +819,9 @@ async def send_message(
     settings = request.app.state.settings
     existing_files = _existing_file_paths(db, project_id)
 
-    # 团队模式分流（工单 0016 / ADR 0003）：
+    # 团队模式分流（工单 0017 / ADR 0003）：
     # 历史项目（已有 PRD 消息）保留旧流程：待确认时引导先处理 PRD，已确认后进工程师；
-    # 新团队项目不再产 PRD，改走：需求澄清 → 需求规格确认门 → 下一阶段（拆单由工单 0017 承接）。
+    # 新团队项目走：需求澄清 → 需求规格确认门 → 工单拆解与清单确认门 → 执行（后续工单承接）。
     # 克隆等已有文件的场景与工程师模式完全一致。
     stage = "engineer"
     if project.mode == "team" and not existing_files:
@@ -658,12 +829,16 @@ async def send_message(
         if prd_state == "pending":
             stage = "guide"
         elif prd_state == "none":
-            # 新流水线（工单 0016）：共识未定先澄清；共识已定而规格未定则起草/重新起草规格；
+            # 新流水线：共识未定先澄清；共识已定而规格未定则起草/重新起草规格；
             # 规格待确认时继续发消息视为修改意见，重新起草并取代旧规格。
             if _consensus_state(db, project_id) in ("none", "pending"):
                 stage = "clarify"
             elif _spec_state(db, project_id) in ("none", "pending"):
                 stage = "spec"
+            elif _tickets_state(db, project_id) in ("none", "pending"):
+                # 工单 0017：规格确认后自动拆单；待确认时继续发消息视为调整粒度/内容的意见，
+                # 重新拆解并取代旧清单；一经确认进入执行期，不再重新澄清/拆单（落到工程师）。
+                stage = "break"
     elif not existing_files and _consensus_state(db, project_id) in ("none", "pending"):
         # 工程师模式首建分流（工单 0015 / ADR 0003）：尚无文件时先经需求澄清；
         # 共识待确认时继续发消息视为追加输入，重新澄清并产出新共识。
@@ -716,6 +891,9 @@ async def send_message(
                     yield chunk
             elif stage == "spec":
                 async for chunk in _spec_stream(request, project_id, body.content, history):
+                    yield chunk
+            elif stage == "break":
+                async for chunk in _break_stream(request, project_id, body.content, history):
                     yield chunk
             else:
                 async for chunk in _engineer_stream(
@@ -863,10 +1041,9 @@ async def confirm_spec(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """确认待确认的需求规格（工单 0016）：确认后流水线进入下一阶段入口（SSE 流）。
+    """确认待确认的需求规格（工单 0016）：确认后拆单智能体随即开始拆解（SSE 流）。
 
-    下一阶段（拆单）由工单 0017 承接；在此之前确认后由工程师智能体直接实现，
-    保持平台可用。确认与修改意见落对话历史（role=user, kind=spec_confirm）。
+    确认与修改意见落对话历史（role=user, kind=spec_confirm）。
     首建流水线内不再占用新名额（名额在首条消息时已扣，ADR 0003）。
     """
     project = get_owned_project(project_id, user, db)
@@ -880,7 +1057,7 @@ async def confirm_spec(
         )
 
     feedback = body.feedback.strip()
-    confirm_content = feedback if feedback else "确认规格，开始实现。"
+    confirm_content = feedback if feedback else "确认规格，开始拆解工单。"
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
 
@@ -907,8 +1084,124 @@ async def confirm_spec(
                     window=settings.agent_history_window,
                 )
                 existing_files = _existing_file_paths(session, project_id)
+            # 规格确认后进入拆单阶段（工单 0017）；克隆等已有文件的团队项目跳过拆单直接实现（同跳过 PRD）
+            if existing_files:
+                async for chunk in _engineer_stream(
+                    request, project_id, confirm_content, history, existing_files
+                ):
+                    yield chunk
+            else:
+                async for chunk in _break_stream(request, project_id, confirm_content, history):
+                    yield chunk
+
+    return _sse_response(event_stream())
+
+
+def _ticket_payload(row: Ticket) -> dict:
+    """工单表行转卡片字段（blocked_by 从 JSON 解出序号列表）。"""
+    payload = {
+        "seq": row.seq,
+        "title": row.title,
+        "deliverable": row.deliverable,
+        "status": row.status,
+    }
+    try:
+        payload["blocked_by"] = json.loads(row.blocked_by or "[]")
+    except ValueError:
+        payload["blocked_by"] = []
+    return payload
+
+
+@router.get("/{project_id}/tickets", response_model=list[TicketOut])
+def list_tickets(
+    project_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """当前工单清单（工单 0017）：按序号升序，刷新页面可回看。"""
+    get_owned_project(project_id, user, db)
+    return [
+        _ticket_payload(row)
+        for row in db.scalars(
+            select(Ticket).where(Ticket.project_id == project_id).order_by(Ticket.seq)
+        )
+    ]
+
+
+@router.post("/{project_id}/tickets/confirm")
+async def confirm_tickets(
+    project_id: int,
+    body: ConfirmTicketsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """确认待确认的工单清单（工单 0017）：确认后进入执行期（SSE 流）。
+
+    本工单范围内执行由工程师智能体承接（检查点串行执行由后续工单承接）；
+    确认后不可重新澄清、不可重新拆单（分流已拦截）。
+    确认与调整意见落对话历史（role=user, kind=tickets_confirm）。
+    首建流水线内不再占用新名额（名额在首条消息时已扣，ADR 0003）。
+    """
+    project = get_owned_project(project_id, user, db)
+    if project.mode != "team":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="工程师模式项目没有工单流程"
+        )
+    if _tickets_state(db, project_id) != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="当前没有待确认的工单清单"
+        )
+
+    feedback = body.feedback.strip()
+    confirm_content = feedback if feedback else "确认工单清单，开始执行。"
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+
+    async def event_stream():
+        async with _project_lock(project_id):
+            # 锁内复查状态并落确认：并发双击/重试不会造成重复确认与两次生成（同规格确认）
+            with session_factory() as session:
+                if _tickets_state(session, project_id) != "pending":
+                    yield _sse({"type": "error", "detail": "当前没有待确认的工单清单"})
+                    return
+                confirm_message = Message(
+                    project_id=project_id,
+                    role="user",
+                    kind="tickets_confirm",
+                    content=confirm_content,
+                )
+                session.add(confirm_message)
+                session.commit()
+                session.refresh(confirm_message)
+                history = _llm_history(
+                    session,
+                    project_id,
+                    before_message_id=confirm_message.id,
+                    window=settings.agent_history_window,
+                )
+                existing_files = _existing_file_paths(session, project_id)
+                # 工单清单以执行目标的形式附入工程师上下文（清单行本身不入上下文）
+                ticket_lines = [
+                    f"{p['seq']}. {p['title']}：{p['deliverable']}"
+                    + (f"（被工单 {', '.join(str(b) for b in p['blocked_by'])} 阻塞）" if p["blocked_by"] else "")
+                    for p in map(
+                        _ticket_payload,
+                        session.scalars(
+                            select(Ticket)
+                            .where(Ticket.project_id == project_id)
+                            .order_by(Ticket.seq)
+                        ),
+                    )
+                ]
+            if ticket_lines:
+                confirm_content_with_list = (
+                    f"{confirm_content}\n\n请按工单清单执行：\n" + "\n".join(ticket_lines)
+                )
+            else:
+                confirm_content_with_list = confirm_content
             async for chunk in _engineer_stream(
-                request, project_id, confirm_content, history, existing_files
+                request, project_id, confirm_content_with_list, history, existing_files
             ):
                 yield chunk
 

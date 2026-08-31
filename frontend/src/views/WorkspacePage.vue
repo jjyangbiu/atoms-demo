@@ -13,7 +13,7 @@ const router = useRouter()
 
 const createDialogVisible = ref(false)
 const newName = ref('')
-// 生成模式（工单 0010/0016）：工程师直接实现（先澄清）/ 团队模式澄清后产需求规格确认再实现
+// 生成模式（工单 0010/0016/0017）：工程师直接实现（先澄清）/ 团队模式澄清→规格确认→拆单确认→执行
 const newMode = ref<'engineer' | 'team'>('engineer')
 const creating = ref(false)
 
@@ -135,7 +135,7 @@ function formatTime(iso: string) {
         <p class="mode-hint">
           {{
             newMode === 'team'
-              ? '团队模式：彻底澄清需求后产出需求规格，确认（可附意见）后才开始实现'
+              ? '团队模式：彻底澄清需求后产出需求规格，确认后拆解为工单清单，确认后开始执行'
               : '工程师模式：澄清需求并确认后，智能体根据你的描述生成应用'
           }}
         </p>

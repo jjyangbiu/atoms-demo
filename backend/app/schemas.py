@@ -85,6 +85,22 @@ class ConfirmSpecRequest(BaseModel):
     feedback: str = Field(default="", max_length=8000)
 
 
+class ConfirmTicketsRequest(BaseModel):
+    """确认工单清单（工单 0017）：可附带调整意见，随确认一并进入执行期。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
+class TicketOut(BaseModel):
+    """工单清单卡片（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态。"""
+
+    seq: int
+    title: str
+    deliverable: str
+    blocked_by: list[int]
+    status: str
+
+
 class MessageOut(BaseModel):
     id: int
     role: str

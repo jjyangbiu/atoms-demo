@@ -2,14 +2,25 @@
  * SSE 消费：fetch + ReadableStream（EventSource 无法携带 Authorization，故不用）。
  * 事件协议与后端约定一致：每行 `data: {json}`，事件含 type 字段
  * （text | thinking | tool | done | error；团队模式历史项目另有 prd 增量事件（工单 0010），
- * 新团队项目需求规格阶段为 spec 增量事件，工单 0016）。
+ * 新团队项目需求规格阶段为 spec 增量事件（工单 0016），
+ * 拆单阶段为 tickets 事件（内容为工单清单 JSON，工单 0017））。
  * thinking 为推理模型的思考过程增量，前端以小号可折叠块展示。
  */
 
 import { ApiError, extractError, getToken } from '@/api/client'
 
 export interface SseEvent {
-  type: 'text' | 'thinking' | 'tool' | 'done' | 'error' | 'prd' | 'consensus' | 'spec' | string
+  type:
+    | 'text'
+    | 'thinking'
+    | 'tool'
+    | 'done'
+    | 'error'
+    | 'prd'
+    | 'consensus'
+    | 'spec'
+    | 'tickets'
+    | string
   [key: string]: unknown
 }
 

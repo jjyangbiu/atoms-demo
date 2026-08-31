@@ -88,6 +88,28 @@ class Snapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class Ticket(Base):
+    """工单（工单 0017 / ADR 0003）：团队模式规格确认后的纵向切片拆解。
+
+    每个工单是可独立预览的完整路径；blocked_by 为阻塞依赖的工单序号列表（JSON，落库时已换算为续编后的 seq）。
+    清单待确认时重新拆解：旧清单整批删除、新清单取代（序号在历史最大值上续编）；
+    一经确认进入执行期，不可重新拆单。
+    """
+
+    __tablename__ = "tickets"
+    __table_args__ = (UniqueConstraint("project_id", "seq"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    seq: Mapped[int] = mapped_column(nullable=False)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    deliverable: Mapped[str] = mapped_column(Text, nullable=False)
+    blocked_by: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # open（待执行）；执行期状态由后续工单承接（ADR 0003 检查点执行）
+    status: Mapped[str] = mapped_column(String(16), default="open", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Message(Base):
     """对话历史：含智能体文本与工具事件（kind=event 时 content 为 JSON）。"""
 
@@ -95,10 +117,12 @@ class Message(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
-    # user | pm | engineer | clarifier | system
+    # user | pm | engineer | clarifier | spec_agent | breaker_agent | system
     role: Mapped[str] = mapped_column(String(16), nullable=False)
-    # text | prd | prd_confirm | consensus | consensus_confirm | event | thinking
-    # （prd/prd_confirm 为团队模式，工单 0010；consensus/consensus_confirm 为需求澄清，工单 0015）
+    # text | prd | prd_confirm | consensus | consensus_confirm | spec | spec_confirm
+    # | tickets | tickets_confirm | event | thinking
+    # （prd/prd_confirm 为团队模式，工单 0010；consensus/consensus_confirm 为需求澄清，工单 0015；
+    # spec/spec_confirm 为需求规格，工单 0016；tickets/tickets_confirm 为工单清单，工单 0017）
     kind: Mapped[str] = mapped_column(String(16), default="text", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

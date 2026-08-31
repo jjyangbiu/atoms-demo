@@ -18,9 +18,18 @@ interface ToolInfo {
   result?: string
 }
 
+// 工单清单卡片字段（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态；
+// seq 为清单内相对序号（与 blocked_by 引用同口径）
+interface TicketInfo {
+  seq: number
+  title: string
+  deliverable: string
+  blocked_by: number[]
+}
+
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'spec' | 'thinking'
+  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'spec' | 'tickets' | 'thinking'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
@@ -35,6 +44,25 @@ interface ChatEntry {
   consensusConfirmed?: boolean
   // 需求规格卡片（工单 0016，团队模式）：交互规则同共识卡片；待确认时发消息会重新起草规格
   specConfirmed?: boolean
+  // 工单清单卡片（工单 0017，团队模式）：交互规则同规格卡片；待确认时发消息会重新拆解，
+  // 确认后进入执行期，不再重新澄清/拆单
+  tickets?: TicketInfo[]
+  ticketsConfirmed?: boolean
+}
+
+function parseTickets(content: string): TicketInfo[] {
+  try {
+    const data = JSON.parse(content)
+    if (!Array.isArray(data)) return []
+    return data.map((t: Record<string, unknown>, i: number) => ({
+      seq: i + 1,
+      title: String(t.title ?? ''),
+      deliverable: String(t.deliverable ?? ''),
+      blocked_by: Array.isArray(t.blocked_by) ? t.blocked_by.map(Number) : [],
+    }))
+  } catch {
+    return []
+  }
 }
 
 const route = useRoute()
@@ -58,6 +86,8 @@ const prdFeedback = ref('')
 const consensusFeedback = ref('')
 // 需求规格确认时的修改意见（工单 0016）
 const specFeedback = ref('')
+// 工单清单确认时的调整意见（工单 0017）
+const ticketsFeedback = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
@@ -198,11 +228,23 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         content: m.content,
         specConfirmed: confirmed || superseded,
       })
+    } else if (m.kind === 'tickets') {
+      // 工单清单卡片（工单 0017）：确认状态推导同规格；被重新拆解取代的旧卡片不再可交互；
+      // 刷新后由历史行重建，回看不丢（工单数据同时持久化于工单表）
+      const confirmed = messages.slice(i + 1).some((x) => x.kind === 'tickets_confirm')
+      const superseded = messages.slice(i + 1).some((x) => x.kind === 'tickets')
+      result.push({
+        id: `msg-${m.id}`,
+        kind: 'tickets',
+        content: m.content,
+        tickets: parseTickets(m.content),
+        ticketsConfirmed: confirmed || superseded,
+      })
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
       result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
-    } else if (m.kind === 'prd_confirm' || m.kind === 'consensus_confirm' || m.kind === 'spec_confirm') {
-      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010/0015/0016）
+    } else if (m.kind === 'prd_confirm' || m.kind === 'consensus_confirm' || m.kind === 'spec_confirm' || m.kind === 'tickets_confirm') {
+      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010/0015/0016/0017）
       result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
     } else if (m.kind === 'text') {
       result.push({
@@ -378,9 +420,8 @@ async function confirmConsensus() {
   await runSse(`/api/projects/${projectId.value}/consensus/confirm`, { feedback })
 }
 
-// 确认需求规格（工单 0016）：确认后流水线进入下一阶段（当前由工程师实现，
-// 拆单由工单 0017 承接）；修改意见可选，随确认一并落对话历史可回看；
-// 首建流水线内确认不占用新名额（ADR 0003）
+// 确认需求规格（工单 0016）：确认后拆单智能体随即开始拆解工单（工单 0017）；
+// 修改意见可选，随确认一并落对话历史可回看；首建流水线内确认不占用新名额（ADR 0003）
 async function confirmSpec() {
   if (generating.value) return
   const feedback = specFeedback.value.trim()
@@ -388,9 +429,24 @@ async function confirmSpec() {
   entries.value.push({
     id: nextId(),
     kind: 'user',
-    content: feedback || '确认规格，开始实现。',
+    content: feedback || '确认规格，开始拆解工单。',
   })
   await runSse(`/api/projects/${projectId.value}/spec/confirm`, { feedback })
+}
+
+// 确认工单清单（工单 0017）：确认后进入执行期，工程师随即开始实现，
+// 其后发消息不再重新澄清/拆单；调整意见可选，随确认一并落对话历史可回看；
+// 首建流水线内确认不占用新名额（ADR 0003）
+async function confirmTickets() {
+  if (generating.value) return
+  const feedback = ticketsFeedback.value.trim()
+  ticketsFeedback.value = ''
+  entries.value.push({
+    id: nextId(),
+    kind: 'user',
+    content: feedback || '确认工单清单，开始执行。',
+  })
+  await runSse(`/api/projects/${projectId.value}/tickets/confirm`, { feedback })
 }
 
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
@@ -401,6 +457,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
   const consensusHolder: { entry: ChatEntry | null } = { entry: null }
   const specHolder: { entry: ChatEntry | null } = { entry: null }
+  const ticketsHolder: { entry: ChatEntry | null } = { entry: null }
   const thinkingHolder: { entry: ChatEntry | null } = { entry: null }
 
   const ensureTextEntry = (): ChatEntry => {
@@ -475,6 +532,23 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return specHolder.entry
   }
 
+  // 工单清单卡片（工单 0017）：tickets 事件一次携完整清单 JSON，直接解析渲染；
+  // 流结束后以持久化历史为准重渲染（同其他卡片）
+  const ensureTicketsEntry = (content: string): ChatEntry => {
+    if (!ticketsHolder.entry) {
+      ticketsHolder.entry = {
+        id: nextId(),
+        kind: 'tickets',
+        content,
+        tickets: parseTickets(content),
+        streaming: true,
+        ticketsConfirmed: false,
+      }
+      entries.value.push(ticketsHolder.entry)
+    }
+    return ticketsHolder.entry
+  }
+
   try {
     await streamPost(path, body, (event: SseEvent) => {
       if (event.type === 'thinking') {
@@ -487,6 +561,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         pushText(ensureConsensusEntry(), String(event.content ?? ''))
       } else if (event.type === 'spec') {
         pushText(ensureSpecEntry(), String(event.content ?? ''))
+      } else if (event.type === 'tickets') {
+        ensureTicketsEntry(String(event.content ?? ''))
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -529,6 +605,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     if (prdHolder.entry) prdHolder.entry.streaming = false
     if (consensusHolder.entry) consensusHolder.entry.streaming = false
     if (specHolder.entry) specHolder.entry.streaming = false
+    if (ticketsHolder.entry) ticketsHolder.entry.streaming = false
     if (thinkingHolder.entry) thinkingHolder.entry.streaming = false
     // 等打字机追平再换历史，避免尾部字符闪现；随后以持久化结果为准对齐（含思考行，回看折叠展示）
     await waitForTypewriter()
@@ -690,7 +767,51 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     data-testid="spec-confirm-button"
                     @click="confirmSpec"
                   >
-                    确认规格并开始实现
+                    确认规格并开始拆解工单
+                  </el-button>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="entry.kind === 'tickets'" class="msg agent-msg">
+              <!-- 工单清单卡片（工单 0017）：团队模式规格确认后的确认门，确认后进入执行期 -->
+              <div class="prd-card tickets-card">
+                <div class="prd-head">
+                  <span class="prd-role">团队模式 · 工单清单</span>
+                  <el-tag v-if="entry.ticketsConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else size="small" type="warning">待确认</el-tag>
+                </div>
+                <div class="ticket-list">
+                  <div v-for="t in entry.tickets ?? []" :key="t.seq" class="ticket-item">
+                    <div class="ticket-head">
+                      <span class="ticket-seq">#{{ t.seq }}</span>
+                      <span class="ticket-title">{{ t.title }}</span>
+                      <el-tag size="small" effect="plain">待执行</el-tag>
+                    </div>
+                    <div class="ticket-deliverable">{{ t.deliverable }}</div>
+                    <div v-if="t.blocked_by.length" class="ticket-blocked">
+                      被 {{ t.blocked_by.map((b) => `#${b}`).join('、') }} 阻塞，前置完成后可开始
+                    </div>
+                  </div>
+                  <div v-if="!entry.tickets?.length" class="ticket-empty">
+                    {{ entry.streaming ? '正在拆解工单…' : '工单清单为空' }}
+                  </div>
+                </div>
+                <div v-if="!entry.ticketsConfirmed && !entry.streaming" class="prd-actions" data-testid="tickets-card-actions">
+                  <el-input
+                    v-model="ticketsFeedback"
+                    type="textarea"
+                    :rows="2"
+                    :disabled="generating"
+                    placeholder="调整意见（可选），例如：工单 2 拆得太细；也可以直接继续对话重新拆解"
+                    data-testid="tickets-feedback-input"
+                  />
+                  <el-button
+                    type="primary"
+                    :loading="generating"
+                    data-testid="tickets-confirm-button"
+                    @click="confirmTickets"
+                  >
+                    确认清单并开始执行
                   </el-button>
                 </div>
               </div>
@@ -971,6 +1092,57 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
 .prd-actions .el-button {
   align-self: flex-end;
+}
+
+/* 工单清单卡片（工单 0017）：逐张工单卡片展示标题/交付内容/阻塞依赖 */
+.ticket-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ticket-item {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #fafafa;
+}
+
+.ticket-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ticket-seq {
+  font-weight: 600;
+  color: #409eff;
+  font-size: 13px;
+}
+
+.ticket-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  flex: 1;
+}
+
+.ticket-deliverable {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.6;
+}
+
+.ticket-blocked {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #e6a23c;
+}
+
+.ticket-empty {
+  color: #909399;
+  font-size: 13px;
 }
 
 .markdown :deep(p) {

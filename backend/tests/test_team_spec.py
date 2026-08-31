@@ -4,7 +4,7 @@
 - 新团队项目首条消息进入需求澄清，不再产出 PRD（旧流程退役）
 - 需求共识确认后，规格智能体产出需求规格卡片（SSE spec 事件），不写文件，落历史
 - 规格待确认时继续发消息视为修改意见，重新起草，新规格取代旧规格
-- 规格确认后流水线进入下一阶段入口（当前由工程师实现承接），规格进入其上下文
+- 规格确认后拆单智能体随即开始拆解（工单 0017），规格进入其上下文
 - 历史团队项目的 PRD 展示、确认与只读路径不受影响
 任何测试不得调用真实 MiniMax API。
 """
@@ -12,6 +12,7 @@
 from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
+from test_team_tickets import BREAK_STEP, _confirm_tickets
 
 from app.models import Message
 
@@ -131,6 +132,7 @@ class TestSpecRedraft:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"text": "规格一：浅色主题。"},
                 {"text": "规格二：深色主题。"},
+                BREAK_STEP,
                 *ENGINEER_BUILD_STEPS,
             ],
         )
@@ -148,19 +150,21 @@ class TestSpecRedraft:
         messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
         assert [m["kind"] for m in messages].count("spec") == 2
 
-        # 确认以最新规格为准并触发实现
+        # 确认以最新规格为准：先拆单，再确认清单进入执行期（工单 0017）
         events = _confirm_spec(client, auth_headers, project["id"])
+        assert any(e["type"] == "tickets" for e in events)
+        events = _confirm_tickets(client, auth_headers, project["id"])
         assert events[-1]["type"] == "done"
         assert (_project_dir(settings, project["id"]) / "index.html").exists()
 
 
 class TestSpecConfirm:
-    def test_confirm_starts_engineer_with_spec_in_context(
-        self, app, settings, client, auth_headers
+    def test_confirm_starts_breaker_with_spec_in_context(
+        self, app, client, auth_headers
     ):
-        """规格确认 = 下一阶段入口：工程师随即实现，规格进入其上下文（拆单由工单 0017 承接）。"""
+        """规格确认 = 拆单入口（工单 0017）：拆单智能体随即拆解，规格进入其上下文。"""
         model = use_fake_model(
-            app, [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, *ENGINEER_BUILD_STEPS]
+            app, [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP]
         )
         project = _create_project(client, auth_headers, mode="team")
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
@@ -168,33 +172,30 @@ class TestSpecConfirm:
         events = _confirm_spec(client, auth_headers, project["id"])
 
         types = [e["type"] for e in events]
-        assert "tool" in types and types[-1] == "done"
-        assert (
-            _project_dir(settings, project["id"]) / "index.html"
-        ).read_text(encoding="utf-8") == "<h1>番茄钟</h1>"
+        assert "tickets" in types and "tool" not in types and types[-1] == "done"
 
-        # 规格与确认消息都进了工程师的上下文
-        engineer_call = model.received_messages[-1]
-        contents = [getattr(m, "content", "") for m in engineer_call]
+        # 规格与确认消息都进了拆单智能体的上下文
+        breaker_call = model.received_messages[-1]
+        contents = [getattr(m, "content", "") for m in breaker_call]
         assert any(SPEC_TEXT in c for c in contents)
-        assert "确认规格，开始实现。" in contents
+        assert "确认规格，开始拆解工单。" in contents
 
         # 规格与确认都落对话历史，可回看
         messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
         kinds = [m["kind"] for m in messages]
         assert "spec" in kinds and "spec_confirm" in kinds
 
-    def test_confirm_with_feedback_reaches_engineer(self, app, client, auth_headers):
+    def test_confirm_with_feedback_reaches_breaker(self, app, client, auth_headers):
         model = use_fake_model(
-            app, [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, *ENGINEER_BUILD_STEPS]
+            app, [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP]
         )
         project = _create_project(client, auth_headers, mode="team")
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
         _confirm_consensus(client, auth_headers, project["id"])
         _confirm_spec(client, auth_headers, project["id"], feedback="界面要深色主题")
 
-        engineer_call = model.received_messages[-1]
-        assert any(getattr(m, "content", "") == "界面要深色主题" for m in engineer_call)
+        breaker_call = model.received_messages[-1]
+        assert any(getattr(m, "content", "") == "界面要深色主题" for m in breaker_call)
 
     def test_confirm_without_pending_spec_is_409(self, app, client, auth_headers):
         project = _create_project(client, auth_headers, mode="team")
@@ -206,7 +207,7 @@ class TestSpecConfirm:
         assert resp.status_code == 409
 
     def test_confirm_twice_is_409(self, app, client, auth_headers):
-        project = _draft_spec(app, client, auth_headers, extra_steps=ENGINEER_BUILD_STEPS)
+        project = _draft_spec(app, client, auth_headers, extra_steps=[BREAK_STEP])
         _confirm_consensus(client, auth_headers, project["id"])
         assert _confirm_spec(client, auth_headers, project["id"])[-1]["type"] == "done"
         resp = client.post(
@@ -287,17 +288,20 @@ class TestTeamPipelineQuota:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"text": SPEC_TEXT},
+                BREAK_STEP,
                 *ENGINEER_BUILD_STEPS,
                 {"text": "迭代完成。"},
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
 
-        # 首条消息扣掉唯一名额；后续流水线阶段不再计数
+        # 首条消息扣掉唯一名额；后续流水线阶段不再计数（拆单与清单确认见 test_team_tickets）
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
         events = _confirm_consensus(client, auth_headers, project["id"])
         assert any(e["type"] == "spec" for e in events)
         events = _confirm_spec(client, auth_headers, project["id"])
+        assert any(e["type"] == "tickets" for e in events)
+        events = _confirm_tickets(client, auth_headers, project["id"])
         assert events[-1]["type"] == "done"
 
         # 首建完成（有文件）后恢复按次计数：名额已用完，迭代被拒
