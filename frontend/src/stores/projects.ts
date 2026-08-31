@@ -19,6 +19,11 @@ export interface MessageOut {
   created_at: string
 }
 
+export interface FileOut {
+  path: string
+  size: number
+}
+
 export const useProjectStore = defineStore('projects', () => {
   const projects = ref<ProjectOut[]>([])
 
@@ -43,5 +48,9 @@ export const useProjectStore = defineStore('projects', () => {
     return api<MessageOut[]>(`/api/projects/${projectId}/messages`)
   }
 
-  return { projects, fetchProjects, createProject, deleteProject, fetchMessages }
+  async function fetchFiles(projectId: number): Promise<FileOut[]> {
+    return api<FileOut[]>(`/api/projects/${projectId}/files`)
+  }
+
+  return { projects, fetchProjects, createProject, deleteProject, fetchMessages, fetchFiles }
 })

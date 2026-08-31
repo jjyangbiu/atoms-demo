@@ -55,3 +55,10 @@ class MessageOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class FileOut(BaseModel):
+    path: str
+    size: int
+
+    model_config = {"from_attributes": True}

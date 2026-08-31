@@ -1,10 +1,10 @@
-"""项目 CRUD、对话历史、生成消息（SSE 流式）。"""
+"""项目 CRUD、对话历史、生成消息（SSE 流式）、预览托管。"""
 
 import json
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import delete, select
@@ -12,11 +12,19 @@ from sqlalchemy.orm import Session
 
 from ..agent.loop import run_generation
 from ..agent.prompts import build_system_prompt
-from ..agent.tools import ALLOWED_EXTENSIONS, FileSandbox, build_tools, execute_tool
-from ..deps import get_current_user, get_db
+from ..agent.tools import (
+    ALLOWED_EXTENSIONS,
+    FileSandbox,
+    SandboxViolation,
+    build_tools,
+    execute_tool,
+    resolve_sandboxed,
+)
+from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, User, _utcnow
 from ..schemas import (
     CreateProjectRequest,
+    FileOut,
     MessageOut,
     ProjectOut,
     SendMessageRequest,
@@ -227,6 +235,86 @@ async def send_message(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/{project_id}/files", response_model=list[FileOut])
+def list_files(
+    project_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ProjectFile]:
+    get_owned_project(project_id, user, db)
+    return list(
+        db.scalars(
+            select(ProjectFile)
+            .where(ProjectFile.project_id == project_id)
+            .order_by(ProjectFile.path)
+        )
+    )
+
+
+# --- 预览托管（工单 0005）：属主项目的当前版本文件按真实 MIME 类型提供 ---
+#
+# 鉴权只靠登录时写入的 Cookie atoms_token（见 routers/auth.py）：
+# iframe 与其子资源同源请求自动携带，无需在 URL 里暴露令牌。
+# 越界路径与白名单外扩展名复用文件沙箱拦截，一律 404。
+
+_MEDIA_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".md": "text/markdown; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def _preview_user(request: Request, db: Session) -> User | None:
+    """按登录 Cookie 解析预览访问者；无 Cookie 或令牌无效返回 None。"""
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return None
+    return resolve_user_by_token(request.app.state.settings, token, db)
+
+
+def _serve_preview(request: Request, project_id: int, rel_path: str, db: Session) -> Response:
+    user = _preview_user(request, db)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录或登录已过期")
+    project = db.get(Project, project_id)
+    # 非属主与不存在的项目同返 404，不泄露项目归属
+    if project is None or project.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    root = project_dir(request, project_id)
+    try:
+        target = resolve_sandboxed(root, rel_path or "index.html")
+    except SandboxViolation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
+    if not target.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
+    media_type = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
+    return Response(content=target.read_bytes(), media_type=media_type)
+
+
+@router.get("/{project_id}/preview")
+def preview_root(
+    project_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Response:
+    return _serve_preview(request, project_id, "index.html", db)
+
+
+@router.get("/{project_id}/preview/{file_path:path}")
+def preview_file(
+    project_id: int,
+    file_path: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Response:
+    return _serve_preview(request, project_id, file_path.strip("/") or "index.html", db)
 
 
 def _persist_event(session_factory, project_id: int, data: dict) -> None:

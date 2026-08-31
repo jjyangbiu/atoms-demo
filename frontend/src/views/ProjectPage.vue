@@ -33,6 +33,8 @@ const input = ref('')
 const generating = ref(false)
 const errorDetail = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
+const hasIndex = ref(false)
+const previewRev = ref(0)
 let seq = 0
 let lastUserContent = ''
 
@@ -42,6 +44,14 @@ function nextId() {
 
 const isEmpty = computed(
   () => entries.value.length === 0 && !generating.value,
+)
+
+// rev 参数在每次生成/迭代完成后递增，强制 iframe 刷新到最新版本（工单 0005）；
+// 预览鉴权靠登录 Cookie 自动携带，无需在 URL 里暴露令牌
+const previewSrc = computed(() =>
+  hasIndex.value
+    ? `/api/projects/${projectId.value}/preview/index.html?rev=${previewRev.value}`
+    : '',
 )
 
 function renderMarkdown(content: string) {
@@ -92,9 +102,14 @@ async function loadHistory() {
   scrollToBottom()
 }
 
+async function loadFiles() {
+  const files = await store.fetchFiles(projectId.value)
+  hasIndex.value = files.some((f) => f.path === 'index.html')
+}
+
 onMounted(async () => {
   await loadProject()
-  await loadHistory()
+  await Promise.all([loadHistory(), loadFiles()])
 })
 
 async function send() {
@@ -161,7 +176,10 @@ async function generate(content: string) {
   } finally {
     generating.value = false
     if (textHolder.entry) textHolder.entry.streaming = false
-    await loadHistory() // 以服务端持久化结果为准对齐
+    // 以服务端持久化结果为准对齐；文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
+    // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比
+    await Promise.all([loadHistory(), loadFiles()])
+    previewRev.value += 1
     scrollToBottom()
   }
 }
@@ -235,7 +253,15 @@ async function generate(content: string) {
       </section>
 
       <section class="preview-panel">
-        <el-empty description="预览区：生成后的应用将在这里实时运行（下个工单交付）" />
+        <iframe
+          v-if="previewSrc"
+          :src="previewSrc"
+          class="preview-frame"
+          title="应用预览"
+          sandbox="allow-scripts allow-same-origin"
+          data-testid="app-preview"
+        />
+        <el-empty v-else description="预览区：生成完成的应用将在这里实时运行" />
       </section>
     </div>
   </div>
@@ -379,5 +405,13 @@ async function generate(content: string) {
   align-items: center;
   justify-content: center;
   background: #fafafa;
+  min-width: 0;
+}
+
+.preview-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
 }
 </style>
