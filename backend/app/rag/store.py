@@ -30,6 +30,10 @@ class KnowledgeStore:
         self.uri = uri
         self.embedder = embedder
         self.client = MilvusClient(uri=uri)
+        # 加载状态不落盘：进程重启后既有集合处于 released，须显式 load；
+        # 新建集合由 create_collection 自动加载，幂等调用对已加载集合无副作用
+        if self.client.has_collection(_COLLECTION):
+            self.client.load_collection(_COLLECTION)
 
     # --- 内部：集合按需创建（维度由 embedder 首次产出决定） ---
 

@@ -15,7 +15,7 @@ from langchain_core.messages import ToolMessage
 
 from app.main import create_app
 from app.rag.seeds import SEED_TEMPLATES
-from app.rag.store import get_knowledge_store
+from app.rag.store import KnowledgeStore, get_knowledge_store
 from conftest import use_fake_embeddings, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
@@ -40,6 +40,15 @@ class TestSeedTemplates:
         use_fake_embeddings(restarted)
         store2 = get_knowledge_store(restarted)
         assert store2.entry_count("seed") == len(SEED_TEMPLATES)
+
+    def test_reopen_with_released_collection_still_readable(self, settings, app):
+        """重启后集合加载状态不保留（released）：重开 store 后种子灌入与检索仍可用。"""
+        store = get_knowledge_store(app)
+        store.client.release_collection("knowledge")  # 等价于进程重启后的落库状态
+        reopened = KnowledgeStore(settings.milvus_uri, app.state.embedding_factory(settings))
+        reopened.seed(SEED_TEMPLATES)
+        assert reopened.entry_count("seed") == len(SEED_TEMPLATES)
+        assert [h["title"] for h in reopened.search("记账", top_k=3)]
 
     def test_milvus_lives_in_temp_dir_and_uses_stub_embeddings(self, settings, app):
         """向量库落在临时目录；灌入只走桩 embedding，不触碰真实服务。"""
