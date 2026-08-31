@@ -19,9 +19,11 @@ export interface PublishOut {
 
 export interface MessageOut {
   id: number
-  role: 'user' | 'pm' | 'engineer' | 'system'
+  // clarifier 为需求澄清智能体（工单 0015）
+  role: 'user' | 'pm' | 'engineer' | 'clarifier' | 'system'
   // thinking 为推理模型的思考过程留痕，回看时以折叠块展示（诊断修复）
-  kind: 'text' | 'prd' | 'prd_confirm' | 'event' | 'thinking'
+  // consensus/consensus_confirm 为需求澄清与共识确认（工单 0015）
+  kind: 'text' | 'prd' | 'prd_confirm' | 'consensus' | 'consensus_confirm' | 'event' | 'thinking'
   content: string
   created_at: string
 }

@@ -13,10 +13,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..agent.loop import run_generation
-from ..agent.prompts import PM_SYSTEM_PROMPT, build_system_prompt
+from ..agent.prompts import CLARIFIER_SYSTEM_PROMPT, PM_SYSTEM_PROMPT, build_system_prompt
 from ..agent.tools import (
     FileSandbox,
     SandboxViolation,
+    build_clarify_tools,
     build_tools,
     execute_tool,
     resolve_sandboxed,
@@ -26,6 +27,7 @@ from ..models import Message, Project, ProjectFile, Publication, Snapshot, User,
 from ..rag.store import maybe_knowledge_store
 from ..rate_limit import RateLimitRejected
 from ..schemas import (
+    ConfirmConsensusRequest,
     ConfirmPrdRequest,
     CreateProjectRequest,
     FileContentOut,
@@ -171,6 +173,9 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
             history.append(HumanMessage(content=m.content))
         elif m.kind == "prd":
             history.append(AIMessage(content=f"以下是我起草的 PRD：\n\n{m.content}"))
+        elif m.kind == "consensus":
+            # 需求共识入上下文：后续澄清轮次与工程师生成都以它为定案基础（工单 0015）
+            history.append(AIMessage(content=f"以下是澄清后达成的需求共识：\n\n{m.content}"))
         else:
             history.append(AIMessage(content=m.content))
     if window > 0:
@@ -201,6 +206,43 @@ def _prd_state(db: Session, project_id: int) -> str:
         .limit(1)
     )
     return "confirmed" if confirmed is not None else "pending"
+
+
+def _consensus_state(db: Session, project_id: int) -> str:
+    """工程师模式的需求共识状态（工单 0015）：none | pending | confirmed。
+
+    与 _prd_state 同构，从对话历史推导：最近一条 consensus 消息之后是否存在确认消息。
+    """
+    last_consensus_id = db.scalar(
+        select(Message.id)
+        .where(Message.project_id == project_id, Message.kind == "consensus")
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    if last_consensus_id is None:
+        return "none"
+    confirmed = db.scalar(
+        select(Message.id)
+        .where(
+            Message.project_id == project_id,
+            Message.kind == "consensus_confirm",
+            Message.id > last_consensus_id,
+        )
+        .limit(1)
+    )
+    return "confirmed" if confirmed is not None else "pending"
+
+
+def _has_any_message(db: Session, project_id: int) -> bool:
+    """项目是否已有对话消息：推导首建流水线是否已进入（名额语义，工单 0015 / ADR 0003）。
+
+    首条消息即进入流水线的起点（名额在此扣一次）；此后只要还没有文件，
+    无论澄清续轮还是共识确认触发的生成都不再计数，直到项目有文件后恢复按次计数。
+    """
+    return (
+        db.scalar(select(Message.id).where(Message.project_id == project_id).limit(1))
+        is not None
+    )
 
 
 def _sync_file_index(db: Session, project_id: int, root: Path) -> None:
@@ -443,6 +485,121 @@ async def _pm_stream(request: Request, project_id: int, user_text: str, history:
     yield _sse({"type": "done", "text": prd_text})
 
 
+class _StartBuildInvoked(Exception):
+    """澄清智能体调用 start_build 的控制流信号：携需求共识摘要立即终止循环。"""
+
+    def __init__(self, summary: str):
+        self.summary = summary
+        super().__init__("start_build")
+
+
+async def _clarify_stream(request: Request, project_id: int, user_text: str, history: list):
+    """需求澄清流（工单 0015）：分轮问答直至无未决问题，产出需求共识卡片。
+
+    澄清智能体唯一工具是 start_build（无任何文件工具）：
+    - 模型返回纯文本 → 澄清提问，以 role=clarifier 落历史；
+    - 模型调用 start_build → 需求共识以 consensus 事件流式外发并落库，本轮结束；
+      start_build 的 ToolMessage 不回传模型，避免模型在共识后继续输出。
+    """
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    try:
+        model = request.app.state.model_factory(settings)
+    except Exception as e:  # noqa: BLE001 — 与其他阶段一致，环境问题以 error 事件收尾
+        yield _sse({"type": "error", "detail": str(e)})
+        return
+
+    def clarify_executor(tools, name, args):
+        if name == "start_build":
+            raise _StartBuildInvoked(str((args or {}).get("requirements_summary", "")))
+        return execute_tool(tools, name, args)
+
+    consensus_summary: str | None = None
+    done_data: dict | None = None
+    errored = False
+    thinking_parts: list[str] = []
+    try:
+        async for event in run_generation(
+            model,
+            build_clarify_tools(),
+            clarify_executor,
+            CLARIFIER_SYSTEM_PROMPT,
+            history,
+            user_text,
+            max_steps=settings.agent_max_steps,
+            max_retries=settings.agent_max_retries,
+        ):
+            if event.type == "done":
+                done_data = event.data
+            else:
+                if event.type == "error":
+                    errored = True
+                if event.type == "thinking":
+                    thinking_parts.append(event.data.get("content", ""))
+                # start_build 的工具事件不外发：澄清轮次对用户只呈现问答与共识卡片
+                if event.type != "tool":
+                    yield _sse({"type": event.type, **event.data})
+    except _StartBuildInvoked as invoked:
+        consensus_summary = invoked.summary
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+        _persist_partial_thinking(session_factory, project_id, "clarifier", thinking_parts)
+        yield _sse({"type": "error", "detail": f"澄清中断: {e}"})
+        return
+    except BaseException:
+        # 刷新/断流触发的生成器关闭：落库已流出的思考后照旧退出（同工程师流）
+        _persist_partial_thinking(session_factory, project_id, "clarifier", thinking_parts)
+        raise
+
+    if consensus_summary is None:
+        # 模型未调 start_build：本轮是一次澄清提问，收尾落库后结束（不写文件、不留快照）
+        question = done_data.get("text", "") if done_data else ""
+        if not question:
+            if not errored:
+                yield _sse({"type": "error", "detail": "澄清未产出任何内容"})
+            return
+        try:
+            with session_factory() as session:
+                thinking_text = "".join(thinking_parts).strip()
+                if thinking_text:
+                    session.add(
+                        Message(
+                            project_id=project_id, role="clarifier", kind="thinking", content=thinking_text
+                        )
+                    )
+                session.add(
+                    Message(project_id=project_id, role="clarifier", kind="text", content=question)
+                )
+                session.commit()
+        except Exception as e:  # noqa: BLE001 — 澄清落库失败须明示，不得静默断流
+            yield _sse({"type": "error", "detail": f"澄清保存失败: {e}"})
+            return
+        yield _sse({"type": "done", "text": question})
+        return
+
+    # 产出需求共识：卡片内容流式外发并落库，等待用户确认后才开始生成（确认门，ADR 0003）
+    yield _sse({"type": "consensus", "content": consensus_summary})
+    try:
+        with session_factory() as session:
+            thinking_text = "".join(thinking_parts).strip()
+            if thinking_text:
+                session.add(
+                    Message(
+                        project_id=project_id, role="clarifier", kind="thinking", content=thinking_text
+                    )
+                )
+            session.add(
+                Message(project_id=project_id, role="clarifier", kind="consensus", content=consensus_summary)
+            )
+            project_row = session.get(Project, project_id)
+            if project_row is not None:
+                project_row.updated_at = _utcnow()
+            session.commit()
+    except Exception as e:  # noqa: BLE001 — 共识落库失败须明示，不得静默断流
+        yield _sse({"type": "error", "detail": f"需求共识保存失败: {e}"})
+        return
+    yield _sse({"type": "done", "text": consensus_summary})
+
+
 @router.post("/{project_id}/messages")
 async def send_message(
     project_id: int,
@@ -465,6 +622,10 @@ async def send_message(
             stage = "pm"
         elif prd_state == "pending":
             stage = "guide"
+    elif not existing_files and _consensus_state(db, project_id) in ("none", "pending"):
+        # 工程师模式首建分流（工单 0015 / ADR 0003）：尚无文件时先经需求澄清；
+        # 共识待确认时继续发消息视为追加输入，重新澄清并产出新共识。
+        stage = "clarify"
 
     if stage == "guide":
         guidance = (
@@ -482,8 +643,13 @@ async def send_message(
         return _sse_response(guide_stream())
 
     # 限流检查在落用户消息之前：被拒请求不产生任何持久化痕迹（工单 0011）。
+    # 首建流水线整体只占一个名额（工单 0015 / ADR 0003）：项目尚无消息也无文件时，
+    # 首条消息扣一次名额；此后只要仍无文件（澄清续轮等流水线内消息）不再计数；
+    # 项目有文件后（首建完成）的迭代消息恢复按次计数。
     # accept 之后、返回流之前的任何异常都必须归还名额，否则全局名额泄漏直至重启。
-    _accept_rate_limit(request, user)
+    charged = bool(existing_files) or not _has_any_message(db, project_id)
+    if charged:
+        _accept_rate_limit(request, user)
     try:
         user_message = Message(
             project_id=project_id, role="user", kind="text", content=body.content
@@ -496,7 +662,8 @@ async def send_message(
             db, project_id, before_message_id=user_message.id, window=settings.agent_history_window
         )
     except Exception:
-        request.app.state.rate_limiter.release()
+        if charged:
+            request.app.state.rate_limiter.release()
         raise
 
     async def event_stream():
@@ -505,13 +672,19 @@ async def send_message(
             if stage == "pm":
                 async for chunk in _pm_stream(request, project_id, body.content, history):
                     yield chunk
+            elif stage == "clarify":
+                async for chunk in _clarify_stream(request, project_id, body.content, history):
+                    yield chunk
             else:
                 async for chunk in _engineer_stream(
                     request, project_id, body.content, history, existing_files
                 ):
                     yield chunk
 
-    return _sse_response(_limited_stream(event_stream(), request))
+    stream = event_stream()
+    if charged:
+        stream = _limited_stream(stream, request)
+    return _sse_response(stream)
 
 
 @router.post("/{project_id}/prd/confirm")
@@ -575,6 +748,65 @@ async def confirm_prd(
                 yield chunk
 
     return _sse_response(_limited_stream(event_stream(), request))
+
+
+@router.post("/{project_id}/consensus/confirm")
+async def confirm_consensus(
+    project_id: int,
+    body: ConfirmConsensusRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """确认待确认的需求共识（工单 0015）：确认后工程师智能体随即开始生成（SSE 流）。
+
+    确认与修改意见落对话历史（role=user, kind=consensus_confirm），重新打开可回看。
+    首建流水线内不再占用新名额（名额在首条消息时已扣，ADR 0003）。
+    """
+    project = get_owned_project(project_id, user, db)
+    if project.mode != "engineer":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="团队模式项目没有共识确认流程"
+        )
+    if _consensus_state(db, project_id) != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="当前没有待确认的需求共识"
+        )
+
+    feedback = body.feedback.strip()
+    confirm_content = feedback if feedback else "确认共识，开始生成。"
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+
+    async def event_stream():
+        async with _project_lock(project_id):
+            # 锁内复查状态并落确认：并发双击/重试不会造成重复确认与两次生成（同 PRD 确认）
+            with session_factory() as session:
+                if _consensus_state(session, project_id) != "pending":
+                    yield _sse({"type": "error", "detail": "当前没有待确认的需求共识"})
+                    return
+                confirm_message = Message(
+                    project_id=project_id,
+                    role="user",
+                    kind="consensus_confirm",
+                    content=confirm_content,
+                )
+                session.add(confirm_message)
+                session.commit()
+                session.refresh(confirm_message)
+                history = _llm_history(
+                    session,
+                    project_id,
+                    before_message_id=confirm_message.id,
+                    window=settings.agent_history_window,
+                )
+                existing_files = _existing_file_paths(session, project_id)
+            async for chunk in _engineer_stream(
+                request, project_id, confirm_content, history, existing_files
+            ):
+                yield chunk
+
+    return _sse_response(event_stream())
 
 
 @router.get("/{project_id}/files", response_model=list[FileOut])

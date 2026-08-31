@@ -20,7 +20,7 @@ interface ToolInfo {
 
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool' | 'prd' | 'thinking'
+  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'thinking'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
@@ -31,6 +31,8 @@ interface ChatEntry {
   // PRD 卡片（工单 0010）：已确认的不再显示操作区，仅待确认的卡片可交互；
   // 未确认前发送普通消息会被后端引导先处理 PRD（工单 0010）
   prdConfirmed?: boolean
+  // 需求共识卡片（工单 0015）：交互规则同 PRD 卡片；待确认时发消息会重新澄清
+  consensusConfirmed?: boolean
 }
 
 const route = useRoute()
@@ -50,6 +52,8 @@ type InterruptedState = { status: 'unknown' | 'none' | 'interrupted' }
 const interrupted = ref<InterruptedState>({ status: 'unknown' })
 // PRD 确认时的追加意见（工单 0010）；同一时刻至多一张待确认卡片，单值即可
 const prdFeedback = ref('')
+// 需求共识确认时的修改意见（工单 0015）
+const consensusFeedback = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
@@ -169,11 +173,22 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
       // 其后存在确认消息即视为已确认（工单 0010）
       const confirmed = messages.slice(i + 1).some((x) => x.kind === 'prd_confirm')
       result.push({ id: `msg-${m.id}`, kind: 'prd', content: m.content, prdConfirmed: confirmed })
+    } else if (m.kind === 'consensus') {
+      // 需求共识卡片（工单 0015）：确认状态推导同 PRD；仅最新一张待确认卡片可交互，
+      // 旧卡片（被重新澄清取代的）即使未确认也不再显示操作区——下方确认按钮只认尾部
+      const confirmed = messages.slice(i + 1).some((x) => x.kind === 'consensus_confirm')
+      const superseded = messages.slice(i + 1).some((x) => x.kind === 'consensus')
+      result.push({
+        id: `msg-${m.id}`,
+        kind: 'consensus',
+        content: m.content,
+        consensusConfirmed: confirmed || superseded,
+      })
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
       result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
-    } else if (m.kind === 'prd_confirm') {
-      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010）
+    } else if (m.kind === 'prd_confirm' || m.kind === 'consensus_confirm') {
+      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010/0015）
       result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
     } else if (m.kind === 'text') {
       result.push({
@@ -332,12 +347,28 @@ async function confirmPrd() {
   }
 }
 
+// 确认需求共识（工单 0015）：确认后工程师智能体随即开始生成；
+// 修改意见可选，随确认一并交给工程师，同步落对话历史可回看；
+// 首建流水线内确认不占用新名额，不会遇限流（ADR 0003）
+async function confirmConsensus() {
+  if (generating.value) return
+  const feedback = consensusFeedback.value.trim()
+  consensusFeedback.value = ''
+  entries.value.push({
+    id: nextId(),
+    kind: 'user',
+    content: feedback || '确认共识，开始生成。',
+  })
+  await runSse(`/api/projects/${projectId.value}/consensus/confirm`, { feedback })
+}
+
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   generating.value = true
   errorDetail.value = ''
   interrupted.value = { status: 'none' }
   const textHolder: { entry: ChatEntry | null } = { entry: null }
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
+  const consensusHolder: { entry: ChatEntry | null } = { entry: null }
   const thinkingHolder: { entry: ChatEntry | null } = { entry: null }
 
   const ensureTextEntry = (): ChatEntry => {
@@ -380,6 +411,22 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return prdHolder.entry
   }
 
+  // 需求共识增量事件累积成一张流式卡片（工单 0015）；流结束后以持久化历史为准重渲染
+  const ensureConsensusEntry = (): ChatEntry => {
+    if (!consensusHolder.entry) {
+      consensusHolder.entry = {
+        id: nextId(),
+        kind: 'consensus',
+        content: '',
+        raw: '',
+        streaming: true,
+        consensusConfirmed: false,
+      }
+      entries.value.push(consensusHolder.entry)
+    }
+    return consensusHolder.entry
+  }
+
   try {
     await streamPost(path, body, (event: SseEvent) => {
       if (event.type === 'thinking') {
@@ -388,6 +435,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         pushText(ensureTextEntry(), String(event.content ?? ''))
       } else if (event.type === 'prd') {
         pushText(ensurePrdEntry(), String(event.content ?? ''))
+      } else if (event.type === 'consensus') {
+        pushText(ensureConsensusEntry(), String(event.content ?? ''))
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -428,6 +477,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     generating.value = false
     if (textHolder.entry) textHolder.entry.streaming = false
     if (prdHolder.entry) prdHolder.entry.streaming = false
+    if (consensusHolder.entry) consensusHolder.entry.streaming = false
     if (thinkingHolder.entry) thinkingHolder.entry.streaming = false
     // 等打字机追平再换历史，避免尾部字符闪现；随后以持久化结果为准对齐（含思考行，回看折叠展示）
     await waitForTypewriter()
@@ -527,6 +577,37 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     @click="confirmPrd"
                   >
                     确认并开始实现
+                  </el-button>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="entry.kind === 'consensus'" class="msg agent-msg">
+              <div class="prd-card consensus-card">
+                <div class="prd-head">
+                  <span class="prd-role">需求澄清 · 共识</span>
+                  <el-tag v-if="entry.consensusConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else size="small" type="warning">待确认</el-tag>
+                </div>
+                <div
+                  class="bubble markdown prd-body"
+                  v-html="renderMarkdown(entry.content || (entry.streaming ? '正在整理需求共识…' : ''))"
+                />
+                <div v-if="!entry.consensusConfirmed && !entry.streaming" class="prd-actions" data-testid="consensus-card-actions">
+                  <el-input
+                    v-model="consensusFeedback"
+                    type="textarea"
+                    :rows="2"
+                    :disabled="generating"
+                    placeholder="修改意见（可选），例如：功能 2 不要了；也可以直接继续对话补充需求"
+                    data-testid="consensus-feedback-input"
+                  />
+                  <el-button
+                    type="primary"
+                    :loading="generating"
+                    data-testid="consensus-confirm-button"
+                    @click="confirmConsensus"
+                  >
+                    确认共识并开始生成
                   </el-button>
                 </div>
               </div>

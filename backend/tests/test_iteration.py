@@ -9,7 +9,12 @@
 
 from pathlib import Path
 
-from conftest import use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    confirm_first_build,
+    seed_project_files,
+    use_fake_model,
+)
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -23,7 +28,8 @@ class TestIteration:
         use_fake_model(
             app,
             [
-                # 首轮：生成两个文件
+                # 首建：澄清产出共识，确认后生成两个文件（工单 0015）
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
                 {"text": "第一版完成。"},
@@ -34,6 +40,7 @@ class TestIteration:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        confirm_first_build(client, auth_headers, project["id"])
         events = _stream_messages(client, auth_headers, project["id"], "把标题改一下")
 
         # 迭代轮只触碰受影响文件
@@ -53,6 +60,8 @@ class TestIteration:
         settings.agent_history_window = 1  # 仅保留最近一轮问答
         model = use_fake_model(app, [{"text": f"ok{i}"} for i in range(3)])
         project = _create_project(client, auth_headers)
+        # 预置文件：三轮都是纯迭代，窗口语义不被首建澄清分流干扰（工单 0015）
+        seed_project_files(app, project["id"])
         _stream_messages(client, auth_headers, project["id"], "第一条指令")
         _stream_messages(client, auth_headers, project["id"], "第二条指令")
         _stream_messages(client, auth_headers, project["id"], "第三条指令")
@@ -67,6 +76,8 @@ class TestIteration:
         settings.agent_history_window = 1
         use_fake_model(app, [{"text": f"ok{i}"} for i in range(3)])
         project = _create_project(client, auth_headers)
+        # 同上：预置文件走纯迭代链路（工单 0015）
+        seed_project_files(app, project["id"])
         _stream_messages(client, auth_headers, project["id"], "第一条指令")
         _stream_messages(client, auth_headers, project["id"], "第二条指令")
         _stream_messages(client, auth_headers, project["id"], "第三条指令")

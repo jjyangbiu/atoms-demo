@@ -12,7 +12,7 @@ TestClient 自动维护 Cookie 罐：auth_headers 依赖登录过后，同一 cl
 
 from fastapi.testclient import TestClient
 
-from conftest import use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, confirm_first_build, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -21,6 +21,7 @@ def _generate_two_files(app, client, headers) -> dict:
     use_fake_model(
         app,
         [
+            FIRST_BUILD_CLARIFY_STEP,
             {
                 "tool_calls": [
                     (
@@ -38,6 +39,7 @@ def _generate_two_files(app, client, headers) -> dict:
     )
     project = _create_project(client, headers)
     _stream_messages(client, headers, project["id"], "做一个时钟应用")
+    confirm_first_build(client, headers, project["id"])  # 首建先过澄清确认门（工单 0015）
     return project
 
 

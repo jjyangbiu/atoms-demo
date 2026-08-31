@@ -7,7 +7,12 @@ import asyncio
 import json
 from pathlib import Path
 
-from conftest import use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    confirm_first_build,
+    seed_project_files,
+    use_fake_model,
+)
 from fake_model import FakeStreamingModel
 from test_projects import _create_project
 
@@ -39,13 +44,17 @@ class TestGeneration:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>时钟</h1>"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "h1{color:red}"})]},
                 {"text": "已完成：一个包含入口页与样式的时钟应用。"},
             ],
         )
         project = _create_project(client, auth_headers)
-        events = _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+        # 首建流水线（工单 0015）：首条消息先产出需求共识，确认后才开始生成
+        clarify_events = _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+        assert any(e["type"] == "consensus" for e in clarify_events)
+        events = confirm_first_build(client, auth_headers, project["id"])
 
         types = [e["type"] for e in events]
         # 事件序列：工具 start/done 成对 → 最终文本 → done（持久化完成后才发出，且是最后一个事件）
@@ -63,17 +72,20 @@ class TestGeneration:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]},
                 {"text": "构建完成。"},
             ],
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "随便做个页面")
+        confirm_first_build(client, auth_headers, project["id"])
 
         resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
         messages = resp.json()
         assert messages[0]["role"] == "user" and messages[0]["content"] == "随便做个页面"
         kinds = [m["kind"] for m in messages]
+        assert "consensus" in kinds and "consensus_confirm" in kinds  # 澄清与确认门留痕可回看
         assert "event" in kinds  # 工具事件留痕
         assert messages[-1]["role"] == "engineer" and messages[-1]["content"] == "构建完成。"
 
@@ -81,6 +93,7 @@ class TestGeneration:
         model = use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "第一版完成。"},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
@@ -89,6 +102,7 @@ class TestGeneration:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "第一版")
+        confirm_first_build(client, auth_headers, project["id"])
         _stream_messages(client, auth_headers, project["id"], "改一下")
 
         # 第二轮的上下文：系统提示含已有文件清单，历史含第一轮问答
@@ -105,12 +119,14 @@ class TestGeneration:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "../../evil.html", "content": "bad"})]},
                 {"text": "尝试越界。"},
             ],
         )
         project = _create_project(client, auth_headers)
-        events = _stream_messages(client, auth_headers, project["id"], "越界")
+        _stream_messages(client, auth_headers, project["id"], "越界")
+        events = confirm_first_build(client, auth_headers, project["id"])
 
         tool_done = [e for e in events if e["type"] == "tool" and e["status"] == "error"]
         assert tool_done, "越界写入应产生错误状态的工具事件"
@@ -121,12 +137,14 @@ class TestGeneration:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "app.exe", "content": "bad"})]},
                 {"text": "尝试写可执行文件。"},
             ],
         )
         project = _create_project(client, auth_headers)
-        events = _stream_messages(client, auth_headers, project["id"], "写个exe")
+        _stream_messages(client, auth_headers, project["id"], "写个exe")
+        events = confirm_first_build(client, auth_headers, project["id"])
         assert any(e["type"] == "tool" and e["status"] == "error" for e in events)
         assert not (_project_dir(settings, project["id"]) / "app.exe").exists()
 
@@ -196,6 +214,8 @@ class TestThinkingStream:
             [[THINK_OPEN[:3], THINK_OPEN[3:] + "先分析需求。" + THINK_CLOSE[:4], THINK_CLOSE[4:] + "构建完成。"]]
         )
         project = _create_project(client, auth_headers)
+        # 逐字流式伪模型无法发工具调用：预置文件绕过澄清分流，直测工程师流（工单 0015）
+        seed_project_files(app, project["id"])
         events = _stream_messages(client, auth_headers, project["id"], "做一个时钟")
 
         think = "".join(e["content"] for e in events if e["type"] == "thinking")
@@ -215,6 +235,8 @@ class TestThinkingStream:
         )
         app.state.model_factory = lambda _s: model
         project = _create_project(client, auth_headers)
+        # 同上：预置文件绕过澄清分流（逐字流式伪模型无法发工具调用，工单 0015）
+        seed_project_files(app, project["id"])
         _stream_messages(client, auth_headers, project["id"], "做一个页面")
 
         messages = client.get(

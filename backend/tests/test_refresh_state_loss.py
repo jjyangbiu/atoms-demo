@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from app.agent.loop import THINK_CLOSE, THINK_OPEN
 from app.models import Message
+from conftest import seed_project_files
 from test_projects import _create_project
 
 
@@ -127,6 +128,8 @@ class TestRefreshMidGeneration:
             gate,
         )
         project = _create_project(client, auth_headers)
+        # 预置文件绕过澄清分流：断流发生在工程师生成中途（工单 0015）
+        seed_project_files(app, project["id"])
         token = auth_headers["Authorization"].removeprefix("Bearer ")
         project_id = project["id"]
 

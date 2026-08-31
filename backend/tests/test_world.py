@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from conftest import login, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, confirm_first_build, login, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -23,16 +23,18 @@ from test_projects import _create_project
 def _generate_and_publish(
     app, client, headers, name="时钟", prompt="做一个时钟应用", content="<h1>时钟</h1>"
 ) -> tuple[dict, dict]:
-    """用伪模型生成一个项目并发布，返回 (项目, 发布结果)。"""
+    """用伪模型生成一个项目并发布，返回 (项目, 发布结果)。首建先过澄清确认门（工单 0015）。"""
     use_fake_model(
         app,
         [
+            FIRST_BUILD_CLARIFY_STEP,
             {"tool_calls": [("write_file", {"path": "index.html", "content": content})]},
             {"text": "完成。"},
         ],
     )
     project = _create_project(client, headers, name=name)
     _stream_messages(client, headers, project["id"], prompt)
+    confirm_first_build(client, headers, project["id"])
     resp = client.post(f"/api/projects/{project['id']}/publish", headers=headers)
     assert resp.status_code == 201, resp.text
     return project, resp.json()
@@ -75,12 +77,14 @@ class TestWorldGallery:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>私</h1>"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个不发布的应用")
+        confirm_first_build(client, auth_headers, project["id"])
 
         assert TestClient(app).get("/api/world").json() == []
 
@@ -93,6 +97,7 @@ class TestWorldGallery:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v</h1>"})]},
                 {"text": "完成。"},
             ]
@@ -100,9 +105,11 @@ class TestWorldGallery:
         )
         first = _create_project(client, auth_headers, name="先发布")
         _stream_messages(client, auth_headers, first["id"], "第一个")
+        confirm_first_build(client, auth_headers, first["id"])
         first_pub = client.post(f"/api/projects/{first['id']}/publish", headers=auth_headers).json()
         second = _create_project(client, auth_headers, name="后发布")
         _stream_messages(client, auth_headers, second["id"], "第二个")
+        confirm_first_build(client, auth_headers, second["id"])
         second_pub = client.post(f"/api/projects/{second['id']}/publish", headers=auth_headers).json()
 
         titles = [a["title"] for a in TestClient(app).get("/api/world").json()]
@@ -150,6 +157,7 @@ class TestClone:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
                 {"text": "第一版。"},
                 {
@@ -162,6 +170,7 @@ class TestClone:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        confirm_first_build(client, auth_headers, project["id"])
         pub = client.post(f"/api/projects/{project['id']}/publish", headers=auth_headers).json()
 
         eve_headers = _register_and_login(client, "eve")
@@ -195,6 +204,7 @@ class TestClone:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
                 {"text": "第一版。"},
                 {
@@ -207,6 +217,7 @@ class TestClone:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        confirm_first_build(client, auth_headers, project["id"])
         pub = client.post(f"/api/projects/{project['id']}/publish", headers=auth_headers).json()
 
         eve_headers = _register_and_login(client, "eve")

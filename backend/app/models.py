@@ -95,9 +95,10 @@ class Message(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
-    # user | pm | engineer | system
+    # user | pm | engineer | clarifier | system
     role: Mapped[str] = mapped_column(String(16), nullable=False)
-    # text | prd | prd_confirm | event（prd/prd_confirm 为团队模式，工单 0010）
+    # text | prd | prd_confirm | consensus | consensus_confirm | event | thinking
+    # （prd/prd_confirm 为团队模式，工单 0010；consensus/consensus_confirm 为需求澄清，工单 0015）
     kind: Mapped[str] = mapped_column(String(16), default="text", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

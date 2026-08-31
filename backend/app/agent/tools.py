@@ -104,6 +104,21 @@ def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
     return tools
 
 
+def build_clarify_tools() -> list:
+    """澄清智能体的唯一工具（工单 0015 / ADR 0003）。
+
+    澄清阶段不绑定任何文件工具：模型物理上无法提前写代码，
+    唯一出口是携带需求共识摘要的 start_build。
+    """
+
+    @tool
+    def start_build(requirements_summary: str) -> str:
+        """澄清完成（或用户要求跳过澄清）时调用，产出需求共识。参数: requirements_summary — 澄清后达成的需求共识摘要（中文 Markdown）。"""
+        return "已记录需求共识，等待用户确认。"
+
+    return [start_build]
+
+
 def execute_tool(tools: list, name: str, args: dict) -> tuple[bool, str]:
     """按名称执行工具，返回 (是否成功, 结果文本)；异常转成失败结果交还模型。"""
     for t in tools:

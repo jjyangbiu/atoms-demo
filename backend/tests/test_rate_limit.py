@@ -5,6 +5,9 @@
 - 全局并发占满时新生成被拒，不影响进行中的生成；结束后名额释放
 - 引导类响应不调模型不计限额；确认 PRD 触发的生成同样受限流约束
 - 限额参数经配置（环境变量）注入，测试以可控时钟验证滑动窗口边界
+名额语义（工单 0015 / ADR 0003）：首建流水线整体只扣 1 个名额，
+首建完成（有文件）后的迭代消息恢复按次计数；此处以预置文件的项目验证后者，
+首建流水线内名额只扣一次的语义见 test_clarification.py。
 任何测试不得调用真实 MiniMax API。
 """
 
@@ -15,7 +18,7 @@ import threading
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
-from conftest import use_fake_model
+from conftest import seed_project_files, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -88,6 +91,8 @@ class TestUserHourlyLimit:
         app.state.rate_limiter.per_user_hourly = 2
         use_fake_model(app, [{"text": "完成"}] * 3)
         project = _create_project(client, auth_headers)
+        # 预置文件：迭代消息按次计数（首建流水线名额语义见 test_clarification）
+        seed_project_files(app, project["id"])
 
         _stream_messages(client, auth_headers, project["id"], "第一次")
         _stream_messages(client, auth_headers, project["id"], "第二次")
@@ -114,6 +119,7 @@ class TestUserHourlyLimit:
         app.state.rate_limiter.per_user_hourly = 1
         use_fake_model(app, [{"text": "完成"}] * 3)
         project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"])
 
         _stream_messages(client, auth_headers, project["id"], "第一次")
 
@@ -144,6 +150,7 @@ class TestUserHourlyLimit:
         app.state.rate_limiter.per_user_hourly = 1
         use_fake_model(app, [{"text": "完成"}] * 2)
         project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"])
 
         _stream_messages(client, auth_headers, project["id"], "第一次")
         for _ in range(3):
@@ -284,6 +291,7 @@ class TestLimitConfiguration:
         _use_clock(app)
         use_fake_model(app, [{"text": "完成"}] * 3)
         project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"])
         for i in range(3):
             events = _stream_messages(client, auth_headers, project["id"], f"第 {i} 次")
             assert events[-1]["type"] == "done"
