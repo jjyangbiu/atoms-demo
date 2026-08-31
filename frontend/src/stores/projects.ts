@@ -20,7 +20,8 @@ export interface PublishOut {
 export interface MessageOut {
   id: number
   role: 'user' | 'pm' | 'engineer' | 'system'
-  kind: 'text' | 'prd' | 'prd_confirm' | 'event'
+  // thinking 为推理模型的思考过程留痕，回看时以折叠块展示（诊断修复）
+  kind: 'text' | 'prd' | 'prd_confirm' | 'event' | 'thinking'
   content: string
   created_at: string
 }

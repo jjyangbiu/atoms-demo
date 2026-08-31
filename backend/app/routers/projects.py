@@ -163,8 +163,8 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
     )
     history = []
     for m in rows:
-        if m.kind == "event" or m.role == "system":
-            # 工具事件行与引导性系统消息不入上下文（工单 0010）
+        if m.kind in ("event", "thinking") or m.role == "system":
+            # 工具事件行、思考过程行与引导性系统消息不入上下文（工单 0010）
             continue
         if m.role == "user":
             # 含 prd_confirm：确认消息（可含追加意见）以用户消息呈现，后续迭代可见（工单 0010）
@@ -314,6 +314,7 @@ async def _engineer_stream(
     system_prompt = build_system_prompt(existing_files)
 
     done_data: dict | None = None
+    thinking_parts: list[str] = []
     try:
         async for event in run_generation(
             model,
@@ -329,6 +330,9 @@ async def _engineer_stream(
                 # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
                 done_data = event.data
             else:
+                if event.type == "thinking":
+                    # 思考增量另存一份，收尾时合并落库供刷新后回看（折叠展示）
+                    thinking_parts.append(event.data.get("content", ""))
                 yield _sse({"type": event.type, **event.data})
                 if event.type == "tool" and event.data.get("status") != "start":
                     _persist_event(session_factory, project_id, event.data)
@@ -338,6 +342,11 @@ async def _engineer_stream(
 
     try:
         with session_factory() as session:
+            thinking_text = "".join(thinking_parts).strip()
+            if thinking_text:
+                session.add(
+                    Message(project_id=project_id, role="engineer", kind="thinking", content=thinking_text)
+                )
             final_text = done_data.get("text", "") if done_data else ""
             if final_text:
                 session.add(
@@ -373,6 +382,7 @@ async def _pm_stream(request: Request, project_id: int, user_text: str, history:
 
     done_data: dict | None = None
     errored = False
+    thinking_parts: list[str] = []
     try:
         async for event in run_generation(
             model,
@@ -391,6 +401,8 @@ async def _pm_stream(request: Request, project_id: int, user_text: str, history:
             else:
                 if event.type == "error":
                     errored = True
+                if event.type == "thinking":
+                    thinking_parts.append(event.data.get("content", ""))
                 yield _sse({"type": event.type, **event.data})
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
         yield _sse({"type": "error", "detail": f"生成中断: {e}"})
@@ -404,6 +416,11 @@ async def _pm_stream(request: Request, project_id: int, user_text: str, history:
         return
     try:
         with session_factory() as session:
+            thinking_text = "".join(thinking_parts).strip()
+            if thinking_text:
+                session.add(
+                    Message(project_id=project_id, role="pm", kind="thinking", content=thinking_text)
+                )
             session.add(Message(project_id=project_id, role="pm", kind="prd", content=prd_text))
             project_row = session.get(Project, project_id)
             if project_row is not None:

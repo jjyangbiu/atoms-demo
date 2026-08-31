@@ -10,7 +10,7 @@
 因此与真实 ChatOpenAI 走完全相同的循环代码路径。
 """
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 
 class FakeModel:
@@ -35,3 +35,26 @@ class FakeModel:
             for i, (name, args) in enumerate(step.get("tool_calls", []))
         ]
         return AIMessage(content=step.get("text", ""), tool_calls=tool_calls)
+
+
+class FakeStreamingModel:
+    """逐字流式伪模型：每次调用按预排的 chunk 片段序列经 astream 产出。
+
+    用于验证真实推理模型（如 MiniMax-M3）的行内 <think>...</think> 思考流：
+    片段可故意把标签切断在 chunk 边界上，检验跨 chunk 拆分。
+    """
+
+    def __init__(self, chunk_scripts: list[list[str]]):
+        self.chunk_scripts = list(chunk_scripts)
+        self.received_messages: list[list] = []
+
+    def bind_tools(self, tools):
+        return self
+
+    async def astream(self, messages):
+        self.received_messages.append(list(messages))
+        if not self.chunk_scripts:
+            yield AIMessageChunk(content="（脚本已耗尽）")
+            return
+        for piece in self.chunk_scripts.pop(0):
+            yield AIMessageChunk(content=piece)

@@ -3,11 +3,15 @@
 验收对应工单 0003：任何测试不得调用真实 MiniMax API。
 """
 
+import asyncio
 import json
 from pathlib import Path
 
 from conftest import use_fake_model
+from fake_model import FakeStreamingModel
 from test_projects import _create_project
+
+from app.agent.loop import THINK_CLOSE, THINK_OPEN, run_generation
 
 
 def _stream_messages(client, headers, project_id, content):
@@ -158,3 +162,110 @@ class TestGeneration:
             ).status_code
             == 404
         )
+
+
+class _GatedStreamModel:
+    """前半段流式产出后卡在闸门上，用于断言事件是实时外发而非整段缓冲。"""
+
+    def __init__(self, first_chunks: list[str], rest_chunks: list[str], gate: asyncio.Event):
+        self.first_chunks = first_chunks
+        self.rest_chunks = rest_chunks
+        self.gate = gate
+
+    def bind_tools(self, tools):
+        return self
+
+    async def astream(self, messages):
+        from langchain_core.messages import AIMessageChunk
+
+        for piece in self.first_chunks:
+            yield AIMessageChunk(content=piece)
+        await self.gate.wait()
+        for piece in self.rest_chunks:
+            yield AIMessageChunk(content=piece)
+
+
+class TestThinkingStream:
+    """思考过程展示（诊断修复）：MiniMax-M3 把思考以 <think>...</think> 行内输出，
+    须拆为独立 thinking 事件（前端才能以小号可折叠样式展示），且事件实时外发（打字机效果前提）。
+    """
+
+    def test_think_tags_split_into_thinking_events_across_chunks(self, app, client, auth_headers):
+        # 标签故意被切断在 chunk 边界上（开标签剩前半截 + 闭标签剩前半截）
+        app.state.model_factory = lambda _s: FakeStreamingModel(
+            [[THINK_OPEN[:3], THINK_OPEN[3:] + "先分析需求。" + THINK_CLOSE[:4], THINK_CLOSE[4:] + "构建完成。"]]
+        )
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个时钟")
+
+        think = "".join(e["content"] for e in events if e["type"] == "thinking")
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert think == "先分析需求。"
+        assert text == "构建完成。"
+        # 结论（done 与落库文本）不残留思考标签与内容
+        assert events[-1]["type"] == "done"
+        assert events[-1]["text"] == "构建完成。"
+
+    def test_thinking_persisted_and_excluded_from_context(self, app, client, auth_headers):
+        model = FakeStreamingModel(
+            [
+                [THINK_OPEN + "先分析需求。" + THINK_CLOSE + "构建完成。"],
+                ["已更新。"],
+            ]
+        )
+        app.state.model_factory = lambda _s: model
+        project = _create_project(client, auth_headers)
+        _stream_messages(client, auth_headers, project["id"], "做一个页面")
+
+        messages = client.get(
+            f"/api/projects/{project['id']}/messages", headers=auth_headers
+        ).json()
+        kinds = [m["kind"] for m in messages]
+        assert "thinking" in kinds
+        thinking_row = next(m for m in messages if m["kind"] == "thinking")
+        assert thinking_row["content"] == "先分析需求。"
+        assert messages[-1]["role"] == "engineer" and messages[-1]["content"] == "构建完成。"
+
+        # 迭代一轮：思考行不入模型上下文（与工具事件行同等对待）
+        _stream_messages(client, auth_headers, project["id"], "改一下")
+        second_call = [getattr(m, "content", "") for m in model.received_messages[-1]]
+        assert not any("先分析需求" in c for c in second_call)
+        assert "构建完成。" in second_call
+
+    def test_text_events_stream_live_not_buffered(self):
+        """打字机效果的前提：模型还在流式产出时，前面的增量就已外发（而非整段缓冲后一次性 flush）。"""
+
+        async def scenario():
+            gate = asyncio.Event()
+            model = _GatedStreamModel(["你好"], ["，世界。"], gate)
+            gen = run_generation(model, [], None, "系统提示", [], "打个招呼")
+            # 闸门未开（模型后半段还没产出），第一个事件必须已可拿到；超时即说明仍是整段缓冲
+            first = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+            assert first.type == "text" and first.data["content"] == "你好"
+            gate.set()
+            rest = [e async for e in gen]
+            assert any(e.type == "text" and e.data["content"] == "，世界。" for e in rest)
+            assert rest[-1].type == "done" and rest[-1].data["text"] == "你好，世界。"
+
+        asyncio.run(scenario())
+
+    def test_streaming_failure_after_emission_is_not_retried(self):
+        """已外发内容后中途失败：不得重试（避免半截流重复），以 error 收尾。"""
+
+        class _MidFailModel:
+            def bind_tools(self, tools):
+                return self
+
+            async def astream(self, messages):
+                from langchain_core.messages import AIMessageChunk
+
+                yield AIMessageChunk(content="半截内容")
+                raise RuntimeError("流中断")
+
+        async def scenario():
+            gen = run_generation(_MidFailModel(), [], None, "系统提示", [], "你好", max_retries=2)
+            events = [e async for e in gen]
+            assert [e.type for e in events] == ["text", "error"]
+            assert "模型调用失败" in events[-1].data["detail"]
+
+        asyncio.run(scenario())

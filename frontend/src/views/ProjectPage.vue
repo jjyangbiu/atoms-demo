@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
-import { computed, defineAsyncComponent, nextTick, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api, ApiError } from '@/api/client'
@@ -20,10 +20,14 @@ interface ToolInfo {
 
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool' | 'prd'
+  kind: 'user' | 'text' | 'tool' | 'prd' | 'thinking'
+  // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
+  raw?: string
   tool?: ToolInfo
   streaming?: boolean
+  // 思考块是否折叠：流式过程默认展开，结束后默认折叠（诊断修复）
+  collapsed?: boolean
   // PRD 卡片（工单 0010）：已确认的不再显示操作区，仅待确认的卡片可交互；
   // 未确认前发送普通消息会被后端引导先处理 PRD（工单 0010）
   prdConfirmed?: boolean
@@ -99,6 +103,53 @@ function scrollToBottom() {
   })
 }
 
+// 打字机（诊断修复）：服务端增量先入 entry.raw，定时器逐拍把字符搬进 content；
+// 积压越大搬运越快，保证流结束后短时间内追平，历史回看则整段直出不重放
+let typewriterTimer: number | null = null
+
+function pushText(entry: ChatEntry, piece: string) {
+  entry.raw = (entry.raw ?? '') + piece
+  if (typewriterTimer === null) {
+    typewriterTimer = window.setInterval(typewriterTick, 24)
+  }
+}
+
+function typewriterTick() {
+  let active = false
+  for (const entry of entries.value) {
+    const raw = entry.raw ?? ''
+    if (entry.content.length >= raw.length) continue
+    active = true
+    const backlog = raw.length - entry.content.length
+    entry.content = raw.slice(0, entry.content.length + Math.max(2, Math.ceil(backlog / 25)))
+  }
+  if (active) scrollToBottom()
+  if (!active && typewriterTimer !== null) {
+    window.clearInterval(typewriterTimer)
+    typewriterTimer = null
+  }
+}
+
+function waitForTypewriter(timeoutMs = 1500): Promise<void> {
+  // 收尾前等打字机追平，避免刷新历史时尾巴上的字突然闪现；超时兜底不阻塞
+  return new Promise((resolve) => {
+    const start = Date.now()
+    const check = () => {
+      const pending = entries.value.some((e) => e.content.length < (e.raw ?? '').length)
+      if (!pending || Date.now() - start > timeoutMs) resolve()
+      else window.setTimeout(check, 30)
+    }
+    check()
+  })
+}
+
+onBeforeUnmount(() => {
+  if (typewriterTimer !== null) {
+    window.clearInterval(typewriterTimer)
+    typewriterTimer = null
+  }
+})
+
 function toEntries(messages: MessageOut[]): ChatEntry[] {
   const result: ChatEntry[] = []
   for (let i = 0; i < messages.length; i++) {
@@ -114,6 +165,9 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
       // 其后存在确认消息即视为已确认（工单 0010）
       const confirmed = messages.slice(i + 1).some((x) => x.kind === 'prd_confirm')
       result.push({ id: `msg-${m.id}`, kind: 'prd', content: m.content, prdConfirmed: confirmed })
+    } else if (m.kind === 'thinking') {
+      // 思考历史回看：整段直出、默认折叠（诊断修复）
+      result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
     } else if (m.kind === 'prd_confirm') {
       // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010）
       result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
@@ -262,13 +316,30 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   errorDetail.value = ''
   const textHolder: { entry: ChatEntry | null } = { entry: null }
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
+  const thinkingHolder: { entry: ChatEntry | null } = { entry: null }
 
   const ensureTextEntry = (): ChatEntry => {
     if (!textHolder.entry) {
-      textHolder.entry = { id: nextId(), kind: 'text', content: '', streaming: true }
+      textHolder.entry = { id: nextId(), kind: 'text', content: '', raw: '', streaming: true }
       entries.value.push(textHolder.entry)
     }
     return textHolder.entry
+  }
+
+  // 思考过程条目（诊断修复）：小号可折叠，流式时展开，随打字机逐字显现
+  const ensureThinkingEntry = (): ChatEntry => {
+    if (!thinkingHolder.entry) {
+      thinkingHolder.entry = {
+        id: nextId(),
+        kind: 'thinking',
+        content: '',
+        raw: '',
+        streaming: true,
+        collapsed: false,
+      }
+      entries.value.push(thinkingHolder.entry)
+    }
+    return thinkingHolder.entry
   }
 
   // PRD 增量事件累积成一张流式卡片（工单 0010）；流结束后以持久化历史为准重渲染（工单 0010）
@@ -278,6 +349,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         id: nextId(),
         kind: 'prd',
         content: '',
+        raw: '',
         streaming: true,
         prdConfirmed: false,
       }
@@ -288,10 +360,12 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
   try {
     await streamPost(path, body, (event: SseEvent) => {
-      if (event.type === 'text') {
-        ensureTextEntry().content += String(event.content ?? '')
+      if (event.type === 'thinking') {
+        pushText(ensureThinkingEntry(), String(event.content ?? ''))
+      } else if (event.type === 'text') {
+        pushText(ensureTextEntry(), String(event.content ?? ''))
       } else if (event.type === 'prd') {
-        ensurePrdEntry().content += String(event.content ?? '')
+        pushText(ensurePrdEntry(), String(event.content ?? ''))
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -332,7 +406,10 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     generating.value = false
     if (textHolder.entry) textHolder.entry.streaming = false
     if (prdHolder.entry) prdHolder.entry.streaming = false
-    // 以服务端持久化结果为准对齐；文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
+    if (thinkingHolder.entry) thinkingHolder.entry.streaming = false
+    // 等打字机追平再换历史，避免尾部字符闪现；随后以持久化结果为准对齐（含思考行，回看折叠展示）
+    await waitForTypewriter()
+    // 文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
     // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比
     await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
     previewRev.value += 1
@@ -444,6 +521,26 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
               <span v-if="entry.tool?.status === 'error'" class="tool-error-text">
                 {{ entry.tool.result }}
               </span>
+            </div>
+            <div v-else-if="entry.kind === 'thinking'" class="msg agent-msg">
+              <!-- 思考过程（诊断修复）：小一号文字，可收起/展开，随打字机逐字显现 -->
+              <div class="thinking-card">
+                <button
+                  type="button"
+                  class="thinking-toggle"
+                  data-testid="thinking-toggle"
+                  @click="entry.collapsed = !entry.collapsed"
+                >
+                  <span class="thinking-caret">{{ entry.collapsed ? '▸' : '▾' }}</span>
+                  <span>思考过程</span>
+                  <span v-if="entry.streaming" class="thinking-running">中…</span>
+                </button>
+                <div
+                  v-show="!entry.collapsed"
+                  class="thinking-body markdown"
+                  v-html="renderMarkdown(entry.content || '…')"
+                />
+              </div>
             </div>
             <div v-else class="msg agent-msg">
               <div class="bubble agent-bubble markdown" v-html="renderMarkdown(entry.content || (entry.streaming ? '思考中…' : ''))" />
@@ -708,6 +805,48 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .tool-error-text {
   color: #f56c6c;
   font-size: 12px;
+}
+
+/* 思考过程（诊断修复）：比正文小一号、弱化配色，左侧细线区分层次 */
+.thinking-card {
+  max-width: 92%;
+  border-left: 2px solid #dcdfe6;
+  padding: 2px 0 2px 10px;
+}
+
+.thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: #909399;
+  font-size: 12px;
+}
+
+.thinking-toggle:hover {
+  color: #606266;
+}
+
+.thinking-caret {
+  display: inline-block;
+  width: 10px;
+}
+
+.thinking-running {
+  opacity: 0.7;
+}
+
+.thinking-body {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #909399;
+  margin-top: 4px;
+  max-width: none;
+  padding: 0;
+  background: transparent;
 }
 
 .generating-hint {
