@@ -77,6 +77,11 @@ function renderMarkdown(content: string) {
 }
 
 function toolLabel(tool: ToolInfo): string {
+  if (tool.name === 'search_templates') {
+    // 模板检索事件（工单 0009）：展示检索词而非文件路径
+    const query = typeof tool.args.query === 'string' ? tool.args.query : ''
+    return `检索模板 ${query}`
+  }
   const verb = { write_file: '写入', edit_file: '修改', read_file: '读取' }[tool.name] ?? tool.name
   const path = typeof tool.args.path === 'string' ? tool.args.path : ''
   return `${verb} ${path}`

@@ -14,9 +14,11 @@ from sqlalchemy.orm import Session
 
 from ..deps import get_current_user, get_db
 from ..models import Project, Publication, User
+from ..rag.store import maybe_knowledge_store
 from ..schemas import PublishOut
 from ..serving import serve_project_file
 from .projects import get_owned_project, project_dir
+from .world import _description
 
 router = APIRouter(prefix="/api/projects", tags=["publish"])
 public_router = APIRouter(tags=["public"])
@@ -41,6 +43,31 @@ def get_publication(db: Session, project_id: int) -> Publication | None:
     return db.scalar(select(Publication).where(Publication.project_id == project_id))
 
 
+def _sink_to_knowledge(app, db: Session, project: Project, slug: str) -> None:
+    """已发布应用沉淀进知识库（工单 0009）：之后的生成检索与画廊搜索均可受益。
+
+    沉淀是增强能力，失败不得影响发布结果；知识库不可用时静默跳过。
+    """
+    store = maybe_knowledge_store(app)
+    if store is None:
+        return
+    try:
+        store.upsert_published(slug, project.name, _description(db, project.id))
+    except Exception:  # noqa: BLE001 — embedding/向量库异常不阻断发布
+        pass
+
+
+def _drop_from_knowledge(app, slug: str) -> None:
+    """下架时同步移除知识库沉淀条目；失败不阻断下架（画廊检索以 DB 为准）。"""
+    store = maybe_knowledge_store(app)
+    if store is None:
+        return
+    try:
+        store.remove_published(slug)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @router.post(
     "/{project_id}/publish", response_model=PublishOut, status_code=status.HTTP_201_CREATED
 )
@@ -51,7 +78,7 @@ def publish_project(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PublishOut:
-    get_owned_project(project_id, user, db)
+    project = get_owned_project(project_id, user, db)
     existing = get_publication(db, project_id)
     if existing is not None:
         # 幂等：重复发布返回同一稳定链接
@@ -64,12 +91,14 @@ def publish_project(
     slug = _generate_slug(db)
     db.add(Publication(project_id=project_id, slug=slug))
     db.commit()
+    _sink_to_knowledge(request.app, db, project, slug)
     return PublishOut(slug=slug, url=f"/p/{slug}")
 
 
 @router.delete("/{project_id}/publish", status_code=status.HTTP_204_NO_CONTENT)
 def unpublish_project(
     project_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
@@ -79,6 +108,7 @@ def unpublish_project(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目尚未发布")
     db.delete(publication)
     db.commit()
+    _drop_from_knowledge(request.app, publication.slug)
 
 
 # --- 公开托管：/p/{slug} 任何人无需登录即可访问 ---

@@ -67,8 +67,12 @@ class FileSandbox:
         return self.write_file(path, current.replace(old_text, new_text, 1))
 
 
-def build_tools(sandbox: FileSandbox) -> list:
-    """以闭包绑定沙箱，产出可供模型 bind_tools 的 LangChain 工具。"""
+def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
+    """以闭包绑定沙箱，产出可供模型 bind_tools 的 LangChain 工具。
+
+    knowledge_store 可用时（工单 0009）额外提供 search_templates 模板检索工具；
+    知识库不可用时不注册该工具，生成主链路不受影响。
+    """
 
     @tool
     def read_file(path: str) -> str:
@@ -85,7 +89,19 @@ def build_tools(sandbox: FileSandbox) -> list:
         """对已有文件做局部替换（替换第一处出现的 old_text）。修改前请先 read_file。"""
         return sandbox.edit_file(path, old_text, new_text)
 
-    return [read_file, write_file, edit_file]
+    tools = [read_file, write_file, edit_file]
+    if knowledge_store is not None:
+
+        @tool
+        def search_templates(query: str) -> str:
+            """检索模板知识库，获取相关应用模板与技术片段作为参考。参数: query — 想构建的应用或功能描述。"""
+            hits = knowledge_store.search(query, top_k=5)
+            if not hits:
+                return "未找到相关模板，可直接开始生成。"
+            return "\n\n".join(f"【{h['title']}】\n{h['text']}" for h in hits)
+
+        tools.append(search_templates)
+    return tools
 
 
 def execute_tool(tools: list, name: str, args: dict) -> tuple[bool, str]:

@@ -22,6 +22,7 @@ from ..agent.tools import (
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, Publication, Snapshot, User, _utcnow
+from ..rag.store import maybe_knowledge_store
 from ..schemas import (
     CreateProjectRequest,
     FileContentOut,
@@ -113,6 +114,8 @@ def delete_project(
     db: Session = Depends(get_db),
 ) -> None:
     project = get_owned_project(project_id, user, db)
+    # 先取发布 slug：删项目连带删发布记录，知识库里的沉淀条目一并移除（工单 0009）
+    pub_slug = db.scalar(select(Publication.slug).where(Publication.project_id == project_id))
     db.execute(delete(Message).where(Message.project_id == project_id))
     db.execute(delete(ProjectFile).where(ProjectFile.project_id == project_id))
     db.execute(delete(Publication).where(Publication.project_id == project_id))
@@ -120,6 +123,13 @@ def delete_project(
     db.delete(project)
     db.commit()
     shutil.rmtree(project_dir(request, project_id), ignore_errors=True)
+    if pub_slug:
+        store = maybe_knowledge_store(request.app)
+        if store is not None:
+            try:
+                store.remove_published(pub_slug)
+            except Exception:  # noqa: BLE001 — 知识库清理失败不阻断删除（画廊检索以 DB 为准兜底）
+                pass
 
 
 @router.get("/{project_id}/messages", response_model=list[MessageOut])
@@ -222,7 +232,8 @@ async def send_message(
             return
 
         sandbox = FileSandbox(project_dir(request, project_id))
-        tools = build_tools(sandbox)
+        # 知识库可用时附带 search_templates 检索工具（工单 0009）；不可用时降级为纯文件工具
+        tools = build_tools(sandbox, maybe_knowledge_store(request.app))
         system_prompt = build_system_prompt(existing_files)
 
         done_data: dict | None = None

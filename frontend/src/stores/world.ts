@@ -17,8 +17,10 @@ export interface WorldAppOut {
 export const useWorldStore = defineStore('world', () => {
   const apps = ref<WorldAppOut[]>([])
 
-  async function fetchWorld(): Promise<void> {
-    apps.value = await api<WorldAppOut[]>('/api/world')
+  /** 画廊列表；传 q 时为语义搜索（工单 0009），按意图命中相关应用 */
+  async function fetchWorld(query?: string): Promise<void> {
+    const q = query?.trim()
+    apps.value = await api<WorldAppOut[]>(`/api/world${q ? `?q=${encodeURIComponent(q)}` : ''}`)
   }
 
   async function fetchWorldApp(slug: string): Promise<WorldAppOut> {

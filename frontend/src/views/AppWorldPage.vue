@@ -10,15 +10,22 @@ const router = useRouter()
 
 const loading = ref(true)
 const loggedIn = ref(false)
+// 语义搜索关键词（工单 0009）：按意图命中相关应用，非关键词精确匹配
+const keyword = ref('')
 
 onMounted(async () => {
   loggedIn.value = getToken() !== null
+  await reload()
+})
+
+async function reload(): Promise<void> {
+  loading.value = true
   try {
-    await store.fetchWorld()
+    await store.fetchWorld(keyword.value)
   } finally {
     loading.value = false
   }
-})
+}
 
 function formatTime(iso: string) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false })
@@ -41,8 +48,24 @@ function formatTime(iso: string) {
     </el-header>
     <el-main>
       <p class="intro">所有已发布的应用都在这里：点开试用，喜欢就克隆一份继续迭代。</p>
+      <el-input
+        v-model="keyword"
+        class="search"
+        placeholder="按意图搜索应用，如“记账工具”“倒计时”"
+        clearable
+        data-testid="world-search"
+        @keyup.enter="reload"
+        @clear="reload"
+      >
+        <template #append>
+          <el-button data-testid="world-search-btn" @click="reload">搜索</el-button>
+        </template>
+      </el-input>
 
-      <el-empty v-if="!loading && store.apps.length === 0" description="还没有已发布的应用" />
+      <el-empty
+        v-if="!loading && store.apps.length === 0"
+        :description="keyword.trim() ? '没有找到相关应用，换个说法试试' : '还没有已发布的应用'"
+      />
 
       <div v-else class="app-grid">
         <el-card
@@ -109,6 +132,11 @@ function formatTime(iso: string) {
   margin: 0 0 16px;
   color: #606266;
   font-size: 13px;
+}
+
+.search {
+  max-width: 480px;
+  margin-bottom: 16px;
 }
 
 .app-grid {

@@ -3,6 +3,8 @@
 - 匿名浏览列表与详情：标题、描述、作者、实时运行预览链接（/p/{slug}）
 - 登录用户一键克隆：文件与元数据复制为克隆者名下的新项目，立即可继续迭代
 - 克隆为物理拷贝且不带发布记录：原项目后续演进、下架乃至删除都不影响副本
+- 语义搜索（工单 0009）：?q= 按意图匹配已发布应用，非关键词精确匹配；
+  知识库不可用时降级为标题/描述关键词包含匹配
 """
 
 import shutil
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from ..deps import get_current_user, get_db
 from ..models import Message, Project, Publication, User
+from ..rag.store import maybe_knowledge_store
 from ..schemas import ProjectOut, WorldAppOut
 from ..snapshots import iter_project_files
 from .projects import _sync_file_index, project_dir, project_payload
@@ -22,6 +25,8 @@ router = APIRouter(prefix="/api/world", tags=["world"])
 
 # 画廊卡片上的描述截断上限（描述取创建者首次诉求，见 _description）
 _DESCRIPTION_MAX = 120
+# 语义搜索相似度下限：过滤明显无关结果（工单 0009）
+_SEARCH_MIN_SCORE = 0.1
 
 
 def _get_published(db: Session, slug: str) -> tuple[Publication, Project]:
@@ -59,15 +64,56 @@ def _world_entry(db: Session, publication: Publication, project: Project) -> Wor
     )
 
 
-@router.get("", response_model=list[WorldAppOut])
-def list_world(db: Session = Depends(get_db)) -> list[WorldAppOut]:
-    """画廊列表：所有已发布应用，最新发布在前；任何人无需登录。"""
+def _all_entries(db: Session) -> list[WorldAppOut]:
+    """全部已发布应用，最新发布在前。"""
     entries = []
     for publication in db.scalars(
         select(Publication).order_by(Publication.created_at.desc(), Publication.id.desc())
     ):
         project = db.get(Project, publication.project_id)
         if project is None:
+            continue
+        entries.append(_world_entry(db, publication, project))
+    return entries
+
+
+@router.get("", response_model=list[WorldAppOut])
+def list_world(
+    request: Request, q: str | None = None, db: Session = Depends(get_db)
+) -> list[WorldAppOut]:
+    """画廊列表：所有已发布应用，最新发布在前；任何人无需登录。
+
+    带 q 时为语义搜索（工单 0009）：按意图命中相关应用，相似度降序。
+    """
+    if q and q.strip():
+        return _search_world(request.app, db, q.strip())
+    return _all_entries(db)
+
+
+def _search_world(app, db: Session, query: str) -> list[WorldAppOut]:
+    """知识库可用时语义检索已发布应用；构建失败或运行期故障都降级为关键词包含匹配。"""
+    hits = None
+    store = maybe_knowledge_store(app)
+    if store is not None:
+        try:
+            hits = store.search(query, top_k=50, source="published")
+        except Exception:  # noqa: BLE001 — embedding/向量库运行期异常不阻断公开画廊搜索
+            hits = None
+    if hits is None:
+        needle = query.lower()
+        return [
+            e
+            for e in _all_entries(db)
+            if needle in e.title.lower() or needle in e.description.lower()
+        ]
+    entries = []
+    for hit in hits:
+        if hit["score"] < _SEARCH_MIN_SCORE or not hit.get("slug"):
+            continue
+        publication = db.scalar(select(Publication).where(Publication.slug == hit["slug"]))
+        project = db.get(Project, publication.project_id) if publication is not None else None
+        # 知识库里可能有已下架/已删除的残留条目，以 DB 为准过滤（相似度降序不变）
+        if publication is None or project is None:
             continue
         entries.append(_world_entry(db, publication, project))
     return entries

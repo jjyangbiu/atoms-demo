@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     agent_history_window: int = 10
     # 每个项目保留的版本快照上限，超出时连同文件清理最旧的（工单 0007）
     snapshot_max_kept: int = 50
+    # 模板知识库 / 画廊语义搜索（工单 0009 / ADR 0002）：
+    # embedding 用 MiniMax embo-01（API Key 复用 LLM 的），向量库存 Milvus Lite 本地文件
+    embedding_model: str = "embo-01"
+    milvus_uri: str = "./data/milvus/atoms.db"
 
 
 @lru_cache
