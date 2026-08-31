@@ -63,6 +63,9 @@ function formatTime(iso: string) {
     <el-header class="header">
       <span class="brand">Atoms Demo</span>
       <div class="header-right">
+        <el-button text data-testid="goto-world" @click="router.push({ name: 'world' })">
+          App 世界
+        </el-button>
         <span class="username">{{ auth.user?.username }}</span>
         <el-button text @click="onLogout">退出登录</el-button>
       </div>

@@ -68,6 +68,9 @@ async function onSubmit() {
         还没有账号？
         <router-link to="/register">立即注册</router-link>
       </p>
+      <p class="switch-link">
+        <router-link to="/world">先逛逛 App 世界，看看大家构建的应用</router-link>
+      </p>
     </el-card>
   </div>
 </template>

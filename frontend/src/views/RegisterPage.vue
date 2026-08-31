@@ -84,6 +84,9 @@ async function onSubmit() {
         已有账号？
         <router-link to="/login">去登录</router-link>
       </p>
+      <p class="switch-link">
+        <router-link to="/world">先逛逛 App 世界，看看大家构建的应用</router-link>
+      </p>
     </el-card>
   </div>
 </template>

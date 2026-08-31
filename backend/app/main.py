@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from .agent.model import default_model_factory
 from .config import Settings, get_settings
 from .db import Base, make_engine
-from .routers import auth, projects, publish
+from .routers import auth, projects, publish, world
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -35,6 +35,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(projects.router)
     app.include_router(publish.router)
     app.include_router(publish.public_router)
+    app.include_router(world.router)
 
     @app.get("/api/health")
     def health() -> dict:

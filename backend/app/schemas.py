@@ -50,6 +50,17 @@ class PublishOut(BaseModel):
     url: str
 
 
+class WorldAppOut(BaseModel):
+    """App 世界画廊条目（工单 0008）：已发布应用的公开卡片信息。"""
+
+    slug: str
+    title: str
+    description: str
+    author: str
+    preview_url: str
+    published_at: datetime
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
 

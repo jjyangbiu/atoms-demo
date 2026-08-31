@@ -17,6 +17,16 @@ const router = createRouter({
       component: () => import('@/views/RegisterPage.vue'),
     },
     {
+      path: '/world',
+      name: 'world',
+      component: () => import('@/views/AppWorldPage.vue'),
+    },
+    {
+      path: '/world/:slug',
+      name: 'world-detail',
+      component: () => import('@/views/AppDetailPage.vue'),
+    },
+    {
       path: '/workspace',
       name: 'workspace',
       component: () => import('@/views/WorkspacePage.vue'),
