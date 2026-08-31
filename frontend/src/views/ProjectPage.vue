@@ -20,10 +20,13 @@ interface ToolInfo {
 
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool'
+  kind: 'user' | 'text' | 'tool' | 'prd'
   content: string
   tool?: ToolInfo
   streaming?: boolean
+  // PRD 卡片（工单 0010）：已确认的不再显示操作区，仅待确认的卡片可交互；
+  // 未确认前发送普通消息会被后端引导先处理 PRD（工单 0010）
+  prdConfirmed?: boolean
 }
 
 const route = useRoute()
@@ -32,10 +35,13 @@ const store = useProjectStore()
 
 const projectId = computed(() => Number(route.params.id))
 const projectName = ref('')
+const projectMode = ref<'engineer' | 'team'>('engineer')
 const entries = ref<ChatEntry[]>([])
 const input = ref('')
 const generating = ref(false)
 const errorDetail = ref('')
+// PRD 确认时的追加意见（工单 0010）；同一时刻至多一张待确认卡片，单值即可
+const prdFeedback = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
@@ -95,7 +101,8 @@ function scrollToBottom() {
 
 function toEntries(messages: MessageOut[]): ChatEntry[] {
   const result: ChatEntry[] = []
-  for (const m of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
     if (m.kind === 'event') {
       try {
         const tool = JSON.parse(m.content) as ToolInfo
@@ -103,6 +110,13 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
       } catch {
         /* 事件行解析失败则跳过 */
       }
+    } else if (m.kind === 'prd') {
+      // 其后存在确认消息即视为已确认（工单 0010）
+      const confirmed = messages.slice(i + 1).some((x) => x.kind === 'prd_confirm')
+      result.push({ id: `msg-${m.id}`, kind: 'prd', content: m.content, prdConfirmed: confirmed })
+    } else if (m.kind === 'prd_confirm') {
+      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010）
+      result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
     } else if (m.kind === 'text') {
       result.push({
         id: `msg-${m.id}`,
@@ -115,10 +129,11 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
 }
 
 async function loadProject() {
-  const project = await api<{ name: string; published_slug: string | null }>(
+  const project = await api<{ name: string; mode: 'engineer' | 'team'; published_slug: string | null }>(
     `/api/projects/${projectId.value}`,
   )
   projectName.value = project.name
+  projectMode.value = project.mode
   publishedSlug.value = project.published_slug
 }
 
@@ -211,18 +226,34 @@ async function send() {
   input.value = ''
   entries.value.push({ id: nextId(), kind: 'user', content })
   lastUserContent = content
-  await generate(content)
+  await runSse(`/api/projects/${projectId.value}/messages`, { content })
 }
 
 function retry() {
   if (!lastUserContent || generating.value) return
-  void generate(lastUserContent)
+  void runSse(`/api/projects/${projectId.value}/messages`, { content: lastUserContent })
 }
 
-async function generate(content: string) {
+// 确认 PRD（工单 0010）：确认后工程师智能体随即开始生成，后续迭代与工程师模式一致；
+// 追加意见可选，随确认一并交给工程师，同步落对话历史可回看（工单 0010）
+async function confirmPrd() {
+  if (generating.value) return
+  const feedback = prdFeedback.value.trim()
+  prdFeedback.value = ''
+  // 与后端持久化文案一致（刷新后回看不变）：有意见存意见，无意见存固定确认语（工单 0010）
+  entries.value.push({
+    id: nextId(),
+    kind: 'user',
+    content: feedback || '确认通过，开始实现。',
+  })
+  await runSse(`/api/projects/${projectId.value}/prd/confirm`, { feedback })
+}
+
+async function runSse(path: string, body: unknown) {
   generating.value = true
   errorDetail.value = ''
   const textHolder: { entry: ChatEntry | null } = { entry: null }
+  const prdHolder: { entry: ChatEntry | null } = { entry: null }
 
   const ensureTextEntry = (): ChatEntry => {
     if (!textHolder.entry) {
@@ -232,10 +263,27 @@ async function generate(content: string) {
     return textHolder.entry
   }
 
+  // PRD 增量事件累积成一张流式卡片（工单 0010）；流结束后以持久化历史为准重渲染（工单 0010）
+  const ensurePrdEntry = (): ChatEntry => {
+    if (!prdHolder.entry) {
+      prdHolder.entry = {
+        id: nextId(),
+        kind: 'prd',
+        content: '',
+        streaming: true,
+        prdConfirmed: false,
+      }
+      entries.value.push(prdHolder.entry)
+    }
+    return prdHolder.entry
+  }
+
   try {
-    await streamPost(`/api/projects/${projectId.value}/messages`, { content }, (event: SseEvent) => {
+    await streamPost(path, body, (event: SseEvent) => {
       if (event.type === 'text') {
         ensureTextEntry().content += String(event.content ?? '')
+      } else if (event.type === 'prd') {
+        ensurePrdEntry().content += String(event.content ?? '')
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -269,6 +317,7 @@ async function generate(content: string) {
   } finally {
     generating.value = false
     if (textHolder.entry) textHolder.entry.streaming = false
+    if (prdHolder.entry) prdHolder.entry.streaming = false
     // 以服务端持久化结果为准对齐；文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
     // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比
     await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
@@ -283,7 +332,9 @@ async function generate(content: string) {
     <header class="topbar">
       <el-button text @click="router.push('/workspace')">← 返回</el-button>
       <span class="project-title">{{ projectName }}</span>
-      <el-tag size="small" type="info">工程师模式</el-tag>
+      <el-tag size="small" :type="projectMode === 'team' ? 'warning' : 'info'">
+        {{ projectMode === 'team' ? '团队模式' : '工程师模式' }}
+      </el-tag>
       <div class="publish-area">
         <template v-if="publishedSlug">
           <el-tag size="small" type="success">已发布</el-tag>
@@ -334,6 +385,37 @@ async function generate(content: string) {
           <template v-for="entry in entries" :key="entry.id">
             <div v-if="entry.kind === 'user'" class="msg user-msg">
               <div class="bubble user-bubble">{{ entry.content }}</div>
+            </div>
+            <div v-else-if="entry.kind === 'prd'" class="msg agent-msg">
+              <div class="prd-card">
+                <div class="prd-head">
+                  <span class="prd-role">产品经理 · PRD</span>
+                  <el-tag v-if="entry.prdConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else size="small" type="warning">待确认</el-tag>
+                </div>
+                <div
+                  class="bubble markdown prd-body"
+                  v-html="renderMarkdown(entry.content || (entry.streaming ? '正在起草 PRD…' : ''))"
+                />
+                <div v-if="!entry.prdConfirmed && !entry.streaming" class="prd-actions" data-testid="prd-card-actions">
+                  <el-input
+                    v-model="prdFeedback"
+                    type="textarea"
+                    :rows="2"
+                    :disabled="generating"
+                    placeholder="追加意见（可选），例如：界面用深色主题"
+                    data-testid="prd-feedback-input"
+                  />
+                  <el-button
+                    type="primary"
+                    :loading="generating"
+                    data-testid="prd-confirm-button"
+                    @click="confirmPrd"
+                  >
+                    确认并开始实现
+                  </el-button>
+                </div>
+              </div>
             </div>
             <div v-else-if="entry.kind === 'tool'" class="tool-line">
               <el-tag
@@ -525,6 +607,62 @@ async function generate(content: string) {
 .agent-bubble {
   background: #f4f4f5;
   color: #303133;
+}
+
+.prd-card {
+  max-width: 92%;
+  border: 1px solid #ebeef5;
+  border-radius: 10px;
+  background: #fff;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.prd-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prd-role {
+  font-size: 13px;
+  font-weight: 600;
+  color: #606266;
+}
+
+.prd-body {
+  background: #f4f4f5;
+  color: #303133;
+  max-width: none;
+}
+
+.prd-body :deep(h1) {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+
+.prd-body :deep(h2) {
+  font-size: 14px;
+  margin: 10px 0 6px;
+}
+
+.prd-body :deep(ul),
+.prd-body :deep(ol) {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.prd-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.prd-actions .el-button {
+  align-self: flex-end;
 }
 
 .markdown :deep(p) {

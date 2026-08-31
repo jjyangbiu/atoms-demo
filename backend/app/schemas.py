@@ -65,6 +65,12 @@ class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
 
 
+class ConfirmPrdRequest(BaseModel):
+    """确认 PRD（工单 0010）：可附带追加意见，随确认一并交给工程师。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
 class MessageOut(BaseModel):
     id: int
     role: str

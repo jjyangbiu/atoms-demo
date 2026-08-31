@@ -20,7 +20,7 @@ export interface PublishOut {
 export interface MessageOut {
   id: number
   role: 'user' | 'pm' | 'engineer' | 'system'
-  kind: 'text' | 'prd' | 'event'
+  kind: 'text' | 'prd' | 'prd_confirm' | 'event'
   content: string
   created_at: string
 }
@@ -44,9 +44,9 @@ export const useProjectStore = defineStore('projects', () => {
     projects.value = await api<ProjectOut[]>('/api/projects')
   }
 
-  async function createProject(name: string): Promise<ProjectOut> {
+  async function createProject(name: string, mode: 'engineer' | 'team'): Promise<ProjectOut> {
     const project = await api<ProjectOut>('/api/projects', {
-      body: { name, mode: 'engineer' },
+      body: { name, mode },
     })
     await fetchProjects()
     return project

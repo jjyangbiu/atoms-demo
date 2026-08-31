@@ -13,6 +13,8 @@ const router = useRouter()
 
 const createDialogVisible = ref(false)
 const newName = ref('')
+// 生成模式（工单 0010）：工程师直接实现 / 团队模式先产 PRD 确认后再实现
+const newMode = ref<'engineer' | 'team'>('engineer')
 const creating = ref(false)
 
 onMounted(async () => {
@@ -30,9 +32,10 @@ async function onCreate() {
   if (!name) return
   creating.value = true
   try {
-    const project = await store.createProject(name)
+    const project = await store.createProject(name, newMode.value)
     createDialogVisible.value = false
     newName.value = ''
+    newMode.value = 'engineer'
     router.push({ name: 'project', params: { id: project.id } })
   } catch (e) {
     ElMessage.error(e instanceof ApiError ? e.detail : '创建失败')
@@ -91,7 +94,9 @@ function formatTime(iso: string) {
         >
           <div class="card-head">
             <span class="project-name">{{ project.name }}</span>
-            <el-tag size="small" type="info">工程师模式</el-tag>
+            <el-tag size="small" :type="project.mode === 'team' ? 'warning' : 'info'">
+              {{ project.mode === 'team' ? '团队模式' : '工程师模式' }}
+            </el-tag>
           </div>
           <div class="card-meta">
             更新于 {{ formatTime(project.updated_at) }}
@@ -121,7 +126,19 @@ function formatTime(iso: string) {
             @keyup.enter="onCreate"
           />
         </el-form-item>
-        <p class="mode-hint">生成模式：工程师模式（团队模式即将上线）</p>
+        <el-form-item label="生成模式">
+          <el-radio-group v-model="newMode" data-testid="project-mode-select">
+            <el-radio value="engineer">工程师模式</el-radio>
+            <el-radio value="team">团队模式</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <p class="mode-hint">
+          {{
+            newMode === 'team'
+              ? '团队模式：产品经理先产出 PRD，确认（可附意见）后工程师才开始实现'
+              : '工程师模式：智能体直接根据你的描述生成应用'
+          }}
+        </p>
       </el-form>
       <template #footer>
         <el-button @click="createDialogVisible = false">取消</el-button>

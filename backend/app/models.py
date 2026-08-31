@@ -94,7 +94,7 @@ class Message(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     # user | pm | engineer | system
     role: Mapped[str] = mapped_column(String(16), nullable=False)
-    # text | prd | event
+    # text | prd | prd_confirm | event（prd/prd_confirm 为团队模式，工单 0010）
     kind: Mapped[str] = mapped_column(String(16), default="text", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -1,13 +1,13 @@
 /**
  * SSE 消费：fetch + ReadableStream（EventSource 无法携带 Authorization，故不用）。
  * 事件协议与后端约定一致：每行 `data: {json}`，事件含 type 字段
- * （text | tool | done | error）。
+ * （text | tool | done | error；团队模式另有 prd 增量事件，工单 0010）。
  */
 
 import { ApiError, getToken } from '@/api/client'
 
 export interface SseEvent {
-  type: 'text' | 'tool' | 'done' | 'error' | string
+  type: 'text' | 'tool' | 'done' | 'error' | 'prd' | string
   [key: string]: unknown
 }
 

@@ -12,7 +12,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..agent.loop import run_generation
-from ..agent.prompts import build_system_prompt
+from ..agent.prompts import PM_SYSTEM_PROMPT, build_system_prompt
 from ..agent.tools import (
     FileSandbox,
     SandboxViolation,
@@ -24,6 +24,7 @@ from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, Publication, Snapshot, User, _utcnow
 from ..rag.store import maybe_knowledge_store
 from ..schemas import (
+    ConfirmPrdRequest,
     CreateProjectRequest,
     FileContentOut,
     FileOut,
@@ -150,6 +151,8 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
     """把持久化对话转成最近 window 轮问答的 langchain 消息（跳过工具事件行）。
 
     窗口截断只影响喂给模型的上下文；持久化与回看仍是完整历史（工单 0004）。
+    团队模式的 PRD 与确认消息（工单 0010）也入上下文：
+    PRD 以 AI 消息、确认（含追加意见）以用户消息呈现。
     """
     rows = db.scalars(
         select(Message)
@@ -158,15 +161,44 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
     )
     history = []
     for m in rows:
-        if m.kind != "text":
+        if m.kind == "event" or m.role == "system":
+            # 工具事件行与引导性系统消息不入上下文（工单 0010）
             continue
         if m.role == "user":
+            # 含 prd_confirm：确认消息（可含追加意见）以用户消息呈现，后续迭代可见（工单 0010）
             history.append(HumanMessage(content=m.content))
+        elif m.kind == "prd":
+            history.append(AIMessage(content=f"以下是我起草的 PRD：\n\n{m.content}"))
         else:
             history.append(AIMessage(content=m.content))
     if window > 0:
         history = history[-2 * window :]
     return history
+
+
+def _prd_state(db: Session, project_id: int) -> str:
+    """团队模式的 PRD 状态（工单 0010）：none | pending | confirmed。
+
+    不新增表字段，从对话历史推导：最近一条 prd 消息之后是否存在确认消息。
+    """
+    last_prd_id = db.scalar(
+        select(Message.id)
+        .where(Message.project_id == project_id, Message.kind == "prd")
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    if last_prd_id is None:
+        return "none"
+    confirmed = db.scalar(
+        select(Message.id)
+        .where(
+            Message.project_id == project_id,
+            Message.kind == "prd_confirm",
+            Message.id > last_prd_id,
+        )
+        .limit(1)
+    )
+    return "confirmed" if confirmed is not None else "pending"
 
 
 def _sync_file_index(db: Session, project_id: int, root: Path) -> None:
@@ -186,8 +218,146 @@ def _sync_file_index(db: Session, project_id: int, root: Path) -> None:
             db.delete(row)
 
 
+def _existing_file_paths(db: Session, project_id: int) -> list[str]:
+    """项目当前文件索引的路径清单（按路径排序），供系统提示与分流判断共用。"""
+    return list(
+        db.scalars(
+            select(ProjectFile.path)
+            .where(ProjectFile.project_id == project_id)
+            .order_by(ProjectFile.path)
+        )
+    )
+
+
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _sse_response(stream) -> StreamingResponse:
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _engineer_stream(
+    request: Request, project_id: int, user_text: str, history: list, existing_files: list[str]
+):
+    """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。"""
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    try:
+        model = request.app.state.model_factory(settings)
+    except Exception as e:  # noqa: BLE001 — 未配置 Key 等环境问题以 error 事件收尾
+        yield _sse({"type": "error", "detail": str(e)})
+        return
+
+    sandbox = FileSandbox(project_dir(request, project_id))
+    # 知识库可用时附带 search_templates 检索工具（工单 0009）；不可用时降级为纯文件工具
+    tools = build_tools(sandbox, maybe_knowledge_store(request.app))
+    system_prompt = build_system_prompt(existing_files)
+
+    done_data: dict | None = None
+    try:
+        async for event in run_generation(
+            model,
+            tools,
+            execute_tool,
+            system_prompt,
+            history,
+            user_text,
+            max_steps=settings.agent_max_steps,
+            max_retries=settings.agent_max_retries,
+        ):
+            if event.type == "done":
+                # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
+                done_data = event.data
+            else:
+                yield _sse({"type": event.type, **event.data})
+                if event.type == "tool" and event.data.get("status") != "start":
+                    _persist_event(session_factory, project_id, event.data)
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+        yield _sse({"type": "error", "detail": f"生成中断: {e}"})
+        return
+
+    try:
+        with session_factory() as session:
+            final_text = done_data.get("text", "") if done_data else ""
+            if final_text:
+                session.add(
+                    Message(project_id=project_id, role="engineer", kind="text", content=final_text)
+                )
+            _sync_file_index(session, project_id, sandbox.root)
+            # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）
+            if done_data is not None:
+                create_snapshot(session, project_id, sandbox.root, settings.snapshot_max_kept)
+            project_row = session.get(Project, project_id)
+            if project_row is not None:
+                project_row.updated_at = _utcnow()
+            session.commit()
+    except Exception as e:  # noqa: BLE001 — 收尾落盘失败也须以 error 事件告知，不得静默断流
+        yield _sse({"type": "error", "detail": f"生成收尾失败: {e}"})
+        return
+    if done_data is not None:
+        yield _sse({"type": "done", **done_data})
+
+
+async def _pm_stream(request: Request, project_id: int, user_text: str, history: list):
+    """产品经理智能体产 PRD 流（工单 0010）：无工具，文本以 prd 事件流式外发。
+
+    成功后 PRD 以 role=pm, kind=prd 落对话历史；不写文件、不留快照。
+    """
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    try:
+        model = request.app.state.model_factory(settings)
+    except Exception as e:  # noqa: BLE001 — 与工程师流一致，环境问题以 error 事件收尾
+        yield _sse({"type": "error", "detail": str(e)})
+        return
+
+    done_data: dict | None = None
+    errored = False
+    try:
+        async for event in run_generation(
+            model,
+            [],
+            execute_tool,
+            PM_SYSTEM_PROMPT,
+            history,
+            user_text,
+            max_steps=settings.agent_max_steps,
+            max_retries=settings.agent_max_retries,
+        ):
+            if event.type == "done":
+                done_data = event.data
+            elif event.type == "text":
+                yield _sse({"type": "prd", "content": event.data.get("content", "")})
+            else:
+                if event.type == "error":
+                    errored = True
+                yield _sse({"type": event.type, **event.data})
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+        yield _sse({"type": "error", "detail": f"生成中断: {e}"})
+        return
+
+    prd_text = done_data.get("text", "") if done_data else ""
+    if not prd_text:
+        # 循环已以 error 事件收尾时不再重复报错（如模型调用失败/超步数）
+        if not errored:
+            yield _sse({"type": "error", "detail": "产品经理未产出 PRD"})
+        return
+    try:
+        with session_factory() as session:
+            session.add(Message(project_id=project_id, role="pm", kind="prd", content=prd_text))
+            project_row = session.get(Project, project_id)
+            if project_row is not None:
+                project_row.updated_at = _utcnow()
+            session.commit()
+    except Exception as e:  # noqa: BLE001 — PRD 落库失败须明示，不得静默断流
+        yield _sse({"type": "error", "detail": f"PRD 保存失败: {e}"})
+        return
+    yield _sse({"type": "done", "text": prd_text})
 
 
 @router.post("/{project_id}/messages")
@@ -205,86 +375,106 @@ async def send_message(
     db.refresh(user_message)
 
     settings = request.app.state.settings
-    session_factory = request.app.state.session_factory
     history = _llm_history(
         db, project_id, before_message_id=user_message.id, window=settings.agent_history_window
     )
-    existing_files = [
-        p
-        for p in db.scalars(
-            select(ProjectFile.path)
-            .where(ProjectFile.project_id == project_id)
-            .order_by(ProjectFile.path)
+    existing_files = _existing_file_paths(db, project_id)
+
+    # 团队模式分流（工单 0010）：首条消息进产品经理产 PRD；待确认时引导先处理 PRD；
+    # 已确认（或克隆等已有文件的场景）后与工程师模式完全一致。
+    stage = "engineer"
+    if project.mode == "team" and not existing_files:
+        prd_state = _prd_state(db, project_id)
+        if prd_state == "none":
+            stage = "pm"
+        elif prd_state == "pending":
+            stage = "guide"
+
+    if stage == "guide":
+        guidance = (
+            "团队模式下已产出待确认的 PRD：请先在 PRD 卡片上确认通过（可附追加意见），"
+            "工程师才会开始实现；如需调整需求，请将修改意见随确认一并提出。"
         )
-    ]
+        db.add(Message(project_id=project_id, role="system", kind="text", content=guidance))
+        db.commit()
+
+        async def guide_stream():
+            yield _sse({"type": "text", "content": guidance})
+            yield _sse({"type": "done", "text": guidance})
+
+        return _sse_response(guide_stream())
 
     async def event_stream():
         # 同一项目的生成排队串行，避免并发覆盖项目目录与快照 rev 竞态（工单 0007 评审项）
         async with _project_lock(project_id):
-            async for chunk in generate_stream():
+            if stage == "pm":
+                async for chunk in _pm_stream(request, project_id, body.content, history):
+                    yield chunk
+            else:
+                async for chunk in _engineer_stream(
+                    request, project_id, body.content, history, existing_files
+                ):
+                    yield chunk
+
+    return _sse_response(event_stream())
+
+
+@router.post("/{project_id}/prd/confirm")
+async def confirm_prd(
+    project_id: int,
+    body: ConfirmPrdRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """确认待确认的 PRD（工单 0010）：确认后工程师智能体随即开始实现（SSE 流）。
+
+    确认与追加意见落对话历史（role=user, kind=prd_confirm），重新打开可回看。
+    """
+    project = get_owned_project(project_id, user, db)
+    if project.mode != "team":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="工程师模式项目没有 PRD 流程"
+        )
+    if _prd_state(db, project_id) != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="当前没有待确认的 PRD"
+        )
+
+    feedback = body.feedback.strip()
+    confirm_content = feedback if feedback else "确认通过，开始实现。"
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+
+    async def event_stream():
+        async with _project_lock(project_id):
+            # 锁内复查状态并落确认：并发双击/重试不会造成重复确认与两次生成（工单 0010）
+            with session_factory() as session:
+                if _prd_state(session, project_id) != "pending":
+                    yield _sse({"type": "error", "detail": "当前没有待确认的 PRD"})
+                    return
+                confirm_message = Message(
+                    project_id=project_id,
+                    role="user",
+                    kind="prd_confirm",
+                    content=confirm_content,
+                )
+                session.add(confirm_message)
+                session.commit()
+                session.refresh(confirm_message)
+                history = _llm_history(
+                    session,
+                    project_id,
+                    before_message_id=confirm_message.id,
+                    window=settings.agent_history_window,
+                )
+                existing_files = _existing_file_paths(session, project_id)
+            async for chunk in _engineer_stream(
+                request, project_id, confirm_content, history, existing_files
+            ):
                 yield chunk
 
-    async def generate_stream():
-        try:
-            model = request.app.state.model_factory(settings)
-        except Exception as e:  # noqa: BLE001 — 未配置 Key 等环境问题以 error 事件收尾
-            yield _sse({"type": "error", "detail": str(e)})
-            return
-
-        sandbox = FileSandbox(project_dir(request, project_id))
-        # 知识库可用时附带 search_templates 检索工具（工单 0009）；不可用时降级为纯文件工具
-        tools = build_tools(sandbox, maybe_knowledge_store(request.app))
-        system_prompt = build_system_prompt(existing_files)
-
-        done_data: dict | None = None
-        try:
-            async for event in run_generation(
-                model,
-                tools,
-                execute_tool,
-                system_prompt,
-                history,
-                body.content,
-                max_steps=settings.agent_max_steps,
-                max_retries=settings.agent_max_retries,
-            ):
-                if event.type == "done":
-                    # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
-                    done_data = event.data
-                else:
-                    yield _sse({"type": event.type, **event.data})
-                    if event.type == "tool" and event.data.get("status") != "start":
-                        _persist_event(session_factory, project_id, event.data)
-        except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
-            yield _sse({"type": "error", "detail": f"生成中断: {e}"})
-            return
-
-        try:
-            with session_factory() as session:
-                final_text = done_data.get("text", "") if done_data else ""
-                if final_text:
-                    session.add(
-                        Message(project_id=project_id, role="engineer", kind="text", content=final_text)
-                    )
-                _sync_file_index(session, project_id, sandbox.root)
-                # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）
-                if done_data is not None:
-                    create_snapshot(session, project_id, sandbox.root, settings.snapshot_max_kept)
-                project_row = session.get(Project, project_id)
-                if project_row is not None:
-                    project_row.updated_at = _utcnow()
-                session.commit()
-        except Exception as e:  # noqa: BLE001 — 收尾落盘失败也须以 error 事件告知，不得静默断流
-            yield _sse({"type": "error", "detail": f"生成收尾失败: {e}"})
-            return
-        if done_data is not None:
-            yield _sse({"type": "done", **done_data})
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return _sse_response(event_stream())
 
 
 @router.get("/{project_id}/files", response_model=list[FileOut])
