@@ -44,6 +44,10 @@ const entries = ref<ChatEntry[]>([])
 const input = ref('')
 const generating = ref(false)
 const errorDetail = ref('')
+// 刷新/断流导致上一轮生成被中断（诊断修复）：后端已把流出的思考落库，
+// 加载历史时据"消息尾不是收尾结论"识别并展示重试入口，避免用户以为状态丢失
+type InterruptedState = { status: 'unknown' | 'none' | 'interrupted' }
+const interrupted = ref<InterruptedState>({ status: 'unknown' })
 // PRD 确认时的追加意见（工单 0010）；同一时刻至多一张待确认卡片，单值即可
 const prdFeedback = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
@@ -229,7 +233,24 @@ async function copyLink() {
 async function loadHistory() {
   const messages = await store.fetchMessages(projectId.value)
   entries.value = toEntries(messages)
+  detectInterrupted(messages)
   scrollToBottom()
+}
+
+// 中断识别（诊断修复）：正常收尾的最后一轮必以结论（text）或 PRD 收尾；
+// 消息尾停在思考行或工具事件行 = 该轮被刷新/断流中断。同时把最后一条用户消息
+// 恢复为可重试内容（刷新后 lastUserContent 已丢失，重试按钮才可用）
+function detectInterrupted(messages: MessageOut[]) {
+  const last = messages[messages.length - 1]
+  if (last && (last.kind === 'thinking' || last.kind === 'event')) {
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user')
+    if (lastUser) {
+      lastUserContent = lastUser.content
+      interrupted.value = { status: 'interrupted' }
+      return
+    }
+  }
+  interrupted.value = { status: 'none' }
 }
 
 async function loadFiles() {
@@ -314,6 +335,7 @@ async function confirmPrd() {
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   generating.value = true
   errorDetail.value = ''
+  interrupted.value = { status: 'none' }
   const textHolder: { entry: ChatEntry | null } = { entry: null }
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
   const thinkingHolder: { entry: ChatEntry | null } = { entry: null }
@@ -549,6 +571,16 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
           <div v-if="generating" class="generating-hint">智能体正在工作…</div>
           <div v-else-if="errorDetail" class="error-banner" data-testid="chat-error">
             <span>⚠ {{ errorDetail }}</span>
+            <el-button type="danger" size="small" data-testid="chat-retry" @click="retry">
+              重新生成
+            </el-button>
+          </div>
+          <div
+            v-else-if="interrupted.status === 'interrupted'"
+            class="error-banner"
+            data-testid="chat-interrupted"
+          >
+            <span>⚠ 上一轮生成被中断（页面刷新或连接断开），已产出的思考过程已保留</span>
             <el-button type="danger" size="small" data-testid="chat-retry" @click="retry">
               重新生成
             </el-button>

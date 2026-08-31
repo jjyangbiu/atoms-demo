@@ -331,14 +331,20 @@ async def _engineer_stream(
                 done_data = event.data
             else:
                 if event.type == "thinking":
-                    # 思考增量另存一份，收尾时合并落库供刷新后回看（折叠展示）
+                    # 思考增量另存一份：正常收尾合并落库；中断时也据已流出部分落库（诊断修复）
                     thinking_parts.append(event.data.get("content", ""))
                 yield _sse({"type": event.type, **event.data})
                 if event.type == "tool" and event.data.get("status") != "start":
                     _persist_event(session_factory, project_id, event.data)
-    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
+        _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
         yield _sse({"type": "error", "detail": f"生成中断: {e}"})
         return
+    except BaseException:
+        # 刷新/断流触发的生成器关闭（GeneratorExit/CancelledError）：
+        # 不能在此 yield（已关闭），只把已流出的思考落库后照旧退出（诊断修复）
+        _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
+        raise
 
     try:
         with session_factory() as session:
@@ -404,9 +410,14 @@ async def _pm_stream(request: Request, project_id: int, user_text: str, history:
                 if event.type == "thinking":
                     thinking_parts.append(event.data.get("content", ""))
                 yield _sse({"type": event.type, **event.data})
-    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
+        _persist_partial_thinking(session_factory, project_id, "pm", thinking_parts)
         yield _sse({"type": "error", "detail": f"生成中断: {e}"})
         return
+    except BaseException:
+        # 刷新/断流触发的生成器关闭：落库已流出的思考后照旧退出（诊断修复）
+        _persist_partial_thinking(session_factory, project_id, "pm", thinking_parts)
+        raise
 
     prd_text = done_data.get("text", "") if done_data else ""
     if not prd_text:
@@ -733,5 +744,23 @@ def _persist_event(session_factory, project_id: int, data: dict) -> None:
                 kind="event",
                 content=json.dumps(data, ensure_ascii=False),
             )
+        )
+        session.commit()
+
+
+def _persist_partial_thinking(
+    session_factory, project_id: int, role: str, thinking_parts: list[str]
+) -> None:
+    """生成未正常收尾（刷新/断流或出错）时，把已流出的思考原样落库。
+
+    否则刷新后思考过程凭空消失，且消息尾停在工具事件行，无法区分中断与完成；
+    收尾落库不含最终结论：半截正文不得伪装成结论（诊断修复）。
+    """
+    thinking_text = "".join(thinking_parts).strip()
+    if not thinking_text:
+        return
+    with session_factory() as session:
+        session.add(
+            Message(project_id=project_id, role=role, kind="thinking", content=thinking_text)
         )
         session.commit()
