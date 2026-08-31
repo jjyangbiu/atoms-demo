@@ -98,8 +98,11 @@ def list_messages(
     )
 
 
-def _llm_history(db: Session, project_id: int, before_message_id: int) -> list:
-    """把持久化对话转成 langchain 消息（跳过工具事件行）。"""
+def _llm_history(db: Session, project_id: int, before_message_id: int, window: int) -> list:
+    """把持久化对话转成最近 window 轮问答的 langchain 消息（跳过工具事件行）。
+
+    窗口截断只影响喂给模型的上下文；持久化与回看仍是完整历史（工单 0004）。
+    """
     rows = db.scalars(
         select(Message)
         .where(Message.project_id == project_id, Message.id < before_message_id)
@@ -113,6 +116,8 @@ def _llm_history(db: Session, project_id: int, before_message_id: int) -> list:
             history.append(HumanMessage(content=m.content))
         else:
             history.append(AIMessage(content=m.content))
+    if window > 0:
+        history = history[-2 * window :]
     return history
 
 
@@ -157,7 +162,9 @@ async def send_message(
 
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
-    history = _llm_history(db, project_id, before_message_id=user_message.id)
+    history = _llm_history(
+        db, project_id, before_message_id=user_message.id, window=settings.agent_history_window
+    )
     existing_files = [
         p
         for p in db.scalars(

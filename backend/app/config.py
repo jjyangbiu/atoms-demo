@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # 智能体单次生成的最大工具循环步数与失败重试次数
     agent_max_steps: int = 20
     agent_max_retries: int = 2
+    # 迭代时喂给模型的最近对话轮数（1 轮 = 一问一答）；持久化不受影响（工单 0004）
+    agent_history_window: int = 10
 
 
 @lru_cache
