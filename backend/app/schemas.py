@@ -79,6 +79,12 @@ class ConfirmConsensusRequest(BaseModel):
     feedback: str = Field(default="", max_length=8000)
 
 
+class ConfirmSpecRequest(BaseModel):
+    """确认需求规格（工单 0016）：可附带修改意见，随确认一并进入下一阶段。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
 class MessageOut(BaseModel):
     id: int
     role: str

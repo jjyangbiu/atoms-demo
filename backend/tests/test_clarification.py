@@ -205,7 +205,10 @@ class TestConsensusGate:
         )
         assert resp.status_code == 409
 
-    def test_team_mode_project_has_no_consensus_flow(self, app, client, auth_headers):
+    def test_team_project_without_pending_consensus_confirm_rejected(
+        self, app, client, auth_headers
+    ):
+        """团队模式也走共识确认门（工单 0016）：尚无共识时确认被拒。"""
         project = _create_project(client, auth_headers, mode="team")
         resp = client.post(
             f"/api/projects/{project['id']}/consensus/confirm",

@@ -62,16 +62,16 @@ class _DisconnectHarness:
             if len(self.body_frames) >= self.disconnect_after_frames:
                 self._disconnect.set()
 
-    async def run(self, token: str, project_id: int, content: str):
-        self._body = json.dumps({"content": content}).encode("utf-8")
+    async def run(self, token: str, path: str, body: dict):
+        self._body = json.dumps(body).encode("utf-8")
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
             "http_version": "1.1",
             "method": "POST",
             "scheme": "http",
-            "path": f"/api/projects/{project_id}/messages",
-            "raw_path": f"/api/projects/{project_id}/messages".encode(),
+            "path": path,
+            "raw_path": path.encode(),
             "query_string": b"",
             "root_path": "",
             "headers": [
@@ -94,16 +94,17 @@ def _read_messages(app, project_id: int) -> list[tuple[str, str, str]]:
         return [(m.role, m.kind, m.content) for m in rows]
 
 
-async def _disconnect_midstream(app, token: str, project_id: int, gate: threading.Event):
-    """发起生成并在中途送达断开，等待收尾落库稳定后返回消息行。"""
+async def _disconnect_midstream(app, token: str, path: str, body: dict, gate: threading.Event):
+    """发起请求并在中途送达断开，等待收尾落库稳定后返回消息行。"""
     harness = _DisconnectHarness(app)
-    await harness.run(token, project_id, "做一个页面")
+    await harness.run(token, path, body)
     # 断开确实发生过：至少收到过响应体帧，且应用已随断开退出本次请求
     assert harness.body_frames, "断开前未收到任何流式帧，回路未走到生成中途"
     # 断开后生成中止（最小修复语义）；轮询落库确认不再有新增行，
     # 同一事件循环内等待，避免生成器关闭与闸门互锁
     gate.set()
     deadline = asyncio.get_event_loop().time() + 3
+    project_id = int(path.split("/")[3])  # /api/projects/{id}/...
     rows = _read_messages(app, project_id)
     # 等待断开触发的收尾落库完成（行数稳定一拍即认为已定案）
     stable = 0
@@ -133,7 +134,15 @@ class TestRefreshMidGeneration:
         token = auth_headers["Authorization"].removeprefix("Bearer ")
         project_id = project["id"]
 
-        rows = asyncio.run(_disconnect_midstream(app, token, project_id, gate))
+        rows = asyncio.run(
+            _disconnect_midstream(
+                app,
+                token,
+                f"/api/projects/{project_id}/messages",
+                {"content": "做一个页面"},
+                gate,
+            )
+        )
         kinds = [(kind, content) for _role, kind, content in rows]
         # 已流出的思考过程刷新后应可回看（症状断言）
         assert ("thinking", "先分析需求。") in kinds, f"思考过程丢失: {kinds}"
@@ -141,26 +150,49 @@ class TestRefreshMidGeneration:
         assert not any(k == "text" and role == "engineer" for role, k, _ in rows), (
             f"中止的生成不应落最终结论: {kinds}"
         )
-        # 消息尾不是收尾结论（text/prd），前端据此识别"上一轮被中断"并提供重试入口
+        # 消息尾不是收尾结论（text/共识/规格），前端据此识别"上一轮被中断"并提供重试入口
         assert kinds[-1][0] in ("thinking", "event"), f"中断状态不可识别: {kinds}"
 
-    def test_refresh_midstream_pm_thinking_survives(self, app, client, auth_headers):
-        """团队模式：PM 产 PRD 途中刷新，已流出的思考同样落库且不留半截 PRD。"""
+    def test_refresh_midstream_spec_thinking_survives(self, app, client, auth_headers):
+        """团队模式：共识确认后起草需求规格途中刷新，已流出的思考同样落库且不留半截规格（工单 0016）。"""
         gate = threading.Event()
         app.state.model_factory = lambda _s: _ThreadGatedStreamModel(
-            [THINK_OPEN + "规划 PRD 结构。" + THINK_CLOSE + "# 需求"],
+            [THINK_OPEN + "起草需求规格。" + THINK_CLOSE + "# 需求"],
             ["背景"],
             gate,
         )
         project = _create_project(client, auth_headers, mode="team")
+        # 注入待确认的需求共识：断流发生在共识确认触发的规格起草中途，
+        # 绕过澄清轮，避免同一伪模型需要两种行为（同 legacy 注水风格）
+        with app.state.session_factory() as session:
+            session.add(
+                Message(project_id=project["id"], role="user", kind="text", content="做一个页面")
+            )
+            session.add(
+                Message(
+                    project_id=project["id"],
+                    role="clarifier",
+                    kind="consensus",
+                    content="需求共识：按用户描述实现。",
+                )
+            )
+            session.commit()
         token = auth_headers["Authorization"].removeprefix("Bearer ")
 
-        rows = asyncio.run(_disconnect_midstream(app, token, project["id"], gate))
+        rows = asyncio.run(
+            _disconnect_midstream(
+                app,
+                token,
+                f"/api/projects/{project['id']}/consensus/confirm",
+                {"feedback": ""},
+                gate,
+            )
+        )
         kinds = [(kind, content) for _role, kind, content in rows]
         assert any(
-            role == "pm" and kind == "thinking" and content == "规划 PRD 结构。"
+            role == "spec_agent" and kind == "thinking" and content == "起草需求规格。"
             for role, kind, content in rows
-        ), f"PM 思考过程丢失: {rows}"
-        # 中止的 PRD 轮不留半截 PRD（后端分流以无 prd 消息判未产出，重发即重产）
-        assert not any(kind == "prd" for kind, _ in kinds), f"不应落半截 PRD: {kinds}"
+        ), f"规格智能体思考过程丢失: {rows}"
+        # 中止的规格轮不留半截规格（后端分流以无 spec 消息判未产出，重发即重产）
+        assert not any(kind == "spec" for kind, _ in kinds), f"不应落半截规格: {kinds}"
         assert kinds[-1][0] in ("thinking", "event"), f"中断状态不可识别: {kinds}"

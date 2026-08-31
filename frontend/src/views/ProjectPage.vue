@@ -20,7 +20,7 @@ interface ToolInfo {
 
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'thinking'
+  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'spec' | 'thinking'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
@@ -28,11 +28,13 @@ interface ChatEntry {
   streaming?: boolean
   // 思考块是否折叠：流式过程默认展开，结束后默认折叠（诊断修复）
   collapsed?: boolean
-  // PRD 卡片（工单 0010）：已确认的不再显示操作区，仅待确认的卡片可交互；
+  // PRD 卡片（工单 0010，仅历史团队项目）：已确认的不再显示操作区，仅待确认的卡片可交互；
   // 未确认前发送普通消息会被后端引导先处理 PRD（工单 0010）
   prdConfirmed?: boolean
   // 需求共识卡片（工单 0015）：交互规则同 PRD 卡片；待确认时发消息会重新澄清
   consensusConfirmed?: boolean
+  // 需求规格卡片（工单 0016，团队模式）：交互规则同共识卡片；待确认时发消息会重新起草规格
+  specConfirmed?: boolean
 }
 
 const route = useRoute()
@@ -54,6 +56,8 @@ const interrupted = ref<InterruptedState>({ status: 'unknown' })
 const prdFeedback = ref('')
 // 需求共识确认时的修改意见（工单 0015）
 const consensusFeedback = ref('')
+// 需求规格确认时的修改意见（工单 0016）
+const specFeedback = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
@@ -184,11 +188,21 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         content: m.content,
         consensusConfirmed: confirmed || superseded,
       })
+    } else if (m.kind === 'spec') {
+      // 需求规格卡片（工单 0016）：确认状态推导同共识；被重新起草取代的旧卡片不再可交互
+      const confirmed = messages.slice(i + 1).some((x) => x.kind === 'spec_confirm')
+      const superseded = messages.slice(i + 1).some((x) => x.kind === 'spec')
+      result.push({
+        id: `msg-${m.id}`,
+        kind: 'spec',
+        content: m.content,
+        specConfirmed: confirmed || superseded,
+      })
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
       result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
-    } else if (m.kind === 'prd_confirm' || m.kind === 'consensus_confirm') {
-      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010/0015）
+    } else if (m.kind === 'prd_confirm' || m.kind === 'consensus_confirm' || m.kind === 'spec_confirm') {
+      // 确认（含追加意见）以用户消息呈现，回看时一目了然（工单 0010/0015/0016）
       result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
     } else if (m.kind === 'text') {
       result.push({
@@ -252,7 +266,7 @@ async function loadHistory() {
   scrollToBottom()
 }
 
-// 中断识别（诊断修复）：正常收尾的最后一轮必以结论（text）或 PRD 收尾；
+// 中断识别（诊断修复）：正常收尾的最后一轮必以结论（text/共识/规格）收尾；
 // 消息尾停在思考行或工具事件行 = 该轮被刷新/断流中断。同时把最后一条用户消息
 // 恢复为可重试内容（刷新后 lastUserContent 已丢失，重试按钮才可用）
 function detectInterrupted(messages: MessageOut[]) {
@@ -347,8 +361,8 @@ async function confirmPrd() {
   }
 }
 
-// 确认需求共识（工单 0015）：确认后工程师智能体随即开始生成；
-// 修改意见可选，随确认一并交给工程师，同步落对话历史可回看；
+// 确认需求共识（工单 0015）：工程师模式确认后随即生成；团队模式确认后规格智能体
+// 开始起草需求规格（工单 0016）；修改意见可选，随确认一并落对话历史可回看；
 // 首建流水线内确认不占用新名额，不会遇限流（ADR 0003）
 async function confirmConsensus() {
   if (generating.value) return
@@ -357,9 +371,26 @@ async function confirmConsensus() {
   entries.value.push({
     id: nextId(),
     kind: 'user',
-    content: feedback || '确认共识，开始生成。',
+    content:
+      feedback ||
+      (projectMode.value === 'team' ? '确认共识，开始起草需求规格。' : '确认共识，开始生成。'),
   })
   await runSse(`/api/projects/${projectId.value}/consensus/confirm`, { feedback })
+}
+
+// 确认需求规格（工单 0016）：确认后流水线进入下一阶段（当前由工程师实现，
+// 拆单由工单 0017 承接）；修改意见可选，随确认一并落对话历史可回看；
+// 首建流水线内确认不占用新名额（ADR 0003）
+async function confirmSpec() {
+  if (generating.value) return
+  const feedback = specFeedback.value.trim()
+  specFeedback.value = ''
+  entries.value.push({
+    id: nextId(),
+    kind: 'user',
+    content: feedback || '确认规格，开始实现。',
+  })
+  await runSse(`/api/projects/${projectId.value}/spec/confirm`, { feedback })
 }
 
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
@@ -369,6 +400,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   const textHolder: { entry: ChatEntry | null } = { entry: null }
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
   const consensusHolder: { entry: ChatEntry | null } = { entry: null }
+  const specHolder: { entry: ChatEntry | null } = { entry: null }
   const thinkingHolder: { entry: ChatEntry | null } = { entry: null }
 
   const ensureTextEntry = (): ChatEntry => {
@@ -427,6 +459,22 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return consensusHolder.entry
   }
 
+  // 需求规格增量事件累积成一张流式卡片（工单 0016）；流结束后以持久化历史为准重渲染
+  const ensureSpecEntry = (): ChatEntry => {
+    if (!specHolder.entry) {
+      specHolder.entry = {
+        id: nextId(),
+        kind: 'spec',
+        content: '',
+        raw: '',
+        streaming: true,
+        specConfirmed: false,
+      }
+      entries.value.push(specHolder.entry)
+    }
+    return specHolder.entry
+  }
+
   try {
     await streamPost(path, body, (event: SseEvent) => {
       if (event.type === 'thinking') {
@@ -437,6 +485,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         pushText(ensurePrdEntry(), String(event.content ?? ''))
       } else if (event.type === 'consensus') {
         pushText(ensureConsensusEntry(), String(event.content ?? ''))
+      } else if (event.type === 'spec') {
+        pushText(ensureSpecEntry(), String(event.content ?? ''))
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -478,6 +528,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     if (textHolder.entry) textHolder.entry.streaming = false
     if (prdHolder.entry) prdHolder.entry.streaming = false
     if (consensusHolder.entry) consensusHolder.entry.streaming = false
+    if (specHolder.entry) specHolder.entry.streaming = false
     if (thinkingHolder.entry) thinkingHolder.entry.streaming = false
     // 等打字机追平再换历史，避免尾部字符闪现；随后以持久化结果为准对齐（含思考行，回看折叠展示）
     await waitForTypewriter()
@@ -607,7 +658,39 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     data-testid="consensus-confirm-button"
                     @click="confirmConsensus"
                   >
-                    确认共识并开始生成
+                    {{ projectMode === 'team' ? '确认共识，起草需求规格' : '确认共识并开始生成' }}
+                  </el-button>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="entry.kind === 'spec'" class="msg agent-msg">
+              <!-- 需求规格卡片（工单 0016）：团队模式澄清收敛后的确认门，确认后进入下一阶段 -->
+              <div class="prd-card spec-card">
+                <div class="prd-head">
+                  <span class="prd-role">团队模式 · 需求规格</span>
+                  <el-tag v-if="entry.specConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else size="small" type="warning">待确认</el-tag>
+                </div>
+                <div
+                  class="bubble markdown prd-body"
+                  v-html="renderMarkdown(entry.content || (entry.streaming ? '正在起草需求规格…' : ''))"
+                />
+                <div v-if="!entry.specConfirmed && !entry.streaming" class="prd-actions" data-testid="spec-card-actions">
+                  <el-input
+                    v-model="specFeedback"
+                    type="textarea"
+                    :rows="2"
+                    :disabled="generating"
+                    placeholder="修改意见（可选），例如：功能 3 换成统计页；也可以直接继续对话重新起草"
+                    data-testid="spec-feedback-input"
+                  />
+                  <el-button
+                    type="primary"
+                    :loading="generating"
+                    data-testid="spec-confirm-button"
+                    @click="confirmSpec"
+                  >
+                    确认规格并开始实现
                   </el-button>
                 </div>
               </div>

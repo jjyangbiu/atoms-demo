@@ -169,19 +169,37 @@ class TestUserHourlyLimit:
 
 class TestTeamModeLimits:
     def test_guide_not_counted_but_confirm_respects_limit(self, app, client, auth_headers):
+        """历史团队项目（已有待确认 PRD，工单 0010 兼容路径）：
+        引导不调模型不计额；确认触发工程师生成受限流约束（工单 0016 后新团队项目不再有此路径）。"""
         clock = _use_clock(app)
         app.state.rate_limiter.per_user_hourly = 1
-        prd_script = [
-            {"text": "# PRD\n\n做一个番茄钟。"},
-            {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-            {"text": "实现完成。"},
-        ]
-        use_fake_model(app, prd_script)
-        project = _create_project(client, auth_headers, mode="team")
+        use_fake_model(
+            app,
+            [
+                {"text": "迭代完成。"},
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
+                {"text": "实现完成。"},
+            ],
+        )
 
-        # PM 产 PRD 消耗唯一名额
-        events = _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        # 先用另一个项目的迭代消耗唯一名额（已有文件的项目按次计数）
+        other = _create_project(client, auth_headers)
+        seed_project_files(app, other["id"])
+        events = _stream_messages(client, auth_headers, other["id"], "微调一下")
         assert events[-1]["type"] == "done"
+
+        # 历史团队项目：注入待确认 PRD
+        from app.models import Message
+
+        project = _create_project(client, auth_headers, mode="team")
+        with app.state.session_factory() as session:
+            session.add(
+                Message(project_id=project["id"], role="user", kind="text", content="做一个番茄钟")
+            )
+            session.add(
+                Message(project_id=project["id"], role="pm", kind="prd", content="# PRD\n\n做一个番茄钟。")
+            )
+            session.commit()
 
         # 待确认时发普通消息走引导：不调模型、不计限额，不受限流
         resp = client.post(

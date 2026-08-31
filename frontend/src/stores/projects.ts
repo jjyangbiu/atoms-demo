@@ -19,11 +19,21 @@ export interface PublishOut {
 
 export interface MessageOut {
   id: number
-  // clarifier 为需求澄清智能体（工单 0015）
-  role: 'user' | 'pm' | 'engineer' | 'clarifier' | 'system'
+  // clarifier 为需求澄清智能体（工单 0015），spec_agent 为需求规格智能体（工单 0016）
+  role: 'user' | 'pm' | 'engineer' | 'clarifier' | 'spec_agent' | 'system'
   // thinking 为推理模型的思考过程留痕，回看时以折叠块展示（诊断修复）
   // consensus/consensus_confirm 为需求澄清与共识确认（工单 0015）
-  kind: 'text' | 'prd' | 'prd_confirm' | 'consensus' | 'consensus_confirm' | 'event' | 'thinking'
+  // spec/spec_confirm 为需求规格与规格确认（工单 0016）
+  kind:
+    | 'text'
+    | 'prd'
+    | 'prd_confirm'
+    | 'consensus'
+    | 'consensus_confirm'
+    | 'spec'
+    | 'spec_confirm'
+    | 'event'
+    | 'thinking'
   content: string
   created_at: string
 }
