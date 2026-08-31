@@ -12,6 +12,8 @@ export interface WorldAppOut {
   author: string
   preview_url: string
   published_at: string
+  /** 官方示例标记（工单 0012）：画廊冷启动示例 */
+  official: boolean
 }
 
 export const useWorldStore = defineStore('world', () => {

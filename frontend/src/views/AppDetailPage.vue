@@ -58,7 +58,13 @@ function formatTime(iso: string) {
     </el-header>
     <el-main v-if="app" class="main">
       <div class="info-panel">
-        <h2 class="title">{{ app.title }}</h2>
+        <h2 class="title">
+          {{ app.title }}
+          <!-- 官方示例标识（工单 0012） -->
+          <el-tag v-if="app.official" size="small" type="warning" effect="plain">
+            官方示例
+          </el-tag>
+        </h2>
         <p class="description">{{ app.description || '暂无描述' }}</p>
         <div class="meta">
           <span>作者：{{ app.author }}</span>
@@ -131,6 +137,11 @@ function formatTime(iso: string) {
 .title {
   margin: 0;
   font-size: 20px;
+}
+
+.title .el-tag {
+  margin-left: 8px;
+  vertical-align: 2px;
 }
 
 .description {

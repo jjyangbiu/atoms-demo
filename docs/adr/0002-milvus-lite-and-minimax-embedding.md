@@ -22,3 +22,11 @@
 
 - 正面：向量库、LLM、embedding、部署全链路生态统一；Milvus Lite 免运维。
 - 代价：内存敏感——若最终购入的 ECS 内存偏小导致吃力，回退路径是切换 Chroma（数据量小，重建索引成本低）；`embo-01` 与本地模型的向量空间不兼容，换 embedding 必须全量重建索引。
+
+## 修订（2026-08-31，工单 0012 真实链路回归）
+
+Embedding 接入方式修订，决策目标不变（仍优先 MiniMax `embo-01`）：
+
+1. 弃用 `langchain_community.MiniMaxEmbeddings`：它强依赖 `MINIMAX_GROUP_ID`，只配一套 LLM Key 的环境构建即失败，导致知识库与画廊语义搜索静默降级为关键词回退。
+2. 改走 **OpenAI 兼容端点**（`langchain_openai.OpenAIEmbeddings`）：默认复用 LLM 的 base_url 与 Key（MiniMax 兼容接口同样提供 `embo-01`）；新增 `ATOMS_EMBEDDING_BASE_URL` / `ATOMS_EMBEDDING_API_KEY` 可指向任意兼容服务（实测 SiliconFlow + `BAAI/bge-m3` 可直用，模型名兼容 `provider:model` 前缀）。
+3. 后果补充：向量维度随模型而变（embo-01 1536 维、bge-m3 1024 维），跨模型切换同样需全量重建索引。

@@ -59,6 +59,8 @@ class WorldAppOut(BaseModel):
     author: str
     preview_url: str
     published_at: datetime
+    # 官方示例标记（工单 0012）：画廊冷启动示例，可被克隆演示
+    official: bool = False
 
 
 class SendMessageRequest(BaseModel):

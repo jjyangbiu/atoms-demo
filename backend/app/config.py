@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/atoms.db"
     # 生成文件落盘根目录
     storage_root: str = "./data/storage"
-    jwt_secret: str = "dev-secret-change-me"
+    # 开发默认值须 >=32 字节，否则 PyJWT 报 InsecureKeyLengthWarning；生产务必经环境变量覆盖
+    jwt_secret: str = "dev-secret-change-me-0123456789abcdef"
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 60 * 24 * 7
     # 逗号分隔的前端来源（本地开发用）
@@ -34,8 +35,11 @@ class Settings(BaseSettings):
     # 全局同时进行的生成上限（自接受起至流结束）；<=0 表示不限
     rate_limit_max_concurrent: int = 10
     # 模板知识库 / 画廊语义搜索（工单 0009 / ADR 0002）：
-    # embedding 用 MiniMax embo-01（API Key 复用 LLM 的），向量库存 Milvus Lite 本地文件
+    # embedding 默认 MiniMax embo-01（复用 LLM 端点与 Key）；向量库存 Milvus Lite 本地文件。
+    # 工单 0012 回归后支持独立的 OpenAI 兼容 embedding 端点（置空则复用 LLM 配置）
     embedding_model: str = "embo-01"
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
     milvus_uri: str = "./data/milvus/atoms.db"
 
 

@@ -65,6 +65,9 @@ class Publication(Base):
         ForeignKey("projects.id"), unique=True, index=True, nullable=False
     )
     slug: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    # 官方示例标记（工单 0012）：由系统自身链路生成并发布的画廊冷启动示例；
+    # 存量旧库缺列时由灌入脚本自动补列（见 official_samples._ensure_official_column）
+    official: Mapped[bool] = mapped_column(default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

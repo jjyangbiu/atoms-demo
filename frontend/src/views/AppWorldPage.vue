@@ -88,7 +88,13 @@ function formatTime(iso: string) {
             />
           </div>
           <div class="card-info">
-            <div class="card-title">{{ app.title }}</div>
+            <div class="card-title">
+              {{ app.title }}
+              <!-- 官方示例标识（工单 0012）：系统自身链路生成的画廊冷启动示例 -->
+              <el-tag v-if="app.official" size="small" type="warning" effect="plain">
+                官方示例
+              </el-tag>
+            </div>
             <div class="card-desc">{{ app.description || '暂无描述' }}</div>
             <div class="card-meta">
               <span>{{ app.author }}</span>
@@ -178,6 +184,11 @@ function formatTime(iso: string) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.card-title .el-tag {
+  margin-left: 6px;
+  vertical-align: 1px;
 }
 
 .card-desc {
