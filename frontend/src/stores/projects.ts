@@ -9,6 +9,12 @@ export interface ProjectOut {
   mode: 'engineer' | 'team'
   created_at: string
   updated_at: string
+  published_slug: string | null
+}
+
+export interface PublishOut {
+  slug: string
+  url: string
 }
 
 export interface MessageOut {
@@ -52,5 +58,22 @@ export const useProjectStore = defineStore('projects', () => {
     return api<FileOut[]>(`/api/projects/${projectId}/files`)
   }
 
-  return { projects, fetchProjects, createProject, deleteProject, fetchMessages, fetchFiles }
+  async function publishProject(projectId: number): Promise<PublishOut> {
+    return api<PublishOut>(`/api/projects/${projectId}/publish`, { method: 'POST' })
+  }
+
+  async function unpublishProject(projectId: number): Promise<void> {
+    await api<void>(`/api/projects/${projectId}/publish`, { method: 'DELETE' })
+  }
+
+  return {
+    projects,
+    fetchProjects,
+    createProject,
+    deleteProject,
+    fetchMessages,
+    fetchFiles,
+    publishProject,
+    unpublishProject,
+  }
 })

@@ -15,13 +15,11 @@ from ..agent.prompts import build_system_prompt
 from ..agent.tools import (
     ALLOWED_EXTENSIONS,
     FileSandbox,
-    SandboxViolation,
     build_tools,
     execute_tool,
-    resolve_sandboxed,
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
-from ..models import Message, Project, ProjectFile, User, _utcnow
+from ..models import Message, Project, ProjectFile, Publication, User, _utcnow
 from ..schemas import (
     CreateProjectRequest,
     FileOut,
@@ -29,6 +27,7 @@ from ..schemas import (
     ProjectOut,
     SendMessageRequest,
 )
+from ..serving import serve_project_file
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -44,28 +43,38 @@ def get_owned_project(project_id: int, user: User, db: Session) -> Project:
     return project
 
 
+def project_payload(db: Session, project: Project) -> dict:
+    """项目响应体：附带活跃发布的 slug（工单 0006）。"""
+    payload = ProjectOut.model_validate(project).model_dump(mode="json")
+    payload["published_slug"] = db.scalar(
+        select(Publication.slug).where(Publication.project_id == project.id)
+    )
+    return payload
+
+
 @router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
 def create_project(
     body: CreateProjectRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> Project:
+) -> dict:
     project = Project(user_id=user.id, name=body.name, mode=body.mode)
     db.add(project)
     db.commit()
     db.refresh(project)
-    return project
+    return project_payload(db, project)
 
 
 @router.get("", response_model=list[ProjectOut])
 def list_projects(
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> list[Project]:
-    return list(
-        db.scalars(
+) -> list[dict]:
+    return [
+        project_payload(db, p)
+        for p in db.scalars(
             select(Project).where(Project.user_id == user.id).order_by(Project.updated_at.desc())
         )
-    )
+    ]
 
 
 @router.get("/{project_id}", response_model=ProjectOut)
@@ -73,8 +82,8 @@ def get_project(
     project_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> Project:
-    return get_owned_project(project_id, user, db)
+) -> dict:
+    return project_payload(db, get_owned_project(project_id, user, db))
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -87,6 +96,7 @@ def delete_project(
     project = get_owned_project(project_id, user, db)
     db.execute(delete(Message).where(Message.project_id == project_id))
     db.execute(delete(ProjectFile).where(ProjectFile.project_id == project_id))
+    db.execute(delete(Publication).where(Publication.project_id == project_id))
     db.delete(project)
     db.commit()
     shutil.rmtree(project_dir(request, project_id), ignore_errors=True)
@@ -257,18 +267,7 @@ def list_files(
 #
 # 鉴权只靠登录时写入的 Cookie atoms_token（见 routers/auth.py）：
 # iframe 与其子资源同源请求自动携带，无需在 URL 里暴露令牌。
-# 越界路径与白名单外扩展名复用文件沙箱拦截，一律 404。
-
-_MEDIA_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".mjs": "text/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".svg": "image/svg+xml",
-    ".md": "text/markdown; charset=utf-8",
-    ".txt": "text/plain; charset=utf-8",
-}
+# 越界路径与白名单外扩展名由共享的 serving.serve_project_file 拦截。
 
 
 def _preview_user(request: Request, db: Session) -> User | None:
@@ -287,15 +286,7 @@ def _serve_preview(request: Request, project_id: int, rel_path: str, db: Session
     # 非属主与不存在的项目同返 404，不泄露项目归属
     if project is None or project.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    root = project_dir(request, project_id)
-    try:
-        target = resolve_sandboxed(root, rel_path or "index.html")
-    except SandboxViolation:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
-    if not target.is_file():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
-    media_type = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
-    return Response(content=target.read_bytes(), media_type=media_type)
+    return serve_project_file(project_dir(request, project_id), rel_path)
 
 
 @router.get("/{project_id}/preview")

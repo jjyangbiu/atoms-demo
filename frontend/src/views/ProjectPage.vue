@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 import { streamPost, type SseEvent } from '@/api/sse'
 import { useProjectStore, type MessageOut } from '@/stores/projects'
 
@@ -35,6 +36,8 @@ const errorDetail = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
+const publishedSlug = ref<string | null>(null)
+const publishing = ref(false)
 let seq = 0
 let lastUserContent = ''
 
@@ -52,6 +55,12 @@ const previewSrc = computed(() =>
   hasIndex.value
     ? `/api/projects/${projectId.value}/preview/index.html?rev=${previewRev.value}`
     : '',
+)
+
+// 发布状态（工单 0006）：稳定公开链接 /p/{slug}，任何人无需登录可访问；
+// 迭代成功后后端直接提供项目目录当前文件，链接内容自动同步而链接本身不变
+const publicUrl = computed(() =>
+  publishedSlug.value ? `${window.location.origin}/p/${publishedSlug.value}` : '',
 )
 
 function renderMarkdown(content: string) {
@@ -92,8 +101,46 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
 }
 
 async function loadProject() {
-  const project = await api<{ name: string }>(`/api/projects/${projectId.value}`)
+  const project = await api<{ name: string; published_slug: string | null }>(
+    `/api/projects/${projectId.value}`,
+  )
   projectName.value = project.name
+  publishedSlug.value = project.published_slug
+}
+
+async function onPublish() {
+  publishing.value = true
+  try {
+    const pub = await store.publishProject(projectId.value)
+    publishedSlug.value = pub.slug
+    ElMessage.success('发布成功，链接已生成')
+  } catch (e) {
+    ElMessage.error(e instanceof ApiError ? e.detail : '发布失败')
+  } finally {
+    publishing.value = false
+  }
+}
+
+async function onUnpublish() {
+  try {
+    await ElMessageBox.confirm('取消发布后，公开链接将立即失效。确定取消发布？', '取消发布', {
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  await store.unpublishProject(projectId.value)
+  publishedSlug.value = null
+  ElMessage.success('已取消发布')
+}
+
+async function copyLink() {
+  try {
+    await navigator.clipboard.writeText(publicUrl.value)
+    ElMessage.success('链接已复制')
+  } catch {
+    ElMessage.warning(`自动复制失败，请手动复制：${publicUrl.value}`)
+  }
 }
 
 async function loadHistory() {
@@ -191,6 +238,41 @@ async function generate(content: string) {
       <el-button text @click="router.push('/workspace')">← 返回</el-button>
       <span class="project-title">{{ projectName }}</span>
       <el-tag size="small" type="info">工程师模式</el-tag>
+      <div class="publish-area">
+        <template v-if="publishedSlug">
+          <el-tag size="small" type="success">已发布</el-tag>
+          <a
+            :href="publicUrl"
+            target="_blank"
+            rel="noopener"
+            class="public-link"
+            data-testid="public-link"
+          >
+            {{ publicUrl }}
+          </a>
+          <el-button size="small" data-testid="copy-link" @click="copyLink">复制链接</el-button>
+          <el-button
+            size="small"
+            text
+            type="danger"
+            data-testid="unpublish-button"
+            @click="onUnpublish"
+          >
+            取消发布
+          </el-button>
+        </template>
+        <el-button
+          v-else
+          size="small"
+          type="primary"
+          :loading="publishing"
+          :disabled="!hasIndex"
+          data-testid="publish-button"
+          @click="onPublish"
+        >
+          发布应用
+        </el-button>
+      </div>
     </header>
 
     <div class="body">
@@ -286,6 +368,23 @@ async function generate(content: string) {
 .project-title {
   font-size: 16px;
   font-weight: 600;
+}
+
+.publish-area {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.public-link {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #409eff;
+  font-size: 12px;
 }
 
 .body {

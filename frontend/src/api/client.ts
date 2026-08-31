@@ -62,5 +62,8 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
     throw new ApiError(resp.status, detail)
   }
 
+  // 204 等无响应体的成功状态（如 DELETE）不能解析 JSON
+  if (resp.status === 204) return undefined as T
+
   return (await resp.json()) as T
 }

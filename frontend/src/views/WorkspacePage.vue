@@ -90,7 +90,10 @@ function formatTime(iso: string) {
             <span class="project-name">{{ project.name }}</span>
             <el-tag size="small" type="info">工程师模式</el-tag>
           </div>
-          <div class="card-meta">更新于 {{ formatTime(project.updated_at) }}</div>
+          <div class="card-meta">
+            更新于 {{ formatTime(project.updated_at) }}
+            <el-tag v-if="project.published_slug" size="small" type="success">已发布</el-tag>
+          </div>
           <el-button
             text
             type="danger"
@@ -202,6 +205,9 @@ function formatTime(iso: string) {
   margin-top: 10px;
   color: #909399;
   font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .delete-btn {

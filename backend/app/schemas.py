@@ -39,8 +39,15 @@ class ProjectOut(BaseModel):
     mode: str
     created_at: datetime
     updated_at: datetime
+    # 活跃发布的稳定 slug；未发布为 None（工单 0006）
+    published_slug: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class PublishOut(BaseModel):
+    slug: str
+    url: str
 
 
 class SendMessageRequest(BaseModel):

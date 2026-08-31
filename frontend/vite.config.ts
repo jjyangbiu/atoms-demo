@@ -17,6 +17,11 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
+      // 已发布应用的公开链接由后端匿名托管（工单 0006）
+      '/p': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

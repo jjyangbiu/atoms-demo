@@ -52,6 +52,22 @@ class ProjectFile(Base):
     )
 
 
+class Publication(Base):
+    """发布记录：项目当前版本的稳定公开链接（见 CONTEXT.md）。
+
+    project_id 唯一约束保证同一项目至多一条活跃发布记录（工单 0006）。
+    """
+
+    __tablename__ = "publications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"), unique=True, index=True, nullable=False
+    )
+    slug: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Message(Base):
     """对话历史：含智能体文本与工具事件（kind=event 时 content 为 JSON）。"""
 
