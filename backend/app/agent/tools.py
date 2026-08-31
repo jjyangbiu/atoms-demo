@@ -11,6 +11,8 @@ from langchain_core.tools import tool
 # 生成物限定纯前端（ADR 0001）：仅允许文本类资源扩展名
 ALLOWED_EXTENSIONS = {".html", ".css", ".js", ".mjs", ".json", ".svg", ".md", ".txt"}
 MAX_FILE_BYTES = 512 * 1024
+# 项目目录内的系统保留目录（快照留档，工单 0007）：智能体与预览均不得触碰
+RESERVED_DIRS = {"snapshots"}
 
 
 class SandboxViolation(ValueError):
@@ -21,6 +23,9 @@ def resolve_sandboxed(root: Path, rel_path: str) -> Path:
     """把相对路径解析进沙箱；越界或扩展名非法即抛 SandboxViolation。"""
     if not rel_path or "\x00" in rel_path:
         raise SandboxViolation(f"非法路径: {rel_path!r}")
+    first = rel_path.replace("\\", "/").strip("/").split("/", 1)[0]
+    if first in RESERVED_DIRS:
+        raise SandboxViolation(f"禁止访问系统保留目录: {first}")
     candidate = (root / rel_path).resolve()
     root_resolved = root.resolve()
     if candidate != root_resolved and root_resolved not in candidate.parents:

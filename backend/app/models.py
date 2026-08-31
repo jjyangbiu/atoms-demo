@@ -68,6 +68,23 @@ class Publication(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class Snapshot(Base):
+    """版本快照：每次成功生成后项目全部文件的完整留档（工单 0007）。
+
+    文件本体以磁盘为准（{storage_root}/projects/{id}/snapshots/{rev}/），
+    此表只存索引；rev 在单个项目内从 1 递增。
+    """
+
+    __tablename__ = "snapshots"
+    __table_args__ = (UniqueConstraint("project_id", "rev"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    rev: Mapped[int] = mapped_column(nullable=False)
+    file_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Message(Base):
     """对话历史：含智能体文本与工具事件（kind=event 时 content 为 JSON）。"""
 

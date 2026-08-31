@@ -30,6 +30,13 @@ export interface FileOut {
   size: number
 }
 
+export interface SnapshotOut {
+  id: number
+  rev: number
+  file_count: number
+  created_at: string
+}
+
 export const useProjectStore = defineStore('projects', () => {
   const projects = ref<ProjectOut[]>([])
 
@@ -58,6 +65,16 @@ export const useProjectStore = defineStore('projects', () => {
     return api<FileOut[]>(`/api/projects/${projectId}/files`)
   }
 
+  async function fetchSnapshots(projectId: number): Promise<SnapshotOut[]> {
+    return api<SnapshotOut[]>(`/api/projects/${projectId}/snapshots`)
+  }
+
+  async function rollbackSnapshot(projectId: number, snapshotId: number): Promise<SnapshotOut> {
+    return api<SnapshotOut>(`/api/projects/${projectId}/snapshots/${snapshotId}/rollback`, {
+      method: 'POST',
+    })
+  }
+
   async function publishProject(projectId: number): Promise<PublishOut> {
     return api<PublishOut>(`/api/projects/${projectId}/publish`, { method: 'POST' })
   }
@@ -73,6 +90,8 @@ export const useProjectStore = defineStore('projects', () => {
     deleteProject,
     fetchMessages,
     fetchFiles,
+    fetchSnapshots,
+    rollbackSnapshot,
     publishProject,
     unpublishProject,
   }

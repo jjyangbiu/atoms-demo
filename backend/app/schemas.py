@@ -69,3 +69,22 @@ class FileOut(BaseModel):
     size: int
 
     model_config = {"from_attributes": True}
+
+
+class FileContentOut(BaseModel):
+    path: str
+    size: int
+    content: str
+
+
+class SnapshotOut(BaseModel):
+    id: int
+    rev: int
+    file_count: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SnapshotDetailOut(SnapshotOut):
+    files: list[FileOut] = []

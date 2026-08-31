@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api, ApiError } from '@/api/client'
 import { streamPost, type SseEvent } from '@/api/sse'
-import { useProjectStore, type MessageOut } from '@/stores/projects'
+import { useProjectStore, type FileOut, type MessageOut, type SnapshotOut } from '@/stores/projects'
+
+// 代码视图异步加载：Monaco 体积较大，仅在切到代码 Tab 时才拉取（工单 0007）
+const CodeView = defineAsyncComponent(() => import('@/components/CodeView.vue'))
 
 interface ToolInfo {
   name: string
@@ -38,6 +41,12 @@ const hasIndex = ref(false)
 const previewRev = ref(0)
 const publishedSlug = ref<string | null>(null)
 const publishing = ref(false)
+// 右侧面板双 Tab：预览 / 代码（工单 0007）；版本历史以抽屉展示
+const activeTab = ref<'preview' | 'code'>('preview')
+const fileList = ref<FileOut[]>([])
+const snapshots = ref<SnapshotOut[]>([])
+const historyVisible = ref(false)
+const rollingBackId = ref<number | null>(null)
 let seq = 0
 let lastUserContent = ''
 
@@ -150,13 +159,45 @@ async function loadHistory() {
 }
 
 async function loadFiles() {
-  const files = await store.fetchFiles(projectId.value)
-  hasIndex.value = files.some((f) => f.path === 'index.html')
+  fileList.value = await store.fetchFiles(projectId.value)
+  hasIndex.value = fileList.value.some((f) => f.path === 'index.html')
+}
+
+async function loadSnapshots() {
+  snapshots.value = await store.fetchSnapshots(projectId.value)
+}
+
+function formatTime(iso: string): string {
+  return new Date(iso).toLocaleString()
+}
+
+async function onRollback(snapshot: SnapshotOut) {
+  try {
+    await ElMessageBox.confirm(
+      `回滚到版本 ${snapshot.rev} 后，当前文件将被替换为该版本状态，后续迭代以其为基线。确定回滚？`,
+      '回滚版本',
+      { type: 'warning', confirmButtonText: '回滚', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  rollingBackId.value = snapshot.id
+  try {
+    await store.rollbackSnapshot(projectId.value, snapshot.id)
+    await Promise.all([loadFiles(), loadSnapshots()])
+    previewRev.value += 1
+    ElMessage.success(`已回滚到版本 ${snapshot.rev}`)
+    historyVisible.value = false
+  } catch (e) {
+    ElMessage.error(e instanceof ApiError ? e.detail : '回滚失败')
+  } finally {
+    rollingBackId.value = null
+  }
 }
 
 onMounted(async () => {
   await loadProject()
-  await Promise.all([loadHistory(), loadFiles()])
+  await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
 })
 
 async function send() {
@@ -225,7 +266,7 @@ async function generate(content: string) {
     if (textHolder.entry) textHolder.entry.streaming = false
     // 以服务端持久化结果为准对齐；文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
     // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比
-    await Promise.all([loadHistory(), loadFiles()])
+    await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
     previewRev.value += 1
     scrollToBottom()
   }
@@ -273,6 +314,9 @@ async function generate(content: string) {
           发布应用
         </el-button>
       </div>
+      <el-button size="small" text data-testid="history-button" @click="historyVisible = true">
+        版本历史
+      </el-button>
     </header>
 
     <div class="body">
@@ -334,8 +378,15 @@ async function generate(content: string) {
         </div>
       </section>
 
-      <section class="preview-panel">
+      <section class="right-panel">
+        <div class="panel-header">
+          <el-radio-group v-model="activeTab" size="small" data-testid="right-tabs">
+            <el-radio-button value="preview" data-testid="tab-preview">预览</el-radio-button>
+            <el-radio-button value="code" data-testid="tab-code">代码</el-radio-button>
+          </el-radio-group>
+        </div>
         <iframe
+          v-show="activeTab === 'preview'"
           v-if="previewSrc"
           :src="previewSrc"
           class="preview-frame"
@@ -343,9 +394,42 @@ async function generate(content: string) {
           sandbox="allow-scripts allow-same-origin"
           data-testid="app-preview"
         />
-        <el-empty v-else description="预览区：生成完成的应用将在这里实时运行" />
+        <el-empty
+          v-if="activeTab === 'preview' && !previewSrc"
+          description="预览区：生成完成的应用将在这里实时运行"
+        />
+        <CodeView
+          v-if="activeTab === 'code'"
+          :project-id="projectId"
+          :files="fileList"
+          :version="previewRev"
+        />
       </section>
     </div>
+
+    <el-drawer v-model="historyVisible" title="版本历史" size="360px">
+      <el-empty v-if="!snapshots.length" description="每次成功生成后将自动留档一版" />
+      <ul v-else class="snapshot-list" data-testid="snapshot-list">
+        <li v-for="s in snapshots" :key="s.id" class="snapshot-item">
+          <div class="snapshot-info">
+            <div class="snapshot-title">
+              版本 {{ s.rev }}
+              <el-tag v-if="s.rev === snapshots[0]?.rev" size="small" type="success">最新</el-tag>
+            </div>
+            <div class="snapshot-meta">{{ formatTime(s.created_at) }} · {{ s.file_count }} 个文件</div>
+          </div>
+          <el-button
+            size="small"
+            :loading="rollingBackId === s.id"
+            :disabled="generating || rollingBackId !== null"
+            data-testid="rollback-button"
+            @click="onRollback(s)"
+          >
+            回滚
+          </el-button>
+        </li>
+      </ul>
+    </el-drawer>
   </div>
 </template>
 
@@ -498,19 +582,59 @@ async function generate(content: string) {
   height: 48px;
 }
 
-.preview-panel {
+.right-panel {
   flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
   background: #fafafa;
   min-width: 0;
 }
 
+.panel-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e4e7ed;
+  background: #fff;
+}
+
 .preview-frame {
+  flex: 1;
   width: 100%;
-  height: 100%;
   border: 0;
   background: #fff;
+}
+
+.snapshot-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.snapshot-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+}
+
+.snapshot-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.snapshot-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #909399;
 }
 </style>

@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     agent_max_retries: int = 2
     # 迭代时喂给模型的最近对话轮数（1 轮 = 一问一答）；持久化不受影响（工单 0004）
     agent_history_window: int = 10
+    # 每个项目保留的版本快照上限，超出时连同文件清理最旧的（工单 0007）
+    snapshot_max_kept: int = 50
 
 
 @lru_cache
