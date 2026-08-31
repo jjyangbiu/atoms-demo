@@ -226,7 +226,11 @@ async function send() {
   input.value = ''
   entries.value.push({ id: nextId(), kind: 'user', content })
   lastUserContent = content
-  await runSse(`/api/projects/${projectId.value}/messages`, { content })
+  const err = await runSse(`/api/projects/${projectId.value}/messages`, { content })
+  if (err?.status === 429) {
+    // 限流被拒不落库：把输入还给用户，稍后可直接重发（工单 0011）
+    input.value = content
+  }
 }
 
 function retry() {
@@ -246,10 +250,14 @@ async function confirmPrd() {
     kind: 'user',
     content: feedback || '确认通过，开始实现。',
   })
-  await runSse(`/api/projects/${projectId.value}/prd/confirm`, { feedback })
+  const err = await runSse(`/api/projects/${projectId.value}/prd/confirm`, { feedback })
+  if (err?.status === 429) {
+    // 限流被拒不落确认：还回追加意见，稍后可直接重新确认（工单 0011）
+    prdFeedback.value = feedback
+  }
 }
 
-async function runSse(path: string, body: unknown) {
+async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   generating.value = true
   errorDetail.value = ''
   const textHolder: { entry: ChatEntry | null } = { entry: null }
@@ -314,6 +322,12 @@ async function runSse(path: string, body: unknown) {
     })
   } catch (e) {
     errorDetail.value = e instanceof Error ? e.message : '请求失败'
+    if (e instanceof ApiError && e.status === 429) {
+      // 限流：友好提示何时可再试，而非通用报错（工单 0011）
+      ElMessage.warning({ message: errorDetail.value, duration: 6000 })
+      return e
+    }
+    return null
   } finally {
     generating.value = false
     if (textHolder.entry) textHolder.entry.streaming = false
@@ -324,6 +338,7 @@ async function runSse(path: string, body: unknown) {
     previewRev.value += 1
     scrollToBottom()
   }
+  return null
 }
 </script>
 

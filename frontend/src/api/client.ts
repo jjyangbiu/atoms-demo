@@ -21,9 +21,32 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     public detail: string,
+    /** 限流（429）时后端给出的建议重试等待秒数（工单 0011） */
+    public retryAfter: number | null = null,
   ) {
     super(detail)
   }
+}
+
+/**
+ * 解析错误响应体：兼容字符串 detail 与结构化 detail（限流 429：
+ * { error, reason, retry_after, message }，工单 0011）。
+ */
+export function extractError(
+  statusText: string,
+  data: unknown,
+): { detail: string; retryAfter: number | null } {
+  let detail = statusText
+  let retryAfter: number | null = null
+  const d = (data as { detail?: unknown } | null)?.detail
+  if (typeof d === 'string') {
+    detail = d
+  } else if (d && typeof d === 'object') {
+    const obj = d as Record<string, unknown>
+    if (typeof obj.message === 'string') detail = obj.message
+    if (typeof obj.retry_after === 'number') retryAfter = obj.retry_after
+  }
+  return { detail, retryAfter }
 }
 
 interface ApiOptions {
@@ -52,14 +75,14 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
   }
 
   if (!resp.ok) {
-    let detail = resp.statusText
+    let data: unknown = null
     try {
-      const data = await resp.json()
-      if (typeof data?.detail === 'string') detail = data.detail
+      data = await resp.json()
     } catch {
       /* 非 JSON 错误体，保留 statusText */
     }
-    throw new ApiError(resp.status, detail)
+    const { detail, retryAfter } = extractError(resp.statusText, data)
+    throw new ApiError(resp.status, detail, retryAfter)
   }
 
   // 204 等无响应体的成功状态（如 DELETE）不能解析 JSON

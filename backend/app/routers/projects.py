@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from ..agent.tools import (
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, Publication, Snapshot, User, _utcnow
 from ..rag.store import maybe_knowledge_store
+from ..rate_limit import RateLimitRejected
 from ..schemas import (
     ConfirmPrdRequest,
     CreateProjectRequest,
@@ -241,6 +243,59 @@ def _sse_response(stream) -> StreamingResponse:
     )
 
 
+# --- 生成限流（工单 0011） ---
+#
+# 模型调用（工程师生成与团队模式 PM 产 PRD）在入口处接受限流检查：
+# 超限直接 429（携带建议重试时间与 Retry-After 头），不落用户消息、不调模型；
+# 引导类响应（如未确认 PRD 的提示）不调模型，不计入限额。
+# 全局名额自接受起占用，流结束（成功/失败/断流）时释放。
+
+
+def _format_wait(seconds: float) -> str:
+    """把建议等待秒数转成友好表述（用于限流提示文案）。"""
+    s = max(1, math.ceil(seconds))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{math.ceil(s / 60)} 分钟"
+    return f"{math.ceil(s / 3600)} 小时"
+
+
+def _accept_rate_limit(request: Request, user: User) -> None:
+    """接受一次生成；超限抛 429，响应体携带 reason/retry_after 与友好文案。"""
+    limiter = request.app.state.rate_limiter
+    try:
+        limiter.accept(user.id)
+    except RateLimitRejected as e:
+        retry_after = int(math.ceil(e.retry_after))
+        if e.reason == "user_hourly":
+            message = (
+                f"已达每小时生成上限（{limiter.per_user_hourly} 次），"
+                f"请约 {_format_wait(e.retry_after)}后重试"
+            )
+        else:
+            message = f"当前同时进行生成任务较多，请约 {_format_wait(e.retry_after)}后重试"
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "rate_limited",
+                "reason": e.reason,
+                "retry_after": retry_after,
+                "message": message,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def _limited_stream(stream, request: Request):
+    """包一层释放：无论流如何结束都归还全局并发名额（工单 0011）。"""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        request.app.state.rate_limiter.release()
+
+
 async def _engineer_stream(
     request: Request, project_id: int, user_text: str, history: list, existing_files: list[str]
 ):
@@ -369,15 +424,8 @@ async def send_message(
     db: Session = Depends(get_db),
 ):
     project = get_owned_project(project_id, user, db)
-    user_message = Message(project_id=project_id, role="user", kind="text", content=body.content)
-    db.add(user_message)
-    db.commit()
-    db.refresh(user_message)
 
     settings = request.app.state.settings
-    history = _llm_history(
-        db, project_id, before_message_id=user_message.id, window=settings.agent_history_window
-    )
     existing_files = _existing_file_paths(db, project_id)
 
     # 团队模式分流（工单 0010）：首条消息进产品经理产 PRD；待确认时引导先处理 PRD；
@@ -395,6 +443,7 @@ async def send_message(
             "团队模式下已产出待确认的 PRD：请先在 PRD 卡片上确认通过（可附追加意见），"
             "工程师才会开始实现；如需调整需求，请将修改意见随确认一并提出。"
         )
+        db.add(Message(project_id=project_id, role="user", kind="text", content=body.content))
         db.add(Message(project_id=project_id, role="system", kind="text", content=guidance))
         db.commit()
 
@@ -403,6 +452,24 @@ async def send_message(
             yield _sse({"type": "done", "text": guidance})
 
         return _sse_response(guide_stream())
+
+    # 限流检查在落用户消息之前：被拒请求不产生任何持久化痕迹（工单 0011）。
+    # accept 之后、返回流之前的任何异常都必须归还名额，否则全局名额泄漏直至重启。
+    _accept_rate_limit(request, user)
+    try:
+        user_message = Message(
+            project_id=project_id, role="user", kind="text", content=body.content
+        )
+        db.add(user_message)
+        db.commit()
+        db.refresh(user_message)
+
+        history = _llm_history(
+            db, project_id, before_message_id=user_message.id, window=settings.agent_history_window
+        )
+    except Exception:
+        request.app.state.rate_limiter.release()
+        raise
 
     async def event_stream():
         # 同一项目的生成排队串行，避免并发覆盖项目目录与快照 rev 竞态（工单 0007 评审项）
@@ -416,7 +483,7 @@ async def send_message(
                 ):
                     yield chunk
 
-    return _sse_response(event_stream())
+    return _sse_response(_limited_stream(event_stream(), request))
 
 
 @router.post("/{project_id}/prd/confirm")
@@ -446,6 +513,11 @@ async def confirm_prd(
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
 
+    # 确认即触发工程师生成：同样受限流约束，超限不落确认消息（工单 0011）。
+    # 前置校验（属主/模式/状态）已在上方完成，accept 与返回流之间无可抛语句，
+    # 名额由 _limited_stream 的 finally 归还。
+    _accept_rate_limit(request, user)
+
     async def event_stream():
         async with _project_lock(project_id):
             # 锁内复查状态并落确认：并发双击/重试不会造成重复确认与两次生成（工单 0010）
@@ -474,7 +546,7 @@ async def confirm_prd(
             ):
                 yield chunk
 
-    return _sse_response(event_stream())
+    return _sse_response(_limited_stream(event_stream(), request))
 
 
 @router.get("/{project_id}/files", response_model=list[FileOut])

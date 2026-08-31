@@ -8,6 +8,7 @@ from .agent.model import default_model_factory
 from .config import Settings, get_settings
 from .db import Base, make_engine
 from .rag.embeddings import default_embedding_factory
+from .rate_limit import GenerationLimiter
 from .routers import auth, projects, publish, world
 
 
@@ -21,6 +22,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 测试可替换为桩 embedding 工厂（见 tests/conftest.py）；知识库懒构建，见 rag.store
     app.state.embedding_factory = default_embedding_factory
     app.state.knowledge_store = None
+    # 生成限流器（工单 0011）：限额取自配置，测试可直接替换或改属性/时钟
+    app.state.rate_limiter = GenerationLimiter(
+        settings.rate_limit_per_user_hourly, settings.rate_limit_max_concurrent
+    )
 
     engine = make_engine(settings.database_url)
     Base.metadata.create_all(engine)

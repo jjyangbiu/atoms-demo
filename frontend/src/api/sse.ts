@@ -4,7 +4,7 @@
  * （text | tool | done | error；团队模式另有 prd 增量事件，工单 0010）。
  */
 
-import { ApiError, getToken } from '@/api/client'
+import { ApiError, extractError, getToken } from '@/api/client'
 
 export interface SseEvent {
   type: 'text' | 'tool' | 'done' | 'error' | 'prd' | string
@@ -22,14 +22,14 @@ export async function streamPost(
 
   const resp = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) })
   if (!resp.ok || !resp.body) {
-    let detail = resp.statusText
+    let data: unknown = null
     try {
-      const data = await resp.json()
-      if (typeof data?.detail === 'string') detail = data.detail
+      data = await resp.json()
     } catch {
       /* 非 JSON 错误体 */
     }
-    throw new ApiError(resp.status, detail)
+    const { detail, retryAfter } = extractError(resp.statusText, data)
+    throw new ApiError(resp.status, detail, retryAfter)
   }
 
   const reader = resp.body.getReader()
