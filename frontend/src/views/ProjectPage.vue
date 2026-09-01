@@ -147,6 +147,9 @@ const projectMode = ref<'engineer' | 'team'>('engineer')
 const entries = ref<ChatEntry[]>([])
 const input = ref('')
 const generating = ref(false)
+// 手动停止（诊断修复）：生成中持有 AbortController，停止按钮点击即中止 fetch，
+// 后端感知断开后中止生成并落库已流出内容（同刷新断流语义）
+const stopCtrl = ref<AbortController | null>(null)
 const errorDetail = ref('')
 // 刷新/断流导致上一轮生成被中断（诊断修复）：后端已把流出的思考落库，
 // 加载历史时据"消息尾不是收尾结论"识别并展示重试入口，避免用户以为状态丢失
@@ -603,6 +606,11 @@ function retry() {
   void runSse(`/api/projects/${projectId.value}/messages`, { content: lastUserContent })
 }
 
+// 手动停止（诊断修复）：中止客户端 fetch 即断开 SSE，后端同刷新断流语义中止生成并落库
+function stopGeneration() {
+  stopCtrl.value?.abort()
+}
+
 // 确认 PRD（工单 0010）：确认后工程师智能体随即开始生成，后续迭代与工程师模式一致；
 // 追加意见可选，随确认一并交给工程师，同步落对话历史可回看（工单 0010）
 async function confirmPrd() {
@@ -861,6 +869,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   generating.value = true
   errorDetail.value = ''
   interrupted.value = { status: 'none' }
+  stopCtrl.value = new AbortController()
   const textHolder: { entry: ChatEntry | null } = { entry: null }
   const prdHolder: { entry: ChatEntry | null } = { entry: null }
   const consensusHolder: { entry: ChatEntry | null } = { entry: null }
@@ -1055,8 +1064,12 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         panelOpen.value = false
       }
       scrollToBottom()
-    })
+    }, stopCtrl.value?.signal)
   } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      // 手动停止：非错误，不落错误横幅；中断横幅由流结束后的 loadHistory 识别
+      return null
+    }
     errorDetail.value = e instanceof Error ? e.message : '请求失败'
     if (e instanceof ApiError && e.status === 429) {
       // 限流：友好提示何时可再试，而非通用报错（工单 0011）
@@ -1066,6 +1079,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return null
   } finally {
     generating.value = false
+    stopCtrl.value = null
     if (textHolder.entry) textHolder.entry.streaming = false
     if (prdHolder.entry) prdHolder.entry.streaming = false
     if (consensusHolder.entry) consensusHolder.entry.streaming = false
@@ -1375,7 +1389,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             class="error-banner"
             data-testid="chat-interrupted"
           >
-            <span>⚠ 上一轮生成被中断（页面刷新或连接断开），已产出的思考过程已保留</span>
+            <span>⚠ 上一轮生成被中断（手动停止、页面刷新或连接断开），已产出的思考过程已保留</span>
             <el-button type="danger" size="small" data-testid="chat-retry" @click="retry">
               重新生成
             </el-button>
@@ -1518,13 +1532,21 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
               @keydown.enter.exact.prevent="send"
             />
             <el-button
+              v-if="generating"
+              type="danger"
+              data-testid="chat-stop"
+              @click="stopGeneration"
+            >
+              停止
+            </el-button>
+            <el-button
+              v-else
               type="primary"
-              :loading="generating"
               :disabled="!input.trim() || panelOpen"
               data-testid="chat-send"
               @click="send"
             >
-              {{ generating ? '生成中' : '发送' }}
+              发送
             </el-button>
           </div>
         </div>
@@ -1959,7 +1981,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .chat-input {
   display: flex;
   gap: 8px;
-  align-items: flex-end;
+  /* 按钮与输入框垂直居中对齐（用户反馈调整） */
+  align-items: center;
   padding: 12px 16px;
 }
 
@@ -2141,10 +2164,6 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   font-size: 13px;
   color: #409eff;
   padding-left: 12px;
-}
-
-.chat-input .el-button {
-  height: 48px;
 }
 
 .right-panel {

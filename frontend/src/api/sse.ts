@@ -30,12 +30,14 @@ export async function streamPost(
   path: string,
   body: unknown,
   onEvent: (event: SseEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token = getToken()
   if (token) headers['Authorization'] = `Bearer ${token}`
 
-  const resp = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) })
+  // signal 供调用方手动停止：中止 fetch 即断开 SSE，后端感知断开后中止生成并落库已流出内容
+  const resp = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body), signal })
   if (!resp.ok || !resp.body) {
     let data: unknown = null
     try {
