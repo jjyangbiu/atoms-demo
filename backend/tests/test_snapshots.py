@@ -14,7 +14,12 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from conftest import login, use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    confirm_first_build,
+    login,
+    use_fake_model,
+)
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -25,7 +30,12 @@ def _project_dir(settings, project_id) -> Path:
 
 def _generate(client, headers, project_id, script, text="第几版都行"):
     use_fake_model(client.app, script)
-    return _stream_messages(client, headers, project_id, text)
+    events = _stream_messages(client, headers, project_id, text)
+    # 首建分流（工单 0015）：新项目首条消息先走澄清；产出共识则确认后拿到生成事件，
+    # 澄清失败（无共识）则原样返回澄清流事件。已有消息的项目直接走迭代。
+    if any(e["type"] == "consensus" for e in events):
+        return confirm_first_build(client, headers, project_id)
+    return events
 
 
 class TestSnapshotCreation:
@@ -33,7 +43,10 @@ class TestSnapshotCreation:
         project = _create_project(client, auth_headers)
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+            ],
         )
         _generate(
             client, auth_headers, project["id"],
@@ -50,6 +63,7 @@ class TestSnapshotCreation:
 
     def test_failed_generation_creates_no_snapshot(self, app, client, auth_headers):
         project = _create_project(client, auth_headers)
+        # 首建澄清阶段耗尽重试：失败同样不留档（工单 0015）
         events = _generate(client, auth_headers, project["id"], [RuntimeError, RuntimeError, RuntimeError])
         assert events[-1]["type"] == "error"
 
@@ -61,6 +75,7 @@ class TestSnapshotCreation:
         _generate(
             client, auth_headers, project["id"],
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
                 {"text": "ok"},
@@ -83,6 +98,7 @@ class TestSnapshotCreation:
         events = _generate(
             client, auth_headers, project["id"],
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 # 智能体不得写入快照存放区
                 {"tool_calls": [("write_file", {"path": "snapshots/evil.html", "content": "bad"})]},
@@ -101,6 +117,7 @@ class TestRollback:
         _generate(
             client, auth_headers, project["id"],
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "extra.html", "content": "extra"})]},
                 {"text": "ok"},
@@ -153,7 +170,10 @@ class TestRollback:
         project = _create_project(client, auth_headers)
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+            ],
         )
         snap_id = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]["id"]
 
@@ -170,11 +190,12 @@ class TestRetention:
         settings.snapshot_max_kept = 3
         project = _create_project(client, auth_headers)
         for i in range(1, 5):
-            _generate(
-                client, auth_headers, project["id"],
-                [{"tool_calls": [("write_file", {"path": "index.html", "content": f"v{i}"})]}, {"text": "ok"}],
-                text=f"第 {i} 轮",
-            )
+            script = [
+                {"tool_calls": [("write_file", {"path": "index.html", "content": f"v{i}"})]}, {"text": "ok"}
+            ]
+            if i == 1:
+                script.insert(0, FIRST_BUILD_CLARIFY_STEP)
+            _generate(client, auth_headers, project["id"], script, text=f"第 {i} 轮")
 
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
         assert [s["rev"] for s in snaps] == [4, 3, 2], "超出上限时最旧快照被清理"
@@ -187,7 +208,10 @@ class TestRetention:
         project = _create_project(client, auth_headers)
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+            ],
         )
         assert client.delete(f"/api/projects/{project['id']}", headers=auth_headers).status_code == 204
         assert not (_project_dir(settings, project["id"]) / "snapshots").exists()
@@ -198,7 +222,10 @@ class TestFileContent:
         project = _create_project(client, auth_headers)
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]}, {"text": "ok"}],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]}, {"text": "ok"}
+            ],
         )
         resp = client.get(f"/api/projects/{project['id']}/files/index.html", headers=auth_headers)
         assert resp.status_code == 200
@@ -227,13 +254,17 @@ class TestFileContent:
         rel_app = create_app(settings)
         use_fake_model(
             rel_app,
-            [{"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>rel</h1>"})]}, {"text": "ok"}],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>rel</h1>"})]}, {"text": "ok"},
+            ],
         )
         rel_client = TestClient(rel_app)
         rel_client.post("/api/auth/register", json={"username": "reluser", "password": "secret123"})
         headers = {"Authorization": f"Bearer {login(rel_client, 'reluser', 'secret123')}"}
         project = _create_project(rel_client, headers)
         _stream_messages(rel_client, headers, project["id"], "做一个页面")
+        confirm_first_build(rel_client, headers, project["id"])
 
         resp = rel_client.get(f"/api/projects/{project['id']}/files/index.html", headers=headers)
         assert resp.status_code == 200, resp.text

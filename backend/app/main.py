@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from .agent.model import default_model_factory
 from .config import Settings, get_settings
-from .db import Base, make_engine
+from .db import Base, ensure_schema, make_engine
 from .rag.embeddings import default_embedding_factory
 from .rate_limit import GenerationLimiter
 from .routers import auth, projects, publish, world
@@ -29,6 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     engine = make_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    ensure_schema(engine)
     app.state.engine = engine
     app.state.session_factory = sessionmaker(bind=engine, expire_on_commit=False)
 

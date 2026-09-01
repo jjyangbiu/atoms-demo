@@ -4,6 +4,7 @@
 """
 
 import inspect
+import json
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -102,6 +103,74 @@ def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
 
         tools.append(search_templates)
     return tools
+
+
+def build_clarify_tools() -> list:
+    """澄清智能体的唯一工具（工单 0015 / ADR 0003）。
+
+    澄清阶段不绑定任何文件工具：模型物理上无法提前写代码，
+    唯一出口是携带需求共识摘要的 start_build。
+    """
+
+    @tool
+    def start_build(requirements_summary: str) -> str:
+        """澄清完成（或用户要求跳过澄清）时调用，产出需求共识。参数: requirements_summary — 澄清后达成的需求共识摘要（中文 Markdown）。"""
+        return "已记录需求共识，等待用户确认。"
+
+    return [start_build]
+
+
+def build_breaker_tools() -> list:
+    """拆单智能体的唯一工具（工单 0017 / ADR 0003）。
+
+    拆解阶段不绑定任何文件工具：模型物理上无法提前写代码，
+    唯一出口是携带工单清单 JSON 的 submit_tickets。
+    """
+
+    @tool
+    def submit_tickets(tickets: str) -> str:
+        """拆解完成时调用，提交工单清单。参数: tickets — 工单清单 JSON 数组字符串，每项含 title（标题）、deliverable（交付内容）、blocked_by（阻塞它的工单序号列表，无依赖为 []）。"""
+        return "已提交工单清单。"
+
+    return [submit_tickets]
+
+
+def parse_ticket_payload(raw: str) -> tuple[list[dict] | None, str]:
+    """校验拆单智能体提交的工单清单；非法时返回 (None, 错误文案) 交还模型修正。
+
+    约束（工单 0017）：数量个位数（1–9）；序号按提交顺序从 1 起编；
+    blocked_by 只引用序号更小的工单（首单无依赖），天然不成环。
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "tickets 不是合法 JSON，请提交 JSON 数组字符串。"
+    if not isinstance(data, list) or not data:
+        return None, "工单清单必须是非空 JSON 数组。"
+    if len(data) > 9:
+        return None, f"工单数量应控制在个位数，当前为 {len(data)} 个，请合并粒度。"
+    tickets: list[dict] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            return None, f"第 {i + 1} 个工单必须是 JSON 对象。"
+        title = str(item.get("title") or "").strip()
+        deliverable = str(item.get("deliverable") or "").strip()
+        if not title or not deliverable:
+            return None, f"第 {i + 1} 个工单缺少 title 或 deliverable。"
+        blocked_raw = item.get("blocked_by") or []
+        if not isinstance(blocked_raw, list):
+            return None, f"第 {i + 1} 个工单的 blocked_by 必须是序号数组。"
+        try:
+            blocked = sorted({int(x) for x in blocked_raw})
+        except (TypeError, ValueError):
+            return None, f"第 {i + 1} 个工单的 blocked_by 含非整数序号。"
+        seq = i + 1
+        if any(b >= seq for b in blocked):
+            return None, f"工单 {seq} 的 blocked_by 只能引用序号更小的工单。"
+        tickets.append(
+            {"seq": seq, "title": title, "deliverable": deliverable, "blocked_by": blocked}
+        )
+    return tickets, ""
 
 
 def execute_tool(tools: list, name: str, args: dict) -> tuple[bool, str]:

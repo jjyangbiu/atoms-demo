@@ -1,8 +1,9 @@
 """官方示例灌入（工单 0012）：画廊冷启动。
 
 用系统自身链路生成并发布一组官方示例应用，标记"官方示例"进入 App 世界画廊，
-供浏览与克隆演示。灌入走与真实用户完全相同的 HTTP 链路（建项目 → 首轮生成 →
-一轮迭代 → 发布），因此同时是对全链路（生成 → 迭代 → 发布 → 画廊）的真实回归。
+供浏览与克隆演示。灌入走与真实用户完全相同的 HTTP 链路（建项目 → 需求澄清与
+共识确认 → 首轮生成 → 一轮迭代 → 发布），因此同时是对全链路（澄清 → 生成 →
+迭代 → 发布 → 画廊）的真实回归。澄清阶段无人应答时以"直接生成"逃生门收敛。
 
 可重复执行：已灌入的示例直接跳过；生成成功但未发布的中断现场会被补齐发布
 （不重复迭代）；生成失败的示例记录原因、不影响其余示例。入口见
@@ -146,9 +147,10 @@ def _ensure_official_user(session_factory) -> User:
         return user
 
 
-def _generation_ok_events(response) -> tuple[bool, str | None]:
-    """解析生成 SSE 流：返回 (是否收到 done, 首个 error 事件的原因)。"""
+def _generation_ok_events(response) -> tuple[bool, bool, str | None]:
+    """解析生成/澄清 SSE 流：返回 (是否收到 done, 是否出现共识卡片, 首个 error 原因)。"""
     done = False
+    consensus = False
     error: str | None = None
     for line in response.iter_lines():
         if not line.startswith("data: "):
@@ -156,13 +158,15 @@ def _generation_ok_events(response) -> tuple[bool, str | None]:
         event = json.loads(line.removeprefix("data: "))
         if event.get("type") == "error" and error is None:
             error = event.get("detail") or "未知错误"
+        elif event.get("type") == "consensus":
+            consensus = True
         elif event.get("type") == "done":
             done = True
-    return done, error
+    return done, consensus, error
 
 
-def _run_generation(client, headers: dict, project_id: int, content: str) -> str | None:
-    """经真实对话链路发一轮生成（SSE）；成功返回 None，失败返回原因。"""
+def _run_generation(client, headers: dict, project_id: int, content: str) -> tuple[str | None, bool]:
+    """经真实对话链路发一轮消息（SSE）：返回 (失败原因或 None, 是否产出需求共识)。"""
     try:
         with client.stream(
             "POST",
@@ -171,14 +175,33 @@ def _run_generation(client, headers: dict, project_id: int, content: str) -> str
             headers=headers,
         ) as stream:
             if stream.status_code != 200:
-                return f"生成请求失败: HTTP {stream.status_code}"
-            done, error = _generation_ok_events(stream)
+                return f"生成请求失败: HTTP {stream.status_code}", False
+            done, consensus, error = _generation_ok_events(stream)
     except Exception as e:  # noqa: BLE001 — 单个示例失败记录后继续灌入其余
-        return f"生成异常: {e}"
+        return f"生成异常: {e}", False
+    if error is not None:
+        return error, False
+    if not done:
+        return "生成流结束但没有 done 事件", False
+    return None, consensus
+
+
+def _confirm_consensus(client, headers: dict, project_id: int) -> str | None:
+    """确认需求共识（工单 0015）：工程师随即生成；成功返回 None，失败返回原因。"""
+    try:
+        with client.stream(
+            "POST",
+            f"/api/projects/{project_id}/consensus/confirm",
+            json={"feedback": ""},
+            headers=headers,
+        ) as stream:
+            if stream.status_code != 200:
+                return f"共识确认失败: HTTP {stream.status_code}"
+            _done, _consensus, error = _generation_ok_events(stream)
+    except Exception as e:  # noqa: BLE001 — 与生成轮一致，记录后继续灌入其余
+        return f"共识确认异常: {e}"
     if error is not None:
         return error
-    if not done:
-        return "生成流结束但没有 done 事件"
     return None
 
 
@@ -217,11 +240,24 @@ def _seed_one(app, client, session_factory, user: User, headers: dict, spec: Sam
             return SeedResult(spec.name, "failed", error=f"创建项目失败: HTTP {resp.status_code}")
         project_id = resp.json()["id"]
 
-        error = _run_generation(client, headers, project_id, spec.ask)
+        error, consensus = _run_generation(client, headers, project_id, spec.ask)
+        if error is not None:
+            return SeedResult(spec.name, "failed", error=error)
+        if not consensus:
+            # 澄清智能体提出了问题：灌入无人应答，走"直接生成"逃生门收敛（工单 0015）
+            error, consensus = _run_generation(
+                client, headers, project_id, "无需继续澄清，按以上描述直接生成。"
+            )
+            if error is not None:
+                return SeedResult(spec.name, "failed", error=error)
+            if not consensus:
+                return SeedResult(spec.name, "failed", error="需求澄清未收敛")
+        # 共识确认门：确认后才开始工程师生成（工单 0015）
+        error = _confirm_consensus(client, headers, project_id)
         if error is not None:
             return SeedResult(spec.name, "failed", error=error)
         # 再走一轮对话迭代：全链路回归含迭代环节；失败则不发布，重跑可重建
-        error = _run_generation(client, headers, project_id, spec.iterate)
+        error, _consensus = _run_generation(client, headers, project_id, spec.iterate)
         if error is not None:
             return SeedResult(spec.name, "failed", error=f"迭代失败: {error}")
     else:

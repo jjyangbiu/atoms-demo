@@ -6,11 +6,15 @@
   默认注入桩 embedding（工单 0009），向量库用临时目录的 Milvus Lite
 """
 
+import json
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.models import ProjectFile
 from fake_embeddings import FakeEmbedder
 from fake_model import FakeModel
 
@@ -75,3 +79,51 @@ def use_fake_embeddings(app, dim: int = 256) -> FakeEmbedder:
     app.state.embedding_factory = lambda settings: embedder
     app.state.knowledge_store = None  # 丢弃可能已缓存的旧实例，用新桩重建
     return embedder
+
+
+# --- 首建流水线辅助（工单 0015） ---
+#
+# 工程师模式新建项目的首条消息先走需求澄清：把它预排在伪模型脚本首位，
+# 即可让旧测试以最小改动穿过“澄清 → 共识确认 → 生成”链路。
+
+FIRST_BUILD_CLARIFY_STEP = {
+    "tool_calls": [("start_build", {"requirements_summary": "需求共识：按用户描述实现。"})]
+}
+"""伪模型脚本步：澄清轮直接调 start_build 产出共识（跳过问答）。"""
+
+
+def parse_sse(resp) -> list[dict]:
+    """解析 SSE 流为事件列表（data: JSON 行）。"""
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in resp.iter_lines()
+        if line.startswith("data: ")
+    ]
+
+
+def confirm_first_build(client, headers, project_id, feedback: str = "") -> list[dict]:
+    """确认需求共识，工程师随即生成；返回生成流的 SSE 事件列表。"""
+    with client.stream(
+        "POST",
+        f"/api/projects/{project_id}/consensus/confirm",
+        json={"feedback": feedback},
+        headers=headers,
+    ) as resp:
+        assert resp.status_code == 200, resp.read()
+        return parse_sse(resp)
+
+
+def seed_project_files(app, project_id, files: dict[str, str] | None = None) -> None:
+    """预置项目文件（磁盘 + 索引）：模拟已有文件场景，消息直接走迭代分流。"""
+    files = files if files is not None else {"index.html": "v1"}
+    root = Path(app.state.settings.storage_root) / "projects" / str(project_id)
+    root.mkdir(parents=True, exist_ok=True)
+    with app.state.session_factory() as session:
+        for path, content in files.items():
+            (root / path).write_text(content, encoding="utf-8")
+            session.add(
+                ProjectFile(
+                    project_id=project_id, path=path, size=len(content.encode("utf-8"))
+                )
+            )
+        session.commit()

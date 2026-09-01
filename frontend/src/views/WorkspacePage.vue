@@ -13,7 +13,7 @@ const router = useRouter()
 
 const createDialogVisible = ref(false)
 const newName = ref('')
-// 生成模式（工单 0010）：工程师直接实现 / 团队模式先产 PRD 确认后再实现
+// 生成模式（工单 0010/0016/0017）：工程师直接实现（先澄清）/ 团队模式澄清→规格确认→拆单确认→执行
 const newMode = ref<'engineer' | 'team'>('engineer')
 const creating = ref(false)
 
@@ -135,8 +135,8 @@ function formatTime(iso: string) {
         <p class="mode-hint">
           {{
             newMode === 'team'
-              ? '团队模式：产品经理先产出 PRD，确认（可附意见）后工程师才开始实现'
-              : '工程师模式：智能体直接根据你的描述生成应用'
+              ? '团队模式：彻底澄清需求后产出需求规格，确认后拆解为工单清单，确认后按检查点串行执行'
+              : '工程师模式：澄清需求并确认后，智能体根据你的描述生成应用'
           }}
         </p>
       </el-form>

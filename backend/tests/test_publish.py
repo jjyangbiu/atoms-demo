@@ -14,22 +14,24 @@
 
 from fastapi.testclient import TestClient
 
-from conftest import login, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, confirm_first_build, login, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
 
 def _generate_index(app, client, headers, content="<h1>时钟</h1>") -> dict:
-    """用伪模型生成一个含 index.html 的项目并返回项目。"""
+    """用伪模型生成一个含 index.html 的项目并返回项目（首建先过澄清确认门，工单 0015）。"""
     use_fake_model(
         app,
         [
+            FIRST_BUILD_CLARIFY_STEP,
             {"tool_calls": [("write_file", {"path": "index.html", "content": content})]},
             {"text": "完成。"},
         ],
     )
     project = _create_project(client, headers)
     _stream_messages(client, headers, project["id"], "做一个时钟应用")
+    confirm_first_build(client, headers, project["id"])
     return project
 
 
@@ -59,6 +61,7 @@ class TestPublish:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {
                     "tool_calls": [
                         (
@@ -76,6 +79,7 @@ class TestPublish:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+        confirm_first_build(client, auth_headers, project["id"])
         pub = _publish(client, auth_headers, project["id"])
 
         anonymous = TestClient(app)
@@ -103,6 +107,7 @@ class TestPublish:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
                 {"text": "第一版。"},
                 {
@@ -115,6 +120,7 @@ class TestPublish:
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        confirm_first_build(client, auth_headers, project["id"])
         pub = _publish(client, auth_headers, project["id"])
 
         _stream_messages(client, auth_headers, project["id"], "改一下标题")

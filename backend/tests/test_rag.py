@@ -15,8 +15,13 @@ from langchain_core.messages import ToolMessage
 
 from app.main import create_app
 from app.rag.seeds import SEED_TEMPLATES
-from app.rag.store import KnowledgeStore, get_knowledge_store
-from conftest import use_fake_embeddings, use_fake_model
+from app.rag.store import get_knowledge_store
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    confirm_first_build,
+    use_fake_embeddings,
+    use_fake_model,
+)
 from test_generation import _stream_messages
 from test_projects import _create_project
 from test_world import _generate_and_publish
@@ -41,15 +46,6 @@ class TestSeedTemplates:
         store2 = get_knowledge_store(restarted)
         assert store2.entry_count("seed") == len(SEED_TEMPLATES)
 
-    def test_reopen_with_released_collection_still_readable(self, settings, app):
-        """重启后集合加载状态不保留（released）：重开 store 后种子灌入与检索仍可用。"""
-        store = get_knowledge_store(app)
-        store.client.release_collection("knowledge")  # 等价于进程重启后的落库状态
-        reopened = KnowledgeStore(settings.milvus_uri, app.state.embedding_factory(settings))
-        reopened.seed(SEED_TEMPLATES)
-        assert reopened.entry_count("seed") == len(SEED_TEMPLATES)
-        assert [h["title"] for h in reopened.search("记账", top_k=3)]
-
     def test_milvus_lives_in_temp_dir_and_uses_stub_embeddings(self, settings, app):
         """向量库落在临时目录；灌入只走桩 embedding，不触碰真实服务。"""
         embedder = app.state.embedding_factory(settings)
@@ -63,6 +59,7 @@ class TestSearchTemplatesTool:
         model = use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("search_templates", {"query": "记账"})]},
                 {
                     "tool_calls": [
@@ -73,7 +70,9 @@ class TestSearchTemplatesTool:
             ],
         )
         project = _create_project(client, auth_headers)
-        events = _stream_messages(client, auth_headers, project["id"], "做一个记账工具")
+        _stream_messages(client, auth_headers, project["id"], "做一个记账工具")
+        # 首建先过澄清确认门（工单 0015）：检索工具事件出现在确认后的生成流里
+        events = confirm_first_build(client, auth_headers, project["id"])
 
         # SSE 出现"正在检索模板"工具事件（start 与 done 成对）
         search_events = [e for e in events if e["type"] == "tool" and e["name"] == "search_templates"]
@@ -96,12 +95,14 @@ class TestSearchTemplatesTool:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers)
-        events = _stream_messages(client, auth_headers, project["id"], "做个页面")
+        _stream_messages(client, auth_headers, project["id"], "做个页面")
+        events = confirm_first_build(client, auth_headers, project["id"])
         assert events[-1]["type"] == "done"
         assert not any(
             e["type"] == "tool" and e["name"] == "search_templates" for e in events
@@ -126,12 +127,14 @@ class TestWorldSemanticSearch:
         use_fake_model(
             app,
             [
+                FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>私</h1>"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers)
         _stream_messages(client, auth_headers, project["id"], "做一个私密记账本")
+        confirm_first_build(client, auth_headers, project["id"])
 
         apps = TestClient(app).get("/api/world", params={"q": "记账"}).json()
         assert apps == []

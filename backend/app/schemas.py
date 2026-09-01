@@ -73,6 +73,39 @@ class ConfirmPrdRequest(BaseModel):
     feedback: str = Field(default="", max_length=8000)
 
 
+class ConfirmConsensusRequest(BaseModel):
+    """确认需求共识（工单 0015）：可附带修改意见，随确认一并交给工程师。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
+class ConfirmSpecRequest(BaseModel):
+    """确认需求规格（工单 0016）：可附带修改意见，随确认一并进入下一阶段。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
+class ConfirmTicketsRequest(BaseModel):
+    """确认工单清单（工单 0017）：可附带调整意见，随确认一并进入执行期。"""
+
+    feedback: str = Field(default="", max_length=8000)
+
+
+class TicketOut(BaseModel):
+    """工单清单卡片（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态。
+
+    执行状态与检查点快照版本号由串行执行写入（工单 0018）。
+    """
+
+    seq: int
+    title: str
+    deliverable: str
+    blocked_by: list[int]
+    status: str
+    # 完成该工单时形成的检查点快照版本；未完成为 None（工单 0018）
+    snapshot_rev: int | None = None
+
+
 class MessageOut(BaseModel):
     id: int
     role: str
@@ -101,6 +134,8 @@ class SnapshotOut(BaseModel):
     rev: int
     file_count: int
     created_at: datetime
+    # 形成该检查点的工单序号（工单 0019）；非检查点快照为 None
+    ticket_seq: int | None = None
 
     model_config = {"from_attributes": True}
 

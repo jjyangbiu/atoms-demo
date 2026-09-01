@@ -18,12 +18,14 @@ from app.official_samples import (
     OFFICIAL_USERNAME,
     seed_official_samples,
 )
-from conftest import use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, use_fake_model
 from test_world import _register_and_login
 
-# 每个示例消耗一段“首轮生成（写文件→收尾）→ 迭代（局部改→收尾）”脚本，
-# 乘上示例数供整轮灌入使用——与灌入实现的双轮对话一一对应，迭代环节同样在回归覆盖内。
+# 每个示例消耗一段“澄清收敛 → 确认后首轮生成（写文件→收尾）→ 迭代（局部改→收尾）”
+# 脚本，乘上示例数供整轮灌入使用——与灌入实现的对话链路一一对应（工单 0015），
+# 澄清与迭代环节同样在回归覆盖内。
 _ONE_SAMPLE_SCRIPT = [
+    FIRST_BUILD_CLARIFY_STEP,
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>示例</h1>"})]},
     {"text": "已完成。"},
     {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "示例", "new_text": "官方示例"})]},
@@ -110,7 +112,7 @@ class TestSeedRepeatable:
 
 class TestSeedFailures:
     def test_generation_failure_recorded_and_others_continue(self, app, client):
-        # 第一个示例耗尽重试后报错；其余示例照常
+        # 第一个示例在澄清阶段耗尽重试后报错；其余示例照常（工单 0015）
         script = [RuntimeError] * 3  # 默认 agent_max_retries=2 → 3 次调用全失败
         script += _ONE_SAMPLE_SCRIPT * (len(OFFICIAL_SAMPLE_SPECS) - 1)
         use_fake_model(app, script)

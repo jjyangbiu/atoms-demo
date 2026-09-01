@@ -1,12 +1,10 @@
-"""团队模式两阶段生成端到端测试（工单 0010）。
+"""团队模式测试（工单 0010 历史兼容 + 模式基础）。
 
-验收要点：
-- 创建项目可选团队模式，模式在项目信息中可见
-- 团队模式首条消息由产品经理智能体流式产出 PRD（SSE prd 事件），不写文件
-- 未确认 PRD 前发送普通消息会被引导先处理 PRD（不调用模型）
-- 确认（可附意见）后工程师智能体才开始生成，PRD 进入其上下文
-- 确认后迭代体验与工程师模式一致
-- PRD、确认与意见全部持久化于对话历史
+工单 0016 起，新团队项目改走"需求澄清 → 需求规格"流水线（见 test_team_spec），
+旧"产品经理产 PRD"生成路径退役。本文件只保留：
+- 团队模式的创建与展示基础
+- 历史团队项目（已有 PRD 消息）的引导、确认与迭代兼容路径
+- 克隆等已有文件场景跳过前置阶段
 任何测试不得调用真实 MiniMax API。
 """
 
@@ -16,12 +14,17 @@ from conftest import use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 
+from app.models import Message
+
 PRD_TEXT = "# PRD\n\n## 目标\n做一个番茄钟。"
 
 
-def _prd_script():
-    """PM 阶段脚本：一步产出 PRD 文本。"""
-    return [{"text": PRD_TEXT}]
+def _seed_legacy_prd(app, project_id, content: str = PRD_TEXT):
+    """注入首条诉求与已有 PRD 消息，模拟工单 0010 旧流程下建立的历史团队项目。"""
+    with app.state.session_factory() as session:
+        session.add(Message(project_id=project_id, role="user", kind="text", content="做一个番茄钟"))
+        session.add(Message(project_id=project_id, role="pm", kind="prd", content=content))
+        session.commit()
 
 
 def _confirm(client, headers, project_id, feedback=""):
@@ -39,59 +42,18 @@ class TestTeamModeBasics:
         resp = client.get(f"/api/projects/{project['id']}", headers=auth_headers)
         assert resp.json()["mode"] == "team"
 
-    def test_first_message_streams_prd_and_writes_no_files(
-        self, app, settings, client, auth_headers
-    ):
-        use_fake_model(app, _prd_script())
-        project = _create_project(client, auth_headers, mode="team")
-        events = _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
 
-        # PRD 以 prd 事件流式产出，以 done 收尾；全程没有工具事件（PM 不动文件）
-        types = [e["type"] for e in events]
-        assert "prd" in types and types[-1] == "done"
-        assert "tool" not in types
-        assert "".join(e["content"] for e in events if e["type"] == "prd") == PRD_TEXT
-
-        pdir = _project_dir(settings, project["id"])
-        assert not pdir.exists() or not any(pdir.iterdir())
-
-    def test_prd_persisted_in_history(self, app, client, auth_headers):
-        use_fake_model(app, _prd_script())
-        project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
-
-        resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
-        messages = resp.json()
-        assert messages[0]["role"] == "user" and messages[0]["content"] == "做一个番茄钟"
-        prds = [m for m in messages if m["kind"] == "prd"]
-        assert len(prds) == 1
-        assert prds[0]["role"] == "pm" and prds[0]["content"] == PRD_TEXT
-
-
-    def test_prd_stage_failure_surfaces_single_error_event(self, app, settings, client, auth_headers):
-        settings.agent_max_retries = 1
-        use_fake_model(app, [RuntimeError, RuntimeError])
-        project = _create_project(client, auth_headers, mode="team")
-        events = _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
-
-        errors = [e for e in events if e["type"] == "error"]
-        assert len(errors) == 1 and "模型调用失败" in errors[0]["detail"]
-        # 失败的 PRD 不落历史；重发仍可重试（无待确认卡片阻塞）
-        resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
-        assert [m["kind"] for m in resp.json()] == ["text"]
-
-
-class TestPrdGuidance:
+class TestLegacyPrdGuidance:
     def test_plain_message_before_confirm_is_guided_without_model_call(
         self, app, client, auth_headers
     ):
-        model = use_fake_model(app, _prd_script())
+        model = use_fake_model(app, [])
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
         events = _stream_messages(client, auth_headers, project["id"], "先把按钮做大一点")
 
         # 未确认前普通消息不触发任何模型调用：只有一段引导文本与 done
-        assert len(model.received_messages) == 1  # 仅 PRD 阶段那次
+        assert len(model.received_messages) == 0
         types = [e["type"] for e in events]
         assert "tool" not in types
         guidance = "".join(e.get("content", "") for e in events if e["type"] == "text")
@@ -104,20 +66,19 @@ class TestPrdGuidance:
         assert any("PRD" in t for t in texts if t != "先把按钮做大一点")
 
 
-class TestPrdConfirm:
+class TestLegacyPrdConfirm:
     def test_confirm_starts_engineer_with_prd_in_context(
         self, app, settings, client, auth_headers
     ):
         model = use_fake_model(
             app,
-            _prd_script()
-            + [
+            [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
                 {"text": "已按 PRD 完成。"},
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
 
         with client.stream(
             "POST",
@@ -154,14 +115,13 @@ class TestPrdConfirm:
     def test_confirm_with_feedback_reaches_engineer(self, app, client, auth_headers):
         model = use_fake_model(
             app,
-            _prd_script()
-            + [
+            [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
         _confirm(client, auth_headers, project["id"], feedback="界面要深色主题")
 
         engineer_call = model.received_messages[-1]
@@ -173,8 +133,7 @@ class TestPrdConfirm:
     ):
         use_fake_model(
             app,
-            _prd_script()
-            + [
+            [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "完成。"},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
@@ -182,7 +141,7 @@ class TestPrdConfirm:
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
         _confirm(client, auth_headers, project["id"])
         events = _stream_messages(client, auth_headers, project["id"], "把标题改一下")
 
@@ -199,14 +158,13 @@ class TestPrdConfirm:
     def test_confirm_without_pending_prd_rejected(self, app, client, auth_headers):
         use_fake_model(
             app,
-            _prd_script()
-            + [
+            [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
         assert _confirm(client, auth_headers, project["id"]).status_code == 200
         # 已确认过、没有新的待确认 PRD（锁外前置检查直接 409）
         assert _confirm(client, auth_headers, project["id"]).status_code == 409
@@ -214,19 +172,18 @@ class TestPrdConfirm:
     def test_confirm_recheck_inside_lock_rejects_second_generation(
         self, app, client, auth_headers, monkeypatch
     ):
-        """锁内复查兑底：若状态在外层检查与拿到锁之间被另一路请求改变，
+        """锁内复查兜底：若状态在外层检查与拿到锁之间被另一路请求改变，
         本路以 error 事件收尾，不会重复生成（工单 0010 评审项）。
         用 _prd_state 先返回 pending 后返回 confirmed 模拟该竞态窗口。"""
         model = use_fake_model(
             app,
-            _prd_script()
-            + [
+            [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "完成。"},
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
-        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _seed_legacy_prd(app, project["id"])
 
         import app.routers.projects as projects_router
 
@@ -255,22 +212,15 @@ class TestPrdConfirm:
         resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
         assert "prd_confirm" not in [m["kind"] for m in resp.json()]
 
+
+class TestExistingFilesSkipStages:
     def test_team_project_with_existing_files_skips_prd_stage(
         self, app, client, auth_headers
     ):
         """克隆等场景：团队模式项目已有文件时，首条消息直接进工程师。"""
-        use_fake_model(
-            app,
-            [
-                # 首个项目走完整工程师流程，产出文件
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "完成。"},
-                # 第二个（模拟带文件的团队项目）直接工程师
-                {"text": "已按诉求修改。"},
-            ],
-        )
+        use_fake_model(app, [{"text": "已按诉求修改。"}])
         project = _create_project(client, auth_headers, mode="team")
-        # 预置文件索引（模拟克隆得到的带文件项目；PM 阶段判断以索引为准）
+        # 预置文件索引（模拟克隆得到的带文件项目；分流判断以索引为准）
         from app.models import ProjectFile
 
         with app.state.session_factory() as session:
@@ -279,5 +229,5 @@ class TestPrdConfirm:
 
         events = _stream_messages(client, auth_headers, project["id"], "改一下标题")
         types = [e["type"] for e in events]
-        assert "prd" not in types  # 不触发 PRD 阶段
+        assert "prd" not in types and "spec" not in types  # 不触发任何前置阶段
         assert types[-1] == "done"

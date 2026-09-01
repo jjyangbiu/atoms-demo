@@ -6,6 +6,8 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/workspace' },
+    // 无独立项目列表页，裸路径重定向到工作区，避免直接访问时白屏/404 观感
+    { path: '/projects', redirect: '/workspace' },
     {
       path: '/login',
       name: 'login',
