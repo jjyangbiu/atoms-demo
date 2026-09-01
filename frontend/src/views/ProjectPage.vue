@@ -956,6 +956,16 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return ticketsHolder.entry
   }
 
+  // 新一轮输出的起点（工具事件开始/工单进度行）即收束当前思考/文本条目：
+  // 其后到来的 thinking/text 增量另开新条目排在事件行之后，
+  // 避免多步循环/多张工单后续轮次的增量并入第一轮创建的条目（诊断修复）
+  const closeStreamingSegments = (): void => {
+    if (thinkingHolder.entry) thinkingHolder.entry.streaming = false
+    thinkingHolder.entry = null
+    if (textHolder.entry) textHolder.entry.streaming = false
+    textHolder.entry = null
+  }
+
   try {
     await streamPost(path, body, (event: SseEvent) => {
       if (event.type === 'thinking') {
@@ -986,6 +996,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         // 卡片内序号是相对编号，按清单下标对齐服务端 seq（重拆后续编也不错位）；
         // 会话内首次“确认即执行”时接口态尚未拉取（挂载时清单尚不存在），
         // 补拉一次后后续事件与进度条即可按接口态对齐（断线重连场景挂载时已拉取）
+        closeStreamingSegments()
         if (ticketStates.value.length === 0) void loadTickets()
         const seq = Number(event.seq)
         const st = String(event.status ?? '') as TicketStatus
@@ -1021,6 +1032,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
           result: event.result as string | undefined,
         }
         if (tool.status === 'start') {
+          closeStreamingSegments()
           entries.value.push({ id: nextId(), kind: 'tool', content: '', tool })
         } else {
           // 收尾事件并入对应的 start 卡片，避免重复

@@ -103,7 +103,7 @@ def main() -> int:
 
     if not vite_running():
         dev_proc = subprocess.Popen(
-            ["npm", "run", "dev"], cwd=FRONTEND_DIR,
+            ["npm.cmd", "run", "dev"], cwd=FRONTEND_DIR,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         for _ in range(60):
