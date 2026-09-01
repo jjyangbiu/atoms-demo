@@ -26,6 +26,7 @@ export interface MessageOut {
   // consensus/consensus_confirm 为需求澄清与共识确认（工单 0015）
   // spec/spec_confirm 为需求规格与规格确认（工单 0016）
   // tickets/tickets_confirm 为工单清单与清单确认（工单 0017）
+  // ticket 为单张工单的执行进度行（工单 0018）
   kind:
     | 'text'
     | 'prd'
@@ -36,6 +37,7 @@ export interface MessageOut {
     | 'spec_confirm'
     | 'tickets'
     | 'tickets_confirm'
+    | 'ticket'
     | 'event'
     | 'thinking'
   content: string
@@ -52,6 +54,16 @@ export interface SnapshotOut {
   rev: number
   file_count: number
   created_at: string
+}
+
+// 工单清单条目（工单 0017）：执行状态与检查点快照版本由串行执行写入（工单 0018）
+export interface TicketOut {
+  seq: number
+  title: string
+  deliverable: string
+  blocked_by: number[]
+  status: 'open' | 'running' | 'done' | 'failed'
+  snapshot_rev: number | null
 }
 
 export const useProjectStore = defineStore('projects', () => {
@@ -86,6 +98,10 @@ export const useProjectStore = defineStore('projects', () => {
     return api<SnapshotOut[]>(`/api/projects/${projectId}/snapshots`)
   }
 
+  async function fetchTickets(projectId: number): Promise<TicketOut[]> {
+    return api<TicketOut[]>(`/api/projects/${projectId}/tickets`)
+  }
+
   async function rollbackSnapshot(projectId: number, snapshotId: number): Promise<SnapshotOut> {
     return api<SnapshotOut>(`/api/projects/${projectId}/snapshots/${snapshotId}/rollback`, {
       method: 'POST',
@@ -108,6 +124,7 @@ export const useProjectStore = defineStore('projects', () => {
     fetchMessages,
     fetchFiles,
     fetchSnapshots,
+    fetchTickets,
     rollbackSnapshot,
     publishProject,
     unpublishProject,

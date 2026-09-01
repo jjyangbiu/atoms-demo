@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -162,6 +163,10 @@ def list_messages(
     )
 
 
+# “取全量历史”哨兵值：大于任何消息 id，工单执行期回灌上下文用（工单 0018）
+_ALL_MESSAGES = 1 << 62
+
+
 def _llm_history(db: Session, project_id: int, before_message_id: int, window: int) -> list:
     """把持久化对话转成最近 window 轮问答的 langchain 消息（跳过工具事件行）。
 
@@ -176,8 +181,8 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
     )
     history = []
     for m in rows:
-        if m.kind in ("event", "thinking") or m.role == "system":
-            # 工具事件行、思考过程行与引导性系统消息不入上下文（工单 0010）
+        if m.kind in ("event", "thinking", "ticket") or m.role == "system":
+            # 工具事件行、思考过程行、工单进度行与引导性系统消息不入上下文（工单 0010/0018）
             continue
         if m.role == "user":
             # 含 prd_confirm/consensus_confirm/spec_confirm/tickets_confirm：
@@ -301,6 +306,22 @@ def _tickets_state(db: Session, project_id: int) -> str:
     return "confirmed" if confirmed is not None else "pending"
 
 
+def _exec_state(db: Session, project_id: int) -> str:
+    """团队模式的工单执行状态（工单 0018）：none | active | done。
+
+    清单未确认是 none；已确认且仍有未完成（含失败/中断的 running）工单是 active；
+    全部完成是 done，项目转入常规迭代（消息按次计数）。
+    """
+    if _tickets_state(db, project_id) != "confirmed":
+        return "none"
+    unfinished = db.scalar(
+        select(Ticket.id)
+        .where(Ticket.project_id == project_id, Ticket.status != "done")
+        .limit(1)
+    )
+    return "active" if unfinished is not None else "done"
+
+
 def _has_any_message(db: Session, project_id: int) -> bool:
     """项目是否已有对话消息：推导首建流水线是否已进入（名额语义，工单 0015 / ADR 0003）。
 
@@ -343,6 +364,10 @@ def _existing_file_paths(db: Session, project_id: int) -> list[str]:
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+# 执行流里被 on_event 压下的事件（如每单的 done/单内 error）：序列化结果固定，循环内直接比对过滤（工单 0018）
+_NOOP_CHUNK = _sse({"type": "noop"})
 
 
 def _sse_response(stream) -> StreamingResponse:
@@ -408,15 +433,36 @@ async def _limited_stream(stream, request: Request):
 
 
 async def _engineer_stream(
-    request: Request, project_id: int, user_text: str, history: list, existing_files: list[str]
+    request: Request,
+    project_id: int,
+    user_text: str,
+    history: list,
+    existing_files: list[str],
+    result: dict | None = None,
+    on_event: Callable[[dict], dict] | None = None,
+    extra_finalize: Callable[[Session, Snapshot], None] | None = None,
 ):
-    """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。"""
+    """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。
+
+    串行执行（工单 0018）通过三个可选挂接复用本流：
+    - result：记录收尾结果 {"ok": bool}，成功时附 snapshot（检查点），失败时附 error；
+    - on_event：外发前改写事件（如把每单的 done 换成工单进度事件）；
+    - extra_finalize：收尾落盘同一事务内的附加写入（如工单标 done 与检查点引用）。
+    """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
+
+    def _emit(data: dict) -> str:
+        if on_event is not None:
+            data = on_event(data)
+        return _sse(data)
+
     try:
         model = request.app.state.model_factory(settings)
     except Exception as e:  # noqa: BLE001 — 未配置 Key 等环境问题以 error 事件收尾
-        yield _sse({"type": "error", "detail": str(e)})
+        if result is not None:
+            result["ok"] = False
+        yield _emit({"type": "error", "detail": str(e)})
         return
 
     sandbox = FileSandbox(project_dir(request, project_id))
@@ -444,12 +490,18 @@ async def _engineer_stream(
                 if event.type == "thinking":
                     # 思考增量另存一份：正常收尾合并落库；中断时也据已流出部分落库（诊断修复）
                     thinking_parts.append(event.data.get("content", ""))
-                yield _sse({"type": event.type, **event.data})
+                if result is not None and event.type == "error":
+                    result["ok"] = False
+                    result["error"] = event.data.get("detail", "")
+                yield _emit({"type": event.type, **event.data})
                 if event.type == "tool" and event.data.get("status") != "start":
                     _persist_event(session_factory, project_id, event.data)
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
+        if result is not None:
+            result["ok"] = False
+            result["error"] = f"生成中断: {e}"
         _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
-        yield _sse({"type": "error", "detail": f"生成中断: {e}"})
+        yield _emit({"type": "error", "detail": f"生成中断: {e}"})
         return
     except BaseException:
         # 刷新/断流触发的生成器关闭（GeneratorExit/CancelledError）：
@@ -472,16 +524,27 @@ async def _engineer_stream(
             _sync_file_index(session, project_id, sandbox.root)
             # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）
             if done_data is not None:
-                create_snapshot(session, project_id, sandbox.root, settings.snapshot_max_kept)
+                snapshot = create_snapshot(
+                    session, project_id, sandbox.root, settings.snapshot_max_kept
+                )
+                if result is not None:
+                    result["snapshot"] = snapshot
+                if extra_finalize is not None:
+                    extra_finalize(session, snapshot)
             project_row = session.get(Project, project_id)
             if project_row is not None:
                 project_row.updated_at = _utcnow()
             session.commit()
     except Exception as e:  # noqa: BLE001 — 收尾落盘失败也须以 error 事件告知，不得静默断流
-        yield _sse({"type": "error", "detail": f"生成收尾失败: {e}"})
+        if result is not None:
+            result["ok"] = False
+            result["error"] = f"生成收尾失败: {e}"
+        yield _emit({"type": "error", "detail": f"生成收尾失败: {e}"})
         return
     if done_data is not None:
-        yield _sse({"type": "done", **done_data})
+        if result is not None:
+            result["ok"] = True
+        yield _emit({"type": "done", **done_data})
 
 
 async def _spec_stream(request: Request, project_id: int, user_text: str, history: list):
@@ -691,6 +754,178 @@ async def _break_stream(request: Request, project_id: int, user_text: str, histo
     yield _sse({"type": "done", "text": submitted_raw})
 
 
+# --- 工单检查点串行执行（工单 0018 / ADR 0003） ---
+#
+# 清单确认后（或失败重试/断线继续，见 /tickets/resume）：按序号升序逐个执行未完成工单；
+# 拆单校验保证 blocked_by 只引用更小序号，序号升序即依赖序。一次只执行一个，
+# 完成一个再进下一个；每单完成即形成检查点快照（融入现有快照体系），
+# 失败则停在该单起点，重试/继续不从第一单重来。
+
+
+def _next_pending_ticket(session: Session, project_id: int) -> Ticket | None:
+    """第一张未完成工单（含失败与中断遗留的 running）；全部完成返回 None。
+
+    执行器断在哪个环节就从哪里续：失败单原地重试、中断单（running）重新执行，
+    已完成的单绝不重跑。
+    """
+    return session.scalar(
+        select(Ticket)
+        .where(Ticket.project_id == project_id, Ticket.status != "done")
+        .order_by(Ticket.seq)
+        .limit(1)
+    )
+
+
+def _ticket_prompt(current: dict, all_payloads: list[dict]) -> str:
+    """单张工单的执行指令：附完整清单划定边界，但只交付当前这一单。
+
+    确认/反馈消息已在全量历史里，指令不再重复，只给本次执行目标（工单 0018）。
+    """
+    lines = [
+        f"{p['seq']}. {p['title']}：{p['deliverable']}"
+        + ("（已完成）" if p["status"] == "done" else "")
+        for p in all_payloads
+    ]
+    return (
+        f"工单清单：\n" + "\n".join(lines) + "\n\n"
+        f"现在执行工单 {current['seq']}「{current['title']}」，交付内容：{current['deliverable']}\n"
+        f"只完成本工单的交付内容：已完成的工单不要重做，后面工单的内容不要提前实现，完成后停止。"
+    )
+
+
+def _persist_ticket_progress(session_factory, project_id: int, data: dict) -> None:
+    """工单进度行落库（kind=ticket）：断线重连后刷新可回看执行进度（工单 0018）。"""
+    with session_factory() as session:
+        session.add(
+            Message(
+                project_id=project_id,
+                role="engineer",
+                kind="ticket",
+                content=json.dumps(data, ensure_ascii=False),
+            )
+        )
+        session.commit()
+
+
+async def _exec_tickets_stream(request: Request, project_id: int):
+    """工单串行执行流（工单 0018）：逐单执行，每单完成形成检查点快照。
+
+    单张工单复用工程师流（_engineer_stream）：完成在工程师收尾同一事务内标 done
+    并记录检查点快照引用（要么都成要么都不成）；其 done/单内 error 经 on_event 压下，
+    由本流统一发工单进度事件；失败标 failed 后终止，由 /tickets/resume 从该单起点重试。
+    """
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    while True:
+        with session_factory() as session:
+            payloads = [
+                _ticket_payload(row)
+                for row in session.scalars(
+                    select(Ticket).where(Ticket.project_id == project_id).order_by(Ticket.seq)
+                )
+            ]
+            total = len(payloads)
+            ticket = _next_pending_ticket(session, project_id)
+            if ticket is None:
+                yield _sse(
+                    {"type": "done", "text": f"全部 {total} 张工单执行完成，项目已就绪。"}
+                )
+                return
+            done_count = sum(1 for p in payloads if p["status"] == "done")
+            ticket_id, seq, title = ticket.id, ticket.seq, ticket.title
+            current_payload = next(p for p in payloads if p["seq"] == seq)
+            ticket.status = "running"
+            session.commit()
+            # 无“当前消息”可排除：以哨兵值取全量历史（窗口截断由 window 控制）
+            history = _llm_history(
+                session,
+                project_id,
+                before_message_id=_ALL_MESSAGES,
+                window=settings.agent_history_window,
+            )
+            existing_files = _existing_file_paths(session, project_id)
+
+        yield _sse(
+            {
+                "type": "ticket_progress",
+                "seq": seq,
+                "title": title,
+                "status": "running",
+                "done": done_count,
+                "total": total,
+            }
+        )
+
+        result: dict = {}
+
+        def _mark_done(_session: Session, snapshot: Snapshot) -> None:
+            # 与工程师收尾落盘同一事务：状态与检查点引用要么都成要么都不成（工单 0018）
+            row = _session.get(Ticket, ticket_id)
+            if row is not None:
+                row.status = "done"
+                row.snapshot_id = snapshot.id
+
+        def _rewrite(event: dict) -> dict:
+            # 每单的 done/error 压下：成功由本流发 done 进度，失败由本流补 failed 进度与 error，
+            # 避免单内错误文案先于工单状态更新外发造成观感错序（工单 0018）
+            if event["type"] in ("done", "error"):
+                return {"type": "noop"}
+            return event
+
+        try:
+            async for chunk in _engineer_stream(
+                request,
+                project_id,
+                _ticket_prompt(current_payload, payloads),
+                history,
+                existing_files,
+                result=result,
+                on_event=_rewrite,
+                extra_finalize=_mark_done,
+            ):
+                if chunk != _NOOP_CHUNK:
+                    yield chunk
+        except BaseException:
+            # 断流：工单留在 running 状态，重连后由 /tickets/resume 从该单重新执行（工单 0018）
+            raise
+
+        if not result.get("ok"):
+            with session_factory() as session:
+                row = session.get(Ticket, ticket_id)
+                if row is not None:
+                    row.status = "failed"
+                    session.commit()
+            detail = result.get("error") or "未知原因"
+            progress = {
+                "type": "ticket_progress",
+                "seq": seq,
+                "title": title,
+                "status": "failed",
+                "done": done_count,
+                "total": total,
+            }
+            _persist_ticket_progress(session_factory, project_id, progress)
+            yield _sse(progress)
+            yield _sse(
+                {"type": "error", "detail": f"工单 {seq}「{title}」执行失败：{detail} 可从该工单重试。"}
+            )
+            return
+
+        snapshot = result.get("snapshot")
+        progress = {
+            "type": "ticket_progress",
+            "seq": seq,
+            "title": title,
+            "status": "done",
+            "done": done_count + 1,
+            "total": total,
+            "snapshot_rev": snapshot.rev if snapshot is not None else None,
+        }
+        _persist_ticket_progress(session_factory, project_id, progress)
+        yield _sse(progress)
+        # 进入下一单；每单重取历史与文件清单，前序交付成果自然进入上下文
+
+
 class _StartBuildInvoked(Exception):
     """澄清智能体调用 start_build 的控制流信号：携需求共识摘要立即终止循环。"""
 
@@ -824,7 +1059,11 @@ async def send_message(
     # 新团队项目走：需求澄清 → 需求规格确认门 → 工单拆解与清单确认门 → 执行（后续工单承接）。
     # 克隆等已有文件的场景与工程师模式完全一致。
     stage = "engineer"
-    if project.mode == "team" and not existing_files:
+    if project.mode == "team" and _exec_state(db, project_id) == "active":
+        # 执行期（工单 0018）：工单正在串行执行或有失败待重试，普通消息以引导拦截，
+        # 不调模型不计名额；全部完成后自然回到工程师分流（迭代按次计数）。
+        stage = "exec_guide"
+    elif project.mode == "team" and not existing_files:
         prd_state = _prd_state(db, project_id)
         if prd_state == "pending":
             stage = "guide"
@@ -858,6 +1097,30 @@ async def send_message(
             yield _sse({"type": "done", "text": guidance})
 
         return _sse_response(guide_stream())
+
+    if stage == "exec_guide":
+        failed_seq = db.scalar(
+            select(Ticket.seq)
+            .where(Ticket.project_id == project_id, Ticket.status == "failed")
+            .order_by(Ticket.seq)
+            .limit(1)
+        )
+        if failed_seq is not None:
+            guidance = (
+                f"工单 {failed_seq} 执行失败：请在工单清单卡片上从该工单重试，"
+                "已完成的工单不会重跑。"
+            )
+        else:
+            guidance = "工单正在按检查点串行执行：请稍候，全部完成后即可继续对话迭代。"
+        db.add(Message(project_id=project_id, role="user", kind="text", content=body.content))
+        db.add(Message(project_id=project_id, role="system", kind="text", content=guidance))
+        db.commit()
+
+        async def exec_guide_stream():
+            yield _sse({"type": "text", "content": guidance})
+            yield _sse({"type": "done", "text": guidance})
+
+        return _sse_response(exec_guide_stream())
 
     # 限流检查在落用户消息之前：被拒请求不产生任何持久化痕迹（工单 0011）。
     # 首建流水线整体只占一个名额（工单 0015 / ADR 0003）：项目尚无消息也无文件时，
@@ -1098,12 +1361,16 @@ async def confirm_spec(
 
 
 def _ticket_payload(row: Ticket) -> dict:
-    """工单表行转卡片字段（blocked_by 从 JSON 解出序号列表）。"""
+    """工单表行转卡片字段（blocked_by 从 JSON 解出序号列表）。
+
+    检查点快照以版本号呈现（工单 0018），快照行已删（清理超限）时降级为 None。
+    """
     payload = {
         "seq": row.seq,
         "title": row.title,
         "deliverable": row.deliverable,
         "status": row.status,
+        "snapshot_rev": row.snapshot.rev if row.snapshot is not None else None,
     }
     try:
         payload["blocked_by"] = json.loads(row.blocked_by or "[]")
@@ -1138,7 +1405,8 @@ async def confirm_tickets(
 ):
     """确认待确认的工单清单（工单 0017）：确认后进入执行期（SSE 流）。
 
-    本工单范围内执行由工程师智能体承接（检查点串行执行由后续工单承接）；
+    执行由工程师智能体按检查点串行承接（工单 0018）：按依赖序逐单执行，
+    每单完成形成检查点快照，失败可从该单重试（见 /tickets/resume）；
     确认后不可重新澄清、不可重新拆单（分流已拦截）。
     确认与调整意见落对话历史（role=user, kind=tickets_confirm）。
     首建流水线内不再占用新名额（名额在首条消息时已扣，ADR 0003）。
@@ -1155,7 +1423,6 @@ async def confirm_tickets(
 
     feedback = body.feedback.strip()
     confirm_content = feedback if feedback else "确认工单清单，开始执行。"
-    settings = request.app.state.settings
     session_factory = request.app.state.session_factory
 
     async def event_stream():
@@ -1165,44 +1432,54 @@ async def confirm_tickets(
                 if _tickets_state(session, project_id) != "pending":
                     yield _sse({"type": "error", "detail": "当前没有待确认的工单清单"})
                     return
-                confirm_message = Message(
-                    project_id=project_id,
-                    role="user",
-                    kind="tickets_confirm",
-                    content=confirm_content,
-                )
-                session.add(confirm_message)
-                session.commit()
-                session.refresh(confirm_message)
-                history = _llm_history(
-                    session,
-                    project_id,
-                    before_message_id=confirm_message.id,
-                    window=settings.agent_history_window,
-                )
-                existing_files = _existing_file_paths(session, project_id)
-                # 工单清单以执行目标的形式附入工程师上下文（清单行本身不入上下文）
-                ticket_lines = [
-                    f"{p['seq']}. {p['title']}：{p['deliverable']}"
-                    + (f"（被工单 {', '.join(str(b) for b in p['blocked_by'])} 阻塞）" if p["blocked_by"] else "")
-                    for p in map(
-                        _ticket_payload,
-                        session.scalars(
-                            select(Ticket)
-                            .where(Ticket.project_id == project_id)
-                            .order_by(Ticket.seq)
-                        ),
+                session.add(
+                    Message(
+                        project_id=project_id,
+                        role="user",
+                        kind="tickets_confirm",
+                        content=confirm_content,
                     )
-                ]
-            if ticket_lines:
-                confirm_content_with_list = (
-                    f"{confirm_content}\n\n请按工单清单执行：\n" + "\n".join(ticket_lines)
                 )
-            else:
-                confirm_content_with_list = confirm_content
-            async for chunk in _engineer_stream(
-                request, project_id, confirm_content_with_list, history, existing_files
-            ):
+                session.commit()
+            # 检查点串行执行（工单 0018）：逐单交付，每单一个检查点快照，失败可重试单张工单；
+            # 确认消息已落库，自然进入执行上下文（调整意见随历史可见）
+            async for chunk in _exec_tickets_stream(request, project_id):
+                yield chunk
+
+    return _sse_response(event_stream())
+
+
+@router.post("/{project_id}/tickets/resume")
+async def resume_tickets(
+    project_id: int,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """继续/重试工单执行（工单 0018）：从第一张未完成工单起点继续（SSE 流）。
+
+    覆盖两种场景：某单失败后从该单重试（已完成的单不重跑）；断线/刷新后
+    重连继续（中断遗留的 running 单重新执行）。全部完成后返回 409：
+    项目已进入常规迭代，直接发消息即可。首建流水线内不重复占用名额（ADR 0003）。
+    """
+    project = get_owned_project(project_id, user, db)
+    if project.mode != "team":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="工程师模式项目没有工单流程"
+        )
+    if _exec_state(db, project_id) != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="当前没有可继续的工单执行"
+        )
+
+    async def event_stream():
+        async with _project_lock(project_id):
+            # 锁内复查：并发双击/与确认竞态不会造成两路执行（同确认门范式）
+            with request.app.state.session_factory() as session:
+                if _exec_state(session, project_id) != "active":
+                    yield _sse({"type": "error", "detail": "当前没有可继续的工单执行"})
+                    return
+            async for chunk in _exec_tickets_stream(request, project_id):
                 yield chunk
 
     return _sse_response(event_stream())

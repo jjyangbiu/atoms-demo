@@ -92,13 +92,18 @@ class ConfirmTicketsRequest(BaseModel):
 
 
 class TicketOut(BaseModel):
-    """工单清单卡片（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态。"""
+    """工单清单卡片（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态。
+
+    执行状态与检查点快照版本号由串行执行写入（工单 0018）。
+    """
 
     seq: int
     title: str
     deliverable: str
     blocked_by: list[int]
     status: str
+    # 完成该工单时形成的检查点快照版本；未完成为 None（工单 0018）
+    snapshot_rev: int | None = None
 
 
 class MessageOut(BaseModel):

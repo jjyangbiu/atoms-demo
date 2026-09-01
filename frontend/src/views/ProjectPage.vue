@@ -6,7 +6,13 @@ import { useRoute, useRouter } from 'vue-router'
 
 import { api, ApiError } from '@/api/client'
 import { streamPost, type SseEvent } from '@/api/sse'
-import { useProjectStore, type FileOut, type MessageOut, type SnapshotOut } from '@/stores/projects'
+import {
+  useProjectStore,
+  type FileOut,
+  type MessageOut,
+  type SnapshotOut,
+  type TicketOut,
+} from '@/stores/projects'
 
 // 代码视图异步加载：Monaco 体积较大，仅在切到代码 Tab 时才拉取（工单 0007）
 const CodeView = defineAsyncComponent(() => import('@/components/CodeView.vue'))
@@ -19,17 +25,31 @@ interface ToolInfo {
 }
 
 // 工单清单卡片字段（工单 0017）：标题 / 交付内容 / 被谁阻塞 / 状态；
-// seq 为清单内相对序号（与 blocked_by 引用同口径）
+// seq 为清单内相对序号（与 blocked_by 引用同口径）；
+// status/snapshot_rev 为检查点串行执行的实时状态（工单 0018，可缺省）
+type TicketStatus = TicketOut['status']
+
 interface TicketInfo {
   seq: number
   title: string
   deliverable: string
   blocked_by: number[]
+  status?: TicketStatus
+  snapshot_rev?: number | null
 }
 
 interface ChatEntry {
   id: string
-  kind: 'user' | 'text' | 'tool' | 'prd' | 'consensus' | 'spec' | 'tickets' | 'thinking'
+  kind:
+    | 'user'
+    | 'text'
+    | 'tool'
+    | 'prd'
+    | 'consensus'
+    | 'spec'
+    | 'tickets'
+    | 'ticket_progress'
+    | 'thinking'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
@@ -48,6 +68,8 @@ interface ChatEntry {
   // 确认后进入执行期，不再重新澄清/拆单
   tickets?: TicketInfo[]
   ticketsConfirmed?: boolean
+  // 工单执行进度行（工单 0018）：开始/完成/失败的状态色
+  ticketStatus?: TicketStatus
 }
 
 function parseTickets(content: string): TicketInfo[] {
@@ -88,6 +110,9 @@ const consensusFeedback = ref('')
 const specFeedback = ref('')
 // 工单清单确认时的调整意见（工单 0017）
 const ticketsFeedback = ref('')
+// 工单执行状态（工单 0018）：来自 /tickets 接口，断线重连后据此展示进度与继续/重试入口；
+// 卡片内按清单下标对齐（卡片内序号是相对编号，重拆后会续编）
+const ticketStates = ref<TicketOut[]>([])
 const chatBodyRef = ref<HTMLElement | null>(null)
 const hasIndex = ref(false)
 const previewRev = ref(0)
@@ -126,6 +151,66 @@ const publicUrl = computed(() =>
 
 function renderMarkdown(content: string) {
   return marked.parse(content, { async: false }) as string
+}
+
+// 工单执行进度文案（工单 0018）：SSE 实时事件与历史 kind=ticket 行共用同一口径
+function ticketProgressText(p: {
+  seq: number
+  title?: string
+  status: string
+  snapshot_rev?: number | null
+}): string {
+  const name = p.title ? `「${p.title}」` : ''
+  if (p.status === 'running') return `▶ 正在执行工单 ${p.seq}${name}…`
+  if (p.status === 'done') {
+    const checkpoint = p.snapshot_rev ? `，检查点版本 ${p.snapshot_rev}` : ''
+    return `✓ 工单 ${p.seq}${name} 完成${checkpoint}`
+  }
+  return `✗ 工单 ${p.seq}${name} 执行失败`
+}
+
+// 执行期判定（工单 0018）：执行已启动（有非 open 状态）且尚未全部完成；
+// 断线重连后据此展示“继续执行/重试”入口，并抑制通用的“重新生成”中断横幅
+const execActive = computed(() => {
+  if (projectMode.value !== 'team' || ticketStates.value.length === 0) return false
+  const started = ticketStates.value.some((t) => t.status !== 'open')
+  const finished = ticketStates.value.every((t) => t.status === 'done')
+  return started && !finished
+})
+
+const failedTicket = computed(() => ticketStates.value.find((t) => t.status === 'failed') ?? null)
+const doneTicketCount = computed(() => ticketStates.value.filter((t) => t.status === 'done').length)
+
+function isLastTicketsEntry(entry: ChatEntry): boolean {
+  for (let i = entries.value.length - 1; i >= 0; i--) {
+    if (entries.value[i].kind === 'tickets') return entries.value[i] === entry
+  }
+  return false
+}
+
+// 卡片内单张工单的展示状态（工单 0018）：实时事件更新过的优先，其次按接口状态对齐（仅最新卡片）
+function ticketDisplay(entry: ChatEntry, t: TicketInfo): { status: TicketStatus; snapshot_rev: number | null } {
+  if (t.status) return { status: t.status, snapshot_rev: t.snapshot_rev ?? null }
+  if (entry.ticketsConfirmed && isLastTicketsEntry(entry)) {
+    const idx = entry.tickets?.indexOf(t) ?? -1
+    const state = idx >= 0 ? ticketStates.value[idx] : undefined
+    if (state) return { status: state.status, snapshot_rev: state.snapshot_rev }
+  }
+  return { status: 'open', snapshot_rev: null }
+}
+
+function ticketStatusLabel(d: { status: TicketStatus; snapshot_rev: number | null }): string {
+  if (d.status === 'running') return '执行中'
+  if (d.status === 'done') return d.snapshot_rev ? `完成 · 检查点 v${d.snapshot_rev}` : '完成'
+  if (d.status === 'failed') return '失败'
+  return '待执行'
+}
+
+function ticketTagType(status: TicketStatus): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'done') return 'success'
+  if (status === 'running') return 'warning'
+  if (status === 'failed') return 'danger'
+  return 'info'
 }
 
 function toolLabel(tool: ToolInfo): string {
@@ -240,6 +325,24 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         tickets: parseTickets(m.content),
         ticketsConfirmed: confirmed || superseded,
       })
+    } else if (m.kind === 'ticket') {
+      // 工单执行进度行（工单 0018）：完成/失败留痕，刷新后回看执行过程
+      try {
+        const p = JSON.parse(m.content) as {
+          seq: number
+          title?: string
+          status: string
+          snapshot_rev?: number | null
+        }
+        result.push({
+          id: `msg-${m.id}`,
+          kind: 'ticket_progress',
+          content: ticketProgressText(p),
+          ticketStatus: p.status as TicketStatus,
+        })
+      } catch {
+        /* 进度行解析失败则跳过 */
+      }
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
       result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
@@ -310,8 +413,14 @@ async function loadHistory() {
 
 // 中断识别（诊断修复）：正常收尾的最后一轮必以结论（text/共识/规格）收尾；
 // 消息尾停在思考行或工具事件行 = 该轮被刷新/断流中断。同时把最后一条用户消息
-// 恢复为可重试内容（刷新后 lastUserContent 已丢失，重试按钮才可用）
+// 恢复为可重试内容（刷新后 lastUserContent 已丢失，重试按钮才可用）。
+// 工单执行中断除外（工单 0018）：正确的恢复入口是清单卡片上的“继续执行”，
+// 重发用户消息会被执行期引导拦截，横幅只会误导。
 function detectInterrupted(messages: MessageOut[]) {
+  if (execActive.value) {
+    interrupted.value = { status: 'none' }
+    return
+  }
   const last = messages[messages.length - 1]
   if (last && (last.kind === 'thinking' || last.kind === 'event')) {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user')
@@ -331,6 +440,24 @@ async function loadFiles() {
 
 async function loadSnapshots() {
   snapshots.value = await store.fetchSnapshots(projectId.value)
+}
+
+// 工单执行状态（工单 0018）：团队模式拉取，断线重连后卡片与继续/重试入口据此重建；
+// 必须先于历史重建完成，中断识别才能据执行期抑制“重新生成”横幅改用继续执行。
+// loading 守卫：会话内首次执行时事件触发补拉，防多事件重复拉取。
+const ticketStatesLoading = ref(false)
+async function loadTickets() {
+  if (projectMode.value !== 'team') {
+    ticketStates.value = []
+    return
+  }
+  if (ticketStatesLoading.value) return
+  ticketStatesLoading.value = true
+  try {
+    ticketStates.value = await store.fetchTickets(projectId.value)
+  } finally {
+    ticketStatesLoading.value = false
+  }
 }
 
 function formatTime(iso: string): string {
@@ -363,7 +490,8 @@ async function onRollback(snapshot: SnapshotOut) {
 
 onMounted(async () => {
   await loadProject()
-  await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
+  await Promise.all([loadTickets(), loadFiles(), loadSnapshots()])
+  await loadHistory()
 })
 
 async function send() {
@@ -434,9 +562,9 @@ async function confirmSpec() {
   await runSse(`/api/projects/${projectId.value}/spec/confirm`, { feedback })
 }
 
-// 确认工单清单（工单 0017）：确认后进入执行期，工程师随即开始实现，
+// 确认工单清单（工单 0017）：确认后进入执行期，工程师按检查点串行逐单实现（工单 0018），
 // 其后发消息不再重新澄清/拆单；调整意见可选，随确认一并落对话历史可回看；
-// 首建流水线内确认不占用新名额（ADR 0003）
+// 首建流水线内确认与执行都不占用新名额（ADR 0003）
 async function confirmTickets() {
   if (generating.value) return
   const feedback = ticketsFeedback.value.trim()
@@ -447,6 +575,14 @@ async function confirmTickets() {
     content: feedback || '确认工单清单，开始执行。',
   })
   await runSse(`/api/projects/${projectId.value}/tickets/confirm`, { feedback })
+}
+
+// 继续/重试工单执行（工单 0018）：从第一张未完成工单起点继续，已完成的单不重跑；
+// 首建流水线内不重复占名额，断线重连与失败重试同一入口；全部完成后后端返 409，
+// 前端在流结束后以 /tickets 状态为准重建卡片，无需额外处理。
+async function resumeTickets() {
+  if (generating.value) return
+  await runSse(`/api/projects/${projectId.value}/tickets/resume`, {})
 }
 
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
@@ -563,6 +699,38 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         pushText(ensureSpecEntry(), String(event.content ?? ''))
       } else if (event.type === 'tickets') {
         ensureTicketsEntry(String(event.content ?? ''))
+      } else if (event.type === 'ticket_progress') {
+        // 工单执行进度（工单 0018）：同步卡片内工单状态与接口态，追加一行进度供实时可见；
+        // 卡片内序号是相对编号，按清单下标对齐服务端 seq（重拆后续编也不错位）；
+        // 会话内首次“确认即执行”时接口态尚未拉取（挂载时清单尚不存在），
+        // 补拉一次后后续事件与进度条即可按接口态对齐（断线重连场景挂载时已拉取）
+        if (ticketStates.value.length === 0) void loadTickets()
+        const seq = Number(event.seq)
+        const st = String(event.status ?? '') as TicketStatus
+        const rev = typeof event.snapshot_rev === 'number' ? event.snapshot_rev : null
+        const stateIdx = ticketStates.value.findIndex((t) => t.seq === seq)
+        const card = [...entries.value].reverse().find((e) => e.kind === 'tickets')
+        const ticketInCard =
+          card?.tickets && stateIdx >= 0 ? card.tickets[stateIdx] : undefined
+        if (ticketInCard) {
+          ticketInCard.status = st
+          if (rev !== null) ticketInCard.snapshot_rev = rev
+        }
+        if (stateIdx >= 0) {
+          ticketStates.value[stateIdx].status = st
+          if (rev !== null) ticketStates.value[stateIdx].snapshot_rev = rev
+        }
+        entries.value.push({
+          id: nextId(),
+          kind: 'ticket_progress',
+          content: ticketProgressText({
+            seq,
+            title: typeof event.title === 'string' ? event.title : undefined,
+            status: st,
+            snapshot_rev: rev,
+          }),
+          ticketStatus: st,
+        })
       } else if (event.type === 'tool') {
         const tool = {
           name: String(event.name ?? ''),
@@ -610,8 +778,9 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     // 等打字机追平再换历史，避免尾部字符闪现；随后以持久化结果为准对齐（含思考行，回看折叠展示）
     await waitForTypewriter()
     // 文件清单刷新后预览自动指向最新版本，无需手动刷新页面（工单 0004/0005）
-    // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比
-    await Promise.all([loadHistory(), loadFiles(), loadSnapshots()])
+    // 即便生成以 error 收尾也刷新预览：已写入的部分改动同样要可见，重试后才能对比；
+    // 工单执行状态同步重拉，失败/中断后的继续入口据最新状态重建（工单 0018）
+    await Promise.all([loadHistory(), loadFiles(), loadSnapshots(), loadTickets()])
     previewRev.value += 1
     scrollToBottom()
   }
@@ -785,7 +954,14 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     <div class="ticket-head">
                       <span class="ticket-seq">#{{ t.seq }}</span>
                       <span class="ticket-title">{{ t.title }}</span>
-                      <el-tag size="small" effect="plain">待执行</el-tag>
+                      <!-- 执行状态（工单 0018）：待执行/执行中/完成（附检查点版本）/失败 -->
+                      <el-tag
+                        size="small"
+                        effect="plain"
+                        :type="ticketTagType(ticketDisplay(entry, t).status)"
+                      >
+                        {{ ticketStatusLabel(ticketDisplay(entry, t)) }}
+                      </el-tag>
                     </div>
                     <div class="ticket-deliverable">{{ t.deliverable }}</div>
                     <div v-if="t.blocked_by.length" class="ticket-blocked">
@@ -795,6 +971,28 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                   <div v-if="!entry.tickets?.length" class="ticket-empty">
                     {{ entry.streaming ? '正在拆解工单…' : '工单清单为空' }}
                   </div>
+                </div>
+                <!-- 执行进度与继续/重试入口（工单 0018）：仅最新已确认卡片展示，
+                     断线重连后据 /tickets 状态重建；失败时从失败单重试，否则继续执行 -->
+                <div
+                  v-if="entry.ticketsConfirmed && !entry.streaming && isLastTicketsEntry(entry) && ticketStates.length"
+                  class="ticket-exec-bar"
+                  data-testid="tickets-exec-bar"
+                >
+                  <span class="ticket-progress">
+                    执行进度 {{ doneTicketCount }}/{{ ticketStates.length }}
+                  </span>
+                  <el-tag v-if="!execActive" size="small" type="success">全部完成</el-tag>
+                  <el-button
+                    v-else
+                    type="primary"
+                    size="small"
+                    :disabled="generating"
+                    data-testid="tickets-resume-button"
+                    @click="resumeTickets"
+                  >
+                    {{ failedTicket ? `重试工单 ${failedTicket.seq}` : '继续执行' }}
+                  </el-button>
                 </div>
                 <div v-if="!entry.ticketsConfirmed && !entry.streaming" class="prd-actions" data-testid="tickets-card-actions">
                   <el-input
@@ -815,6 +1013,16 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                   </el-button>
                 </div>
               </div>
+            </div>
+            <div v-else-if="entry.kind === 'ticket_progress'" class="tool-line">
+              <!-- 工单执行进度行（工单 0018）：开始/完成（含检查点版本）/失败，历史回看由消息行重建 -->
+              <el-tag
+                :type="entry.ticketStatus === 'failed' ? 'danger' : entry.ticketStatus === 'done' ? 'success' : 'warning'"
+                size="small"
+                effect="plain"
+              >
+                {{ entry.content }}
+              </el-tag>
             </div>
             <div v-else-if="entry.kind === 'tool'" class="tool-line">
               <el-tag
@@ -1143,6 +1351,21 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .ticket-empty {
   color: #909399;
   font-size: 13px;
+}
+
+/* 工单执行进度条（工单 0018）：整体进度 + 继续/重试入口 */
+.ticket-exec-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+  border-top: 1px dashed #ebeef5;
+}
+
+.ticket-progress {
+  font-size: 13px;
+  color: #606266;
 }
 
 .markdown :deep(p) {

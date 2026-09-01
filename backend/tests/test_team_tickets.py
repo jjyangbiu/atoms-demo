@@ -55,9 +55,12 @@ BREAK_STEP = {"tool_calls": [("submit_tickets", {"tickets": TICKETS_PAYLOAD})]}
 
 SECOND_BREAK_STEP = {"tool_calls": [("submit_tickets", {"tickets": SECOND_TICKETS_PAYLOAD})]}
 
-ENGINEER_BUILD_STEPS = [
+# 清单确认后的检查点串行执行（工单 0018）：两张工单各两步（写文件 + 收尾文本）
+EXEC_STEPS = [
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-    {"text": "已按工单完成。"},
+    {"text": "工单 1 完成。"},
+    {"tool_calls": [("write_file", {"path": "timer.js", "content": "// 计时"})]},
+    {"text": "工单 2 完成。"},
 ]
 
 
@@ -187,7 +190,7 @@ class TestTicketRedraft:
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
                 SECOND_BREAK_STEP,
-                *ENGINEER_BUILD_STEPS,
+                *EXEC_STEPS,
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -228,10 +231,10 @@ class TestTicketsConfirm:
     def test_confirm_starts_engineer_with_tickets_in_context(
         self, app, settings, client, auth_headers
     ):
-        """清单确认 = 执行期入口：工程师随即实现，工单清单进入其上下文。"""
+        """清单确认 = 执行期入口：工程师随即逐单实现（工单 0018 串行执行）。"""
         model = use_fake_model(
             app,
-            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *ENGINEER_BUILD_STEPS],
+            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *EXEC_STEPS],
         )
         project = _create_project(client, auth_headers, mode="team")
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
@@ -245,10 +248,14 @@ class TestTicketsConfirm:
             _project_dir(settings, project["id"]) / "index.html"
         ).read_text(encoding="utf-8") == "<h1>番茄钟</h1>"
 
-        # 确认消息（携工单清单）与规格都进了工程师的上下文
-        engineer_call = model.received_messages[-1]
-        contents = [getattr(m, "content", "") for m in engineer_call]
-        assert any("请按工单清单执行" in c and "计时核心" in c for c in contents)
+        # 首张工单的执行调用：指令含完整清单（含第二单），规格在上下文里可见（工单 0018）
+        first_exec_call = next(
+            call
+            for call in model.received_messages
+            if any("现在执行工单" in getattr(m, "content", "") for m in call)
+        )
+        contents = [getattr(m, "content", "") for m in first_exec_call]
+        assert any("现在执行工单 1" in c and "计时核心" in c for c in contents)
         assert any(SPEC_TEXT in c for c in contents)
 
         # 确认落对话历史，可回看
@@ -260,7 +267,7 @@ class TestTicketsConfirm:
     def test_confirm_with_feedback_reaches_engineer(self, app, client, auth_headers):
         model = use_fake_model(
             app,
-            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *ENGINEER_BUILD_STEPS],
+            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *EXEC_STEPS],
         )
         project = _create_project(client, auth_headers, mode="team")
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
@@ -268,9 +275,14 @@ class TestTicketsConfirm:
         _confirm_spec(client, auth_headers, project["id"])
         _confirm_tickets(client, auth_headers, project["id"], feedback="第二个工单加上统计页")
 
-        engineer_call = model.received_messages[-1]
+        # 调整意见随确认落历史并进执行上下文（工单 0018：确认消息在首单执行前已落库）
+        first_exec_call = next(
+            call
+            for call in model.received_messages
+            if any("现在执行工单" in getattr(m, "content", "") for m in call)
+        )
         assert any(
-            getattr(m, "content", "").startswith("第二个工单加上统计页") for m in engineer_call
+            getattr(m, "content", "").startswith("第二个工单加上统计页") for m in first_exec_call
         )
 
     def test_message_after_confirmed_no_rebreak_no_reclarify(
@@ -283,7 +295,7 @@ class TestTicketsConfirm:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
-                *ENGINEER_BUILD_STEPS,
+                *EXEC_STEPS,
                 {"text": "已调整。"},
             ],
         )
@@ -318,7 +330,7 @@ class TestTicketsConfirm:
     def test_confirm_twice_is_409(self, app, client, auth_headers):
         use_fake_model(
             app,
-            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *ENGINEER_BUILD_STEPS],
+            [FIRST_BUILD_CLARIFY_STEP, {"text": SPEC_TEXT}, BREAK_STEP, *EXEC_STEPS],
         )
         project = _create_project(client, auth_headers, mode="team")
         _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
@@ -354,7 +366,7 @@ class TestTeamTicketsQuota:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
-                *ENGINEER_BUILD_STEPS,
+                *EXEC_STEPS,
                 {"text": "迭代完成。"},
             ],
         )
