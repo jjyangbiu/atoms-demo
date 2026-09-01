@@ -72,10 +72,21 @@ systemctl daemon-reload
 systemctl enable atoms-backend
 systemctl restart atoms-backend
 
-echo "==> 前端：生产构建"
+echo "==> 前端：构建前检查（低内存保护）"
+# 2C4G 实例内存紧张，若尚无 swap 则补 2G，避免构建期内存峰值把整机拖死（幂等，重跑安全）
+if [ "$(swapon --show --noheadings | wc -l)" -eq 0 ]; then
+    fallocate -l 2G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+echo "==> 前端：安装依赖并构建"
 cd "$DEPLOY_DIR/frontend"
 npm ci
-npm run build
+# Rollup build needs large heap; swap above acts as fallback memory
+NODE_OPTIONS="--max-old-space-size=2560" npm run build
 
 echo "==> nginx：站点配置"
 cp "$DEPLOY_DIR/deploy/aliyun/nginx-bare.conf" /etc/nginx/sites-available/atoms
