@@ -23,6 +23,8 @@ export interface MessageOut {
   // breaker_agent 为拆单智能体（工单 0017）
   role: 'user' | 'pm' | 'engineer' | 'clarifier' | 'spec_agent' | 'breaker_agent' | 'system'
   // thinking 为推理模型的思考过程留痕，回看时以折叠块展示（诊断修复）
+  // clarify 为选项式澄清问题卡片（内容为问题清单 JSON，诊断修复）
+  // clarify_answer 为弹窗式澄清的答案消息标记，前端折叠进问答记录卡（工单 0020）
   // consensus/consensus_confirm 为需求澄清与共识确认（工单 0015）
   // spec/spec_confirm 为需求规格与规格确认（工单 0016）
   // tickets/tickets_confirm 为工单清单与清单确认（工单 0017）
@@ -40,6 +42,8 @@ export interface MessageOut {
     | 'ticket'
     | 'event'
     | 'thinking'
+    | 'clarify'
+    | 'clarify_answer'
   content: string
   created_at: string
 }

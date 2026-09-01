@@ -10,11 +10,17 @@
 任何测试不得调用真实 MiniMax API。
 """
 
+import json
 from pathlib import Path
 
+import pytest
+
 from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, seed_project_files, use_fake_model
+from fake_model import FakeStreamingModel
 from test_generation import _stream_messages
 from test_projects import _create_project
+
+from app.agent.loop import THINK_CLOSE, THINK_OPEN
 
 
 class FakeClock:
@@ -275,3 +281,179 @@ class TestExistingFilesSkipClarify:
         assert all(e["type"] != "consensus" for e in events)
         assert any(e["type"] == "tool" and e["name"] == "edit_file" for e in events)
         assert events[-1]["type"] == "done"
+
+
+ASK_STEP = {
+    "tool_calls": [
+        (
+            "ask_options",
+            {
+                "questions": '[{"question": "配色用深色还是浅色？",'
+                ' "options": ["深色主题", "浅色主题"], "recommend": 0}]'
+            },
+        )
+    ]
+}
+"""伪模型脚本步：澄清轮经 ask_options 产出选项式问题。"""
+
+
+class TestOptionBasedClarify:
+    def test_ask_options_streams_clarify_event_and_persists(self, app, settings, client, auth_headers):
+        """选项式澄清：结构化问题以 clarify 事件外发、落历史可回看，全程不写文件。"""
+        use_fake_model(app, [ASK_STEP])
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+
+        clarify = [e for e in events if e["type"] == "clarify"]
+        assert clarify and events[-1]["type"] == "done"
+        assert all(e["type"] in ("clarify", "thinking", "done") for e in events), events
+        payload = json.loads(clarify[0]["content"])
+        assert payload[0]["question"] == "配色用深色还是浅色？"
+        assert payload[0]["options"] == ["深色主题", "浅色主题"]
+        assert payload[0]["recommend"] == 0
+        pdir = Path(settings.storage_root) / "projects" / str(project["id"])
+        assert not (pdir / "index.html").exists()
+
+        # 选项卡片落对话历史，刷新可回看（kind=clarify）
+        messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        assert messages[-1]["role"] == "clarifier" and messages[-1]["kind"] == "clarify"
+        assert json.loads(messages[-1]["content"])[0]["options"][0] == "深色主题"
+
+    def test_invalid_payload_sent_back_to_model(self, app, client, auth_headers):
+        """选项非法（非 JSON）时错误交还模型自行修正，不中断循环、不外发坏卡片。"""
+        model = use_fake_model(
+            app,
+            [
+                {"tool_calls": [("ask_options", {"questions": "这显然不是 JSON"})]},
+                ASK_STEP,
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个页面")
+
+        # 非法一遭不外发任何 clarify 事件；修正后的合法清单照常外发并收尾
+        assert any(e["type"] == "clarify" for e in events) and events[-1]["type"] == "done"
+        tool_replies = [
+            m for call in model.received_messages for m in call if type(m).__name__ == "ToolMessage"
+        ]
+        assert any("不合法" in m.content for m in tool_replies)
+
+    def test_clarify_card_and_answer_reach_next_round(self, app, client, auth_headers):
+        """选项卡片与用户回答都进后续澄清轮上下文；答完收敛出共识。"""
+        model = use_fake_model(app, [ASK_STEP, FIRST_BUILD_CLARIFY_STEP])
+        project = _create_project(client, auth_headers)
+        _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+        events = _stream_messages(client, auth_headers, project["id"], "第 1 题：深色主题")
+        assert any(e["type"] == "consensus" for e in events)
+
+        call = model.received_messages[-1]
+        contents = [getattr(m, "content", "") for m in call]
+        assert any("澄清问题" in c and "深色主题" in c for c in contents)
+        assert "第 1 题：深色主题" in contents
+
+    @pytest.mark.parametrize("bad", ['[{"question": "", "options": ["a", "b"]}]', "[]", '[{"question": "q", "options": ["a", "b"], "recommend": 9}]'])
+    def test_validation_rejects_malformed_payload(self, bad):
+        """解析器单测：空问题/空清单/推荐越界均被拒，错误文案交还模型。"""
+        from app.agent.tools import parse_clarify_payload
+
+        questions, reason = parse_clarify_payload(bad)
+        assert questions is None and reason
+
+
+class TestClarifyJsonRecovery:
+    """部分推理模型不调 ask_options，而是把问题 JSON 写进 content——
+    甚至 JSON 开头漏进 think 块、尾部被截断。此时后端须恢复出合法
+    问题清单并升级为选项卡片路径，不得把半截 JSON 渲染成裸文本气泡。"""
+
+    def test_json_split_across_think_block_recovered_as_card(self, app, client, auth_headers):
+        """复现线上 trace：think 块尾部漏出 `[{`，闭标签后只剩 JSON 残段且缺尾 `]`。"""
+        app.state.model_factory = lambda _s: FakeStreamingModel(
+            [
+                [
+                    THINK_OPEN + "让我整理问题。[{\"",
+                    THINK_CLOSE
+                    + 'question": "配色用深色还是浅色？", "options": ["深色主题", "浅色主题"], "recommend": 0}, '
+                    + '{"question": "统计功能如何？", "options": ["基础统计", "详细统计"], "recommend": 1}',
+                ]
+            ]
+        )
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个页面")
+
+        clarify = [e for e in events if e["type"] == "clarify"]
+        assert clarify and events[-1]["type"] == "done", events
+        payload = json.loads(clarify[0]["content"])
+        assert [q["question"] for q in payload] == ["配色用深色还是浅色？", "统计功能如何？"]
+
+        # 落库为选项卡片而非裸文本残段（前端流结束后以历史重渲染）
+        messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        assert messages[-1]["kind"] == "clarify"
+        assert not any(m["kind"] == "text" and 'question":' in m["content"] for m in messages)
+
+    def test_complete_json_as_plain_text_recovered_as_card(self, app, client, auth_headers):
+        """模型把完整 JSON 数组当正文输出（未跨 think）：同样恢复为卡片。"""
+        full = '[{"question": "配色用深色还是浅色？", "options": ["深色主题", "浅色主题"], "recommend": 0}]'
+        app.state.model_factory = lambda _s: FakeStreamingModel([[full]])
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        assert any(e["type"] == "clarify" for e in events), events
+
+    def test_old_style_free_text_question_not_recovered(self, app, client, auth_headers):
+        """自由文本提问不含合法 JSON 清单：保持旧形态文本路径，不误升级。"""
+        app.state.model_factory = lambda _s: FakeStreamingModel(
+            [["❓ Q1 - 配色：深色还是浅色？\n➤ 推荐：深色"]]
+        )
+        project = _create_project(client, auth_headers)
+        events = _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        assert all(e["type"] != "clarify" for e in events)
+        messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        assert messages[-1]["kind"] == "text"
+
+
+class TestClarifyAnswerMarker:
+    """弹窗式澄清（工单 0020）：弹窗提交答案携 clarify_answer 标记，
+    落库 kind=clarify_answer，历史回看据此与新请求区分；无标记消息仍落 kind=text。
+    标记消息在后续澄清轮仍以用户消息入上下文，分流与名额语义不变。"""
+
+    def _send(self, client, headers, project_id, content, marker):
+        with client.stream(
+            "POST",
+            f"/api/projects/{project_id}/messages",
+            json={"content": content, "clarify_answer": marker},
+            headers=headers,
+        ) as resp:
+            assert resp.status_code == 200, resp.read()
+            return parse_sse(resp)
+
+    def test_marker_persists_clarify_answer_kind(self, app, client, auth_headers):
+        use_fake_model(app, [ASK_STEP, ASK_STEP])
+        project = _create_project(client, auth_headers)
+        self._send(client, auth_headers, project["id"], "做一个时钟应用", False)
+        self._send(client, auth_headers, project["id"], "第 1 题：深色主题", True)
+
+        messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert [m["kind"] for m in user_msgs] == ["text", "clarify_answer"]
+        assert user_msgs[1]["content"] == "第 1 题：深色主题"
+
+    def test_without_marker_still_text_kind(self, app, client, auth_headers):
+        use_fake_model(app, [ASK_STEP, ASK_STEP])
+        project = _create_project(client, auth_headers)
+        self._send(client, auth_headers, project["id"], "做一个时钟应用", False)
+        self._send(client, auth_headers, project["id"], "配色直接用深色", False)
+
+        messages = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert [m["kind"] for m in user_msgs] == ["text", "text"]
+
+    def test_marker_answer_reaches_next_round_context(self, app, client, auth_headers):
+        """标记消息以用户消息入后续澄清轮上下文（语义与现状一致）。"""
+        model = use_fake_model(app, [ASK_STEP, FIRST_BUILD_CLARIFY_STEP])
+        project = _create_project(client, auth_headers)
+        self._send(client, auth_headers, project["id"], "做一个时钟应用", False)
+        events = self._send(client, auth_headers, project["id"], "第 1 题：深色主题", True)
+        assert any(e["type"] == "consensus" for e in events)
+
+        call = model.received_messages[-1]
+        contents = [getattr(m, "content", "") for m in call]
+        assert "第 1 题：深色主题" in contents

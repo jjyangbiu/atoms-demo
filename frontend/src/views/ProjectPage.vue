@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api, ApiError } from '@/api/client'
@@ -50,12 +50,13 @@ interface ChatEntry {
     | 'tickets'
     | 'ticket_progress'
     | 'thinking'
+    | 'clarify'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
   tool?: ToolInfo
   streaming?: boolean
-  // 思考块是否折叠：流式过程默认展开，结束后默认折叠（诊断修复）
+  // 思考块一律默认折叠（诊断修复）：流式期间与历史回看同态，想看可点开
   collapsed?: boolean
   // PRD 卡片（工单 0010，仅历史团队项目）：已确认的不再显示操作区，仅待确认的卡片可交互；
   // 未确认前发送普通消息会被后端引导先处理 PRD（工单 0010）
@@ -70,6 +71,21 @@ interface ChatEntry {
   ticketsConfirmed?: boolean
   // 工单执行进度行（工单 0018）：开始/完成/失败的状态色
   ticketStatus?: TicketStatus
+  // 选项式澄清问题卡片（诊断修复）：解析后的问题清单；已回答/被取代的卡片不再可点选
+  clarifyQuestions?: ClarifyQuestion[]
+  clarifyAnswered?: boolean
+  // 澄清问答一体记录卡（工单 0020）：答案消息折叠解析结果，与 clarifyQuestions 下标对齐
+  clarifyAnswers?: (string | null)[]
+  // 确认记录卡默认折叠（工单 0020）：摘要 + 可展开全文，操作移入弹窗
+  recordCollapsed?: boolean
+  // 未确认但其后已有任何消息 = 被取代（工单 0020 取代语义）：标签展示“已被取代”而非“待确认”
+  superseded?: boolean
+}
+
+interface ClarifyQuestion {
+  question: string
+  options: string[]
+  recommend?: number | null
 }
 
 function parseTickets(content: string): TicketInfo[] {
@@ -82,6 +98,40 @@ function parseTickets(content: string): TicketInfo[] {
       deliverable: String(t.deliverable ?? ''),
       blocked_by: Array.isArray(t.blocked_by) ? t.blocked_by.map(Number) : [],
     }))
+  } catch {
+    return []
+  }
+}
+
+// 澄清答案折叠解析（工单 0020）：答案消息内容为「第 N 题：X」行式，
+// 还原为与问题下标对齐的数组；解析不出的行为 null，记录卡仅展示问题
+function parseClarifyAnswers(content: string, count: number): (string | null)[] {
+  const answers: (string | null)[] = Array(count).fill(null)
+  for (const line of content.split('\n')) {
+    const m = /^第 (\d+) 题：(.*)$/.exec(line.trim())
+    if (!m) continue
+    const idx = Number(m[1]) - 1
+    if (idx >= 0 && idx < count) answers[idx] = m[2]
+  }
+  return answers
+}
+
+// 选项式澄清清单解析（诊断修复）：后端校验已把住形状，这里只做宽容的字段摘取；
+// 解析失败降级为空清单，卡片提示异常而不阻塞对话
+function parseClarify(content: string): ClarifyQuestion[] {
+  try {
+    const data = JSON.parse(content)
+    if (!Array.isArray(data)) return []
+    return data
+      .filter((q: unknown) => q !== null && typeof q === 'object')
+      .map((item: object) => {
+        const q = item as Record<string, unknown>
+        return {
+          question: String(q.question ?? ''),
+          options: Array.isArray(q.options) ? q.options.map(String) : [],
+          recommend: typeof q.recommend === 'number' ? q.recommend : null,
+        }
+      })
   } catch {
     return []
   }
@@ -110,6 +160,17 @@ const consensusFeedback = ref('')
 const specFeedback = ref('')
 // 工单清单确认时的调整意见（工单 0017）
 const ticketsFeedback = ref('')
+// 弹窗式待办动作面板（工单 0020）：每题作答状态，键为 pending 条目 id，
+// 值为“问题下标 → 答案”；选项与自定义互斥，收起期间保留，历史重建后失效
+interface PanelAnswer {
+  kind: 'option' | 'custom'
+  text: string
+}
+const panelAnswers = ref<Record<string, Record<number, PanelAnswer>>>({})
+// 弹窗张开状态：pending 出现（含刷新重建）自动张开；取消为非破坏性收起
+const panelOpen = ref(false)
+// 问答模板翻页：一题一页、1/N 左右翻
+const panelPage = ref(0)
 // 工单执行状态（工单 0018）：来自 /tickets 接口，断线重连后据此展示进度与继续/重试入口；
 // 卡片内按清单下标对齐（卡片内序号是相对编号，重拆后会续编）
 const ticketStates = ref<TicketOut[]>([])
@@ -302,6 +363,8 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         kind: 'consensus',
         content: m.content,
         consensusConfirmed: confirmed || superseded,
+        recordCollapsed: true,
+        superseded: !confirmed && messages.slice(i + 1).length > 0,
       })
     } else if (m.kind === 'spec') {
       // 需求规格卡片（工单 0016）：确认状态推导同共识；被重新起草取代的旧卡片不再可交互
@@ -312,6 +375,8 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         kind: 'spec',
         content: m.content,
         specConfirmed: confirmed || superseded,
+        recordCollapsed: true,
+        superseded: !confirmed && messages.slice(i + 1).length > 0,
       })
     } else if (m.kind === 'tickets') {
       // 工单清单卡片（工单 0017）：确认状态推导同规格；被重新拆解取代的旧卡片不再可交互；
@@ -324,6 +389,8 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         content: m.content,
         tickets: parseTickets(m.content),
         ticketsConfirmed: confirmed || superseded,
+        recordCollapsed: true,
+        superseded: !confirmed && messages.slice(i + 1).length > 0,
       })
     } else if (m.kind === 'ticket') {
       // 工单执行进度行（工单 0018）：完成/失败留痕，刷新后回看执行过程
@@ -342,6 +409,24 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
         })
       } catch {
         /* 进度行解析失败则跳过 */
+      }
+    } else if (m.kind === 'clarify') {
+      // 选项式澄清问题卡片（诊断修复）：其后存在任何消息（回答/新一轮提问）即视为已回答或被取代，不再可点选
+      result.push({
+        id: `msg-${m.id}`,
+        kind: 'clarify',
+        content: m.content,
+        clarifyQuestions: parseClarify(m.content),
+        clarifyAnswered: messages.slice(i + 1).length > 0,
+      })
+    } else if (m.kind === 'clarify_answer') {
+      // 澄清答案（工单 0020）：不渲染独立气泡，折叠进对应问题记录卡；
+      // 找不到对应问题卡（脏数据）时降级为用户气泡，不丢消息
+      const target = [...result].reverse().find((e) => e.kind === 'clarify')
+      if (target?.clarifyQuestions) {
+        target.clarifyAnswers = parseClarifyAnswers(m.content, target.clarifyQuestions.length)
+      } else {
+        result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
       }
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
@@ -541,6 +626,7 @@ async function confirmPrd() {
 // 首建流水线内确认不占用新名额，不会遇限流（ADR 0003）
 async function confirmConsensus() {
   if (generating.value) return
+  panelOpen.value = false
   const feedback = consensusFeedback.value.trim()
   consensusFeedback.value = ''
   entries.value.push({
@@ -557,6 +643,7 @@ async function confirmConsensus() {
 // 修改意见可选，随确认一并落对话历史可回看；首建流水线内确认不占用新名额（ADR 0003）
 async function confirmSpec() {
   if (generating.value) return
+  panelOpen.value = false
   const feedback = specFeedback.value.trim()
   specFeedback.value = ''
   entries.value.push({
@@ -572,6 +659,7 @@ async function confirmSpec() {
 // 首建流水线内确认与执行都不占用新名额（ADR 0003）
 async function confirmTickets() {
   if (generating.value) return
+  panelOpen.value = false
   const feedback = ticketsFeedback.value.trim()
   ticketsFeedback.value = ''
   entries.value.push({
@@ -588,6 +676,180 @@ async function confirmTickets() {
 async function resumeTickets() {
   if (generating.value) return
   await runSse(`/api/projects/${projectId.value}/tickets/resume`, {})
+}
+
+// 待办动作检测（工单 0020）：尾部卡片未回答/未确认 = 当前唯一 pending 动作；
+// 流式期间（generating/streaming）不算 pending，弹窗等流结束历史重建后再弹
+const pendingAction = computed(() => {
+  if (generating.value) return null
+  const last = entries.value[entries.value.length - 1]
+  if (!last || last.streaming) return null
+  if (last.kind === 'clarify' && !last.clarifyAnswered)
+    return { entryId: last.id, kind: 'clarify' as const, entry: last }
+  if (last.kind === 'consensus' && !last.consensusConfirmed && !last.superseded)
+    return { entryId: last.id, kind: 'consensus' as const, entry: last }
+  if (last.kind === 'spec' && !last.specConfirmed && !last.superseded)
+    return { entryId: last.id, kind: 'spec' as const, entry: last }
+  if (last.kind === 'tickets' && !last.ticketsConfirmed && !last.superseded)
+    return { entryId: last.id, kind: 'tickets' as const, entry: last }
+  return null
+})
+
+const pendingKey = computed(() => pendingAction.value?.entryId ?? null)
+
+// pending 切换（新一轮提问/新草案/刷新重建）→ 自动张弹窗；pending 消失 → 收起（工单 0020）
+watch(pendingKey, (now, prev) => {
+  if (now && now !== prev) {
+    panelOpen.value = true
+    panelPage.value = 0
+  } else if (!now) {
+    panelOpen.value = false
+  }
+})
+
+const pendingLabel = computed(() => {
+  switch (pendingAction.value?.kind) {
+    case 'clarify':
+      return '需求澄清待回答'
+    case 'consensus':
+      return '需求共识待确认'
+    case 'spec':
+      return '需求规格待确认'
+    case 'tickets':
+      return '工单清单待确认'
+    default:
+      return ''
+  }
+})
+
+const panelQuestions = computed(() => pendingAction.value?.entry.clarifyQuestions ?? [])
+
+// 全部题目都有答案（选项或自定义非空）才启用“继续”（工单 0020）
+const panelAllAnswered = computed(() => {
+  const p = pendingAction.value
+  if (!p || p.kind !== 'clarify' || !panelQuestions.value.length) return false
+  const per = panelAnswers.value[p.entryId] ?? {}
+  return panelQuestions.value.every((_q, i) => (per[i]?.text ?? '').trim().length > 0)
+})
+
+function panelAnswerOf(qIdx: number): PanelAnswer | undefined {
+  const p = pendingAction.value
+  if (!p) return undefined
+  return (panelAnswers.value[p.entryId] ?? {})[qIdx]
+}
+
+function pickPanelOption(qIdx: number, opt: string) {
+  const p = pendingAction.value
+  if (!p || generating.value) return
+  const per = panelAnswers.value[p.entryId] ?? {}
+  per[qIdx] = { kind: 'option', text: opt }
+  panelAnswers.value[p.entryId] = per
+}
+
+function setPanelCustom(qIdx: number, text: string) {
+  const p = pendingAction.value
+  if (!p || generating.value) return
+  const per = panelAnswers.value[p.entryId] ?? {}
+  per[qIdx] = { kind: 'custom', text }
+  panelAnswers.value[p.entryId] = per
+}
+
+function cancelPanel() {
+  // 非破坏性收起（工单 0020）：输入框恢复可用，重开入口出现
+  panelOpen.value = false
+}
+
+function reopenPanel() {
+  panelOpen.value = true
+  panelPage.value = 0
+}
+
+// 确认记录卡摘要（工单 0020）：折叠时只展示首个非空行截断，展开看全文
+function excerptOf(content: string): string {
+  const line = content
+    .split('\n')
+    .map((s) => s.trim())
+    .find((s) => s.length > 0)
+  const plain = (line ?? '').replace(/^#+\s*/, '').replace(/[*_`>]/g, '')
+  if (!plain) return '（空内容）'
+  return plain.length > 60 ? `${plain.slice(0, 60)}…` : plain
+}
+
+function ticketsExcerpt(entry: ChatEntry): string {
+  const ts = entry.tickets ?? []
+  const head = ts
+    .slice(0, 3)
+    .map((t) => `#${t.seq} ${t.title}`)
+    .join('；')
+  return `共 ${ts.length} 张工单${head ? '：' + head : ''}${ts.length > 3 ? '…' : ''}`
+}
+
+// 弹窗追加意见输入复用各阶段意见状态（工单 0020）
+const panelFeedback = computed({
+  get() {
+    switch (pendingAction.value?.kind) {
+      case 'consensus':
+        return consensusFeedback.value
+      case 'spec':
+        return specFeedback.value
+      case 'tickets':
+        return ticketsFeedback.value
+      default:
+        return ''
+    }
+  },
+  set(v: string) {
+    switch (pendingAction.value?.kind) {
+      case 'consensus':
+        consensusFeedback.value = v
+        break
+      case 'spec':
+        specFeedback.value = v
+        break
+      case 'tickets':
+        ticketsFeedback.value = v
+        break
+    }
+  },
+})
+
+const panelConfirmLabel = computed(() => {
+  switch (pendingAction.value?.kind) {
+    case 'consensus':
+      return projectMode.value === 'team' ? '确认共识，起草规格' : '确认共识并开始生成'
+    case 'spec':
+      return '确认规格并开始拆单'
+    case 'tickets':
+      return '确认清单并开始执行'
+    default:
+      return '确认'
+  }
+})
+
+function confirmByKind() {
+  const kind = pendingAction.value?.kind
+  if (kind === 'consensus') void confirmConsensus()
+  else if (kind === 'spec') void confirmSpec()
+  else if (kind === 'tickets') void confirmTickets()
+}
+
+// 弹窗提交澄清回答 = 发送一条携答案标记的用户消息（工单 0020）：
+// 后端分流/名额语义不变；提交后问答一体记录卡立即呈现，流结束后以持久化历史为准重建
+async function submitPanelAnswers() {
+  const p = pendingAction.value
+  if (!p || generating.value || !panelAllAnswered.value) return
+  const per = panelAnswers.value[p.entryId] ?? {}
+  const parts: string[] = []
+  panelQuestions.value.forEach((_q, i) => {
+    const text = (per[i]?.text ?? '').trim()
+    if (text) parts.push(`第 ${i + 1} 题：${text}`)
+  })
+  const content = parts.join('\n')
+  p.entry.clarifyAnswered = true
+  p.entry.clarifyAnswers = panelQuestions.value.map((_q, i) => (per[i]?.text ?? '').trim())
+  panelOpen.value = false
+  lastUserContent = content
+  await runSse(`/api/projects/${projectId.value}/messages`, { content, clarify_answer: true })
 }
 
 async function runSse(path: string, body: unknown): Promise<ApiError | null> {
@@ -609,7 +871,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
     return textHolder.entry
   }
 
-  // 思考过程条目（诊断修复）：小号可折叠，流式时展开，随打字机逐字显现
+  // 思考过程条目（诊断修复）：小号可折叠，一律默认折叠，随打字机逐字显现（点开才可见）
   const ensureThinkingEntry = (): ChatEntry => {
     if (!thinkingHolder.entry) {
       thinkingHolder.entry = {
@@ -618,7 +880,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         content: '',
         raw: '',
         streaming: true,
-        collapsed: false,
+        collapsed: true,
       }
       entries.value.push(thinkingHolder.entry)
     }
@@ -704,6 +966,17 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         pushText(ensureSpecEntry(), String(event.content ?? ''))
       } else if (event.type === 'tickets') {
         ensureTicketsEntry(String(event.content ?? ''))
+      } else if (event.type === 'clarify') {
+        // 选项式澄清问题卡片（诊断修复）：事件一次携完整清单，直接解析渲染；
+        // 流结束后以持久化历史为准重渲染（同其他卡片）
+        const content = String(event.content ?? '')
+        entries.value.push({
+          id: nextId(),
+          kind: 'clarify',
+          content,
+          clarifyQuestions: parseClarify(content),
+          clarifyAnswered: false,
+        })
       } else if (event.type === 'ticket_progress') {
         // 工单执行进度（工单 0018）：同步卡片内工单状态与接口态，追加一行进度供实时可见；
         // 卡片内序号是相对编号，按清单下标对齐服务端 seq（重拆后续编也不错位）；
@@ -761,6 +1034,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         }
       } else if (event.type === 'error') {
         errorDetail.value = String(event.detail ?? '生成失败')
+        // 错误收尾即收起弹窗（工单 0020）：pending 仍在的话重开入口会出现
+        panelOpen.value = false
       }
       scrollToBottom()
     })
@@ -883,35 +1158,51 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                 </div>
               </div>
             </div>
+            <div v-else-if="entry.kind === 'clarify'" class="msg agent-msg">
+              <!-- 澄清问答一体记录卡（工单 0020）：操作移入弹窗，此处只读留痕；
+                   已回答展示问题+折叠答案；存量无标记旧卡仅展示问题；待回答展示问题+待选标签 -->
+              <div class="prd-card clarify-card">
+                <div class="prd-head">
+                  <span class="prd-role">需求澄清 · 问答记录</span>
+                  <el-tag v-if="entry.clarifyAnswered" size="small" type="success">已处理</el-tag>
+                  <el-tag v-else size="small" type="warning">待选择</el-tag>
+                </div>
+                <div class="clarify-list">
+                  <div v-for="(q, qi) in entry.clarifyQuestions ?? []" :key="qi" class="clarify-question">
+                    <div class="clarify-q-text">{{ qi + 1 }}. {{ q.question }}</div>
+                    <div v-if="entry.clarifyAnswers?.[qi]" class="clarify-a-text">
+                      答：{{ entry.clarifyAnswers[qi] }}
+                    </div>
+                  </div>
+                  <div v-if="!entry.clarifyQuestions?.length" class="clarify-empty">
+                    澄清问题内容解析失败，可收起弹窗后直接在输入框回答
+                  </div>
+                </div>
+              </div>
+            </div>
             <div v-else-if="entry.kind === 'consensus'" class="msg agent-msg">
               <div class="prd-card consensus-card">
                 <div class="prd-head">
                   <span class="prd-role">需求澄清 · 共识</span>
                   <el-tag v-if="entry.consensusConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else-if="entry.superseded" size="small" type="info">已被取代</el-tag>
                   <el-tag v-else size="small" type="warning">待确认</el-tag>
                 </div>
                 <div
+                  v-if="entry.streaming || !entry.recordCollapsed"
                   class="bubble markdown prd-body"
                   v-html="renderMarkdown(entry.content || (entry.streaming ? '正在整理需求共识…' : ''))"
                 />
-                <div v-if="!entry.consensusConfirmed && !entry.streaming" class="prd-actions" data-testid="consensus-card-actions">
-                  <el-input
-                    v-model="consensusFeedback"
-                    type="textarea"
-                    :rows="2"
-                    :disabled="generating"
-                    placeholder="修改意见（可选），例如：功能 2 不要了；也可以直接继续对话补充需求"
-                    data-testid="consensus-feedback-input"
-                  />
-                  <el-button
-                    type="primary"
-                    :loading="generating"
-                    data-testid="consensus-confirm-button"
-                    @click="confirmConsensus"
-                  >
-                    {{ projectMode === 'team' ? '确认共识，起草需求规格' : '确认共识并开始生成' }}
-                  </el-button>
-                </div>
+                <div v-else class="record-excerpt">{{ excerptOf(entry.content) }}</div>
+                <button
+                  v-if="!entry.streaming"
+                  type="button"
+                  class="record-toggle"
+                  data-testid="consensus-record-toggle"
+                  @click="entry.recordCollapsed = !entry.recordCollapsed"
+                >
+                  {{ entry.recordCollapsed ? '展开全文' : '收起全文' }}
+                </button>
               </div>
             </div>
             <div v-else-if="entry.kind === 'spec'" class="msg agent-msg">
@@ -920,30 +1211,24 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                 <div class="prd-head">
                   <span class="prd-role">团队模式 · 需求规格</span>
                   <el-tag v-if="entry.specConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else-if="entry.superseded" size="small" type="info">已被取代</el-tag>
                   <el-tag v-else size="small" type="warning">待确认</el-tag>
                 </div>
                 <div
+                  v-if="entry.streaming || !entry.recordCollapsed"
                   class="bubble markdown prd-body"
                   v-html="renderMarkdown(entry.content || (entry.streaming ? '正在起草需求规格…' : ''))"
                 />
-                <div v-if="!entry.specConfirmed && !entry.streaming" class="prd-actions" data-testid="spec-card-actions">
-                  <el-input
-                    v-model="specFeedback"
-                    type="textarea"
-                    :rows="2"
-                    :disabled="generating"
-                    placeholder="修改意见（可选），例如：功能 3 换成统计页；也可以直接继续对话重新起草"
-                    data-testid="spec-feedback-input"
-                  />
-                  <el-button
-                    type="primary"
-                    :loading="generating"
-                    data-testid="spec-confirm-button"
-                    @click="confirmSpec"
-                  >
-                    确认规格并开始拆解工单
-                  </el-button>
-                </div>
+                <div v-else class="record-excerpt">{{ excerptOf(entry.content) }}</div>
+                <button
+                  v-if="!entry.streaming"
+                  type="button"
+                  class="record-toggle"
+                  data-testid="spec-record-toggle"
+                  @click="entry.recordCollapsed = !entry.recordCollapsed"
+                >
+                  {{ entry.recordCollapsed ? '展开全文' : '收起全文' }}
+                </button>
               </div>
             </div>
             <div v-else-if="entry.kind === 'tickets'" class="msg agent-msg">
@@ -952,9 +1237,10 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                 <div class="prd-head">
                   <span class="prd-role">团队模式 · 工单清单</span>
                   <el-tag v-if="entry.ticketsConfirmed" size="small" type="success">已确认</el-tag>
+                  <el-tag v-else-if="entry.superseded" size="small" type="info">已被取代</el-tag>
                   <el-tag v-else size="small" type="warning">待确认</el-tag>
                 </div>
-                <div class="ticket-list">
+                <div v-show="entry.streaming || !entry.recordCollapsed" class="ticket-list">
                   <div v-for="t in entry.tickets ?? []" :key="t.seq" class="ticket-item">
                     <div class="ticket-head">
                       <span class="ticket-seq">#{{ t.seq }}</span>
@@ -999,24 +1285,18 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     {{ failedTicket ? `重试工单 ${failedTicket.seq}` : '继续执行' }}
                   </el-button>
                 </div>
-                <div v-if="!entry.ticketsConfirmed && !entry.streaming" class="prd-actions" data-testid="tickets-card-actions">
-                  <el-input
-                    v-model="ticketsFeedback"
-                    type="textarea"
-                    :rows="2"
-                    :disabled="generating"
-                    placeholder="调整意见（可选），例如：工单 2 拆得太细；也可以直接继续对话重新拆解"
-                    data-testid="tickets-feedback-input"
-                  />
-                  <el-button
-                    type="primary"
-                    :loading="generating"
-                    data-testid="tickets-confirm-button"
-                    @click="confirmTickets"
-                  >
-                    确认清单并开始执行
-                  </el-button>
+                <div v-if="!entry.streaming && entry.recordCollapsed" class="record-excerpt">
+                  {{ ticketsExcerpt(entry) }}
                 </div>
+                <button
+                  v-if="!entry.streaming"
+                  type="button"
+                  class="record-toggle"
+                  data-testid="tickets-record-toggle"
+                  @click="entry.recordCollapsed = !entry.recordCollapsed"
+                >
+                  {{ entry.recordCollapsed ? '展开全文' : '收起全文' }}
+                </button>
               </div>
             </div>
             <div v-else-if="entry.kind === 'ticket_progress'" class="tool-line">
@@ -1085,25 +1365,151 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
           </div>
         </div>
 
-        <div class="chat-input">
-          <el-input
-            v-model="input"
-            type="textarea"
-            :rows="3"
-            :disabled="generating"
-            placeholder="描述需求或提出修改，例如：把按钮改大一点"
-            data-testid="chat-input"
-            @keydown.enter.exact.prevent="send"
-          />
-          <el-button
-            type="primary"
-            :loading="generating"
-            :disabled="!input.trim()"
-            data-testid="chat-send"
-            @click="send"
-          >
-            {{ generating ? '生成中' : '发送' }}
-          </el-button>
+        <div class="chat-bottom">
+          <!-- 待办重开入口（工单 0020）：弹窗取消收起后出现，点击恢复弹窗 -->
+          <div v-if="pendingAction && !panelOpen" class="pending-reopen" data-testid="pending-reopen">
+            <span>⏳ {{ pendingLabel }}</span>
+            <el-button size="small" type="primary" data-testid="pending-reopen-button" @click="reopenPanel">
+              处理
+            </el-button>
+          </div>
+          <!-- 弹窗式待办动作面板（工单 0020）：悬浮于输入框上方、无遮罩；
+               问答模板（澄清）与审阅模板（共识/规格/工单）共用容器 -->
+          <div v-if="pendingAction && panelOpen" class="pending-panel" data-testid="pending-panel">
+            <div class="pending-panel-head">
+              <span class="pending-panel-title">
+                {{ pendingAction.kind === 'clarify' ? '请回答以下问题' : pendingLabel }}
+              </span>
+              <span v-if="pendingAction.kind === 'clarify'" class="pending-pager">
+                <button type="button" :disabled="panelPage <= 0" @click="panelPage -= 1">‹</button>
+                <span>{{ panelPage + 1 }}/{{ panelQuestions.length }}</span>
+                <button
+                  type="button"
+                  :disabled="panelPage >= panelQuestions.length - 1"
+                  @click="panelPage += 1"
+                >
+                  ›
+                </button>
+              </span>
+            </div>
+            <div v-if="pendingAction.kind === 'clarify'" class="pending-panel-body">
+              <template v-if="panelQuestions.length">
+                <div class="panel-q-text">{{ panelPage + 1 }}. {{ panelQuestions[panelPage]?.question }}</div>
+                <div class="panel-options">
+                  <button
+                    v-for="(opt, oi) in panelQuestions[panelPage]?.options ?? []"
+                    :key="oi"
+                    type="button"
+                    class="panel-option"
+                    :class="{
+                      selected: panelAnswerOf(panelPage)?.kind === 'option' && panelAnswerOf(panelPage)?.text === opt,
+                    }"
+                    :data-testid="`panel-option-${panelPage}-${oi}`"
+                    @click="pickPanelOption(panelPage, opt)"
+                  >
+                    <span class="panel-option-badge">{{ String.fromCharCode(65 + oi) }}</span>
+                    {{ opt }}
+                    <span v-if="panelQuestions[panelPage]?.recommend === oi" class="clarify-recommend">
+                      ➤ 推荐
+                    </span>
+                  </button>
+                  <div
+                    class="panel-option panel-option-custom"
+                    :class="{ selected: panelAnswerOf(panelPage)?.kind === 'custom' }"
+                    @click="
+                      setPanelCustom(
+                        panelPage,
+                        panelAnswerOf(panelPage)?.kind === 'custom'
+                          ? (panelAnswerOf(panelPage)?.text ?? '')
+                          : '',
+                      )
+                    "
+                  >
+                    <span class="panel-option-badge">
+                      {{ String.fromCharCode(65 + (panelQuestions[panelPage]?.options ?? []).length) }}
+                    </span>
+                    <el-input
+                      :model-value="panelAnswerOf(panelPage)?.kind === 'custom' ? (panelAnswerOf(panelPage)?.text ?? '') : ''"
+                      placeholder="或输入自定义答案"
+                      :data-testid="`panel-custom-${panelPage}`"
+                      @input="setPanelCustom(panelPage, $event)"
+                    />
+                  </div>
+                </div>
+              </template>
+              <div v-else class="clarify-empty">澄清问题内容解析失败，可取消后直接在输入框回答</div>
+            </div>
+            <div v-else class="pending-panel-body pending-review">
+              <div
+                v-if="pendingAction.kind !== 'tickets'"
+                class="bubble markdown prd-body review-doc"
+                v-html="renderMarkdown(pendingAction.entry.content)"
+              />
+              <div v-else class="ticket-list review-doc">
+                <div v-for="t in pendingAction.entry.tickets ?? []" :key="t.seq" class="ticket-item">
+                  <div class="ticket-head">
+                    <span class="ticket-seq">#{{ t.seq }}</span>
+                    <span class="ticket-title">{{ t.title }}</span>
+                  </div>
+                  <div class="ticket-deliverable">{{ t.deliverable }}</div>
+                  <div v-if="t.blocked_by.length" class="ticket-blocked">
+                    被 {{ t.blocked_by.map((b) => `#${b}`).join('、') }} 阻塞
+                  </div>
+                </div>
+              </div>
+              <el-input
+                v-model="panelFeedback"
+                type="textarea"
+                :rows="2"
+                placeholder="追加意见（可选）"
+                data-testid="panel-feedback"
+              />
+            </div>
+            <div class="pending-panel-foot">
+              <el-button size="small" data-testid="panel-cancel" @click="cancelPanel">取消</el-button>
+              <el-button
+                v-if="pendingAction.kind === 'clarify'"
+                size="small"
+                type="primary"
+                :disabled="!panelAllAnswered"
+                :loading="generating"
+                data-testid="panel-continue"
+                @click="submitPanelAnswers"
+              >
+                继续
+              </el-button>
+              <el-button
+                v-else
+                size="small"
+                type="primary"
+                :loading="generating"
+                data-testid="panel-confirm"
+                @click="confirmByKind"
+              >
+                {{ panelConfirmLabel }}
+              </el-button>
+            </div>
+          </div>
+          <div class="chat-input">
+            <el-input
+              v-model="input"
+              type="textarea"
+              :rows="3"
+              :disabled="generating || panelOpen"
+              placeholder="描述需求或提出修改，例如：把按钮改大一点"
+              data-testid="chat-input"
+              @keydown.enter.exact.prevent="send"
+            />
+            <el-button
+              type="primary"
+              :loading="generating"
+              :disabled="!input.trim() || panelOpen"
+              data-testid="chat-send"
+              @click="send"
+            >
+              {{ generating ? '生成中' : '发送' }}
+            </el-button>
+          </div>
         </div>
       </section>
 
@@ -1311,6 +1717,72 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-self: flex-end;
 }
 
+/* 选项式澄清问题卡片（诊断修复）：逐题候选项横排可点选，推荐项虚线标注，选中项高亮 */
+.clarify-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.clarify-q-text {
+  font-size: 13px;
+  color: #303133;
+  margin-bottom: 6px;
+}
+
+.clarify-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.clarify-option {
+  border: 1px solid #dcdfe6;
+  border-radius: 16px;
+  background: #fff;
+  padding: 4px 12px;
+  font-size: 13px;
+  color: #606266;
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.clarify-option:hover:not(:disabled) {
+  border-color: #409eff;
+  color: #409eff;
+}
+
+.clarify-option.selected {
+  border-color: #409eff;
+  background: #ecf5ff;
+  color: #409eff;
+}
+
+.clarify-option.recommended {
+  border-style: dashed;
+}
+
+.clarify-option:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.clarify-recommend {
+  margin-left: 6px;
+  font-size: 12px;
+  color: #e6a23c;
+}
+
+.clarify-empty {
+  font-size: 13px;
+  color: #909399;
+}
+
+.clarify-hint {
+  font-size: 12px;
+  color: #909399;
+}
+
 /* 工单清单卡片（工单 0017）：逐张工单卡片展示标题/交付内容/阻塞依赖 */
 .ticket-list {
   display: flex;
@@ -1472,7 +1944,186 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   gap: 8px;
   align-items: flex-end;
   padding: 12px 16px;
+}
+
+/* 弹窗式待办动作面板（工单 0020）：输入区容器作为定位错，面板悬浮其上、无遮罩 */
+.chat-bottom {
+  position: relative;
   border-top: 1px solid #e4e7ed;
+}
+
+.pending-reopen {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 16px;
+  background: #fdf6ec;
+  color: #e6a23c;
+  font-size: 13px;
+}
+
+.pending-panel {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 8px;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  max-height: min(480px, 70vh);
+  z-index: 10;
+}
+
+.pending-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.pending-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #606266;
+}
+
+.pending-pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.pending-pager button {
+  border: 1px solid #dcdfe6;
+  background: #fff;
+  border-radius: 4px;
+  width: 20px;
+  height: 20px;
+  cursor: pointer;
+  color: #606266;
+}
+
+.pending-pager button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pending-panel-body {
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.panel-q-text {
+  font-size: 13px;
+  color: #303133;
+}
+
+.panel-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.panel-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: #f4f4f5;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: #303133;
+  cursor: pointer;
+  text-align: left;
+}
+
+.panel-option:hover {
+  background: #ecf5ff;
+}
+
+.panel-option.selected {
+  background: #ecf5ff;
+  border-color: #409eff;
+  color: #409eff;
+}
+
+.panel-option-badge {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #c0c4cc;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #606266;
+  background: #fff;
+}
+
+.panel-option.selected .panel-option-badge {
+  border-color: #409eff;
+  color: #409eff;
+}
+
+.panel-option-custom {
+  cursor: text;
+}
+
+.panel-option-custom .el-input {
+  flex: 1;
+}
+
+.review-doc {
+  max-width: none;
+}
+
+.pending-panel-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid #ebeef5;
+}
+
+/* 确认记录卡折叠摘要与展开入口（工单 0020） */
+.record-excerpt {
+  font-size: 13px;
+  color: #909399;
+  padding: 2px 4px;
+}
+
+.record-toggle {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  color: #409eff;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.record-toggle:hover {
+  color: #66b1ff;
+}
+
+/* 澄清问答一体记录卡的答案行（工单 0020） */
+.clarify-a-text {
+  font-size: 13px;
+  color: #409eff;
+  padding-left: 12px;
 }
 
 .chat-input .el-button {

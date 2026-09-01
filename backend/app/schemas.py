@@ -65,6 +65,10 @@ class WorldAppOut(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
+    # 弹窗式澄清答案标记（工单 0020）：前端弹窗提交答案时为 true，
+    # 落库 kind=clarify_answer，历史回看据此把答案折叠进问答记录卡、与新请求区分；
+    # 普通消息默认 false，行为不变。
+    clarify_answer: bool = False
 
 
 class ConfirmPrdRequest(BaseModel):

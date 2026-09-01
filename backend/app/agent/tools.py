@@ -5,6 +5,7 @@
 
 import inspect
 import json
+import re
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -106,18 +107,79 @@ def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
 
 
 def build_clarify_tools() -> list:
-    """澄清智能体的唯一工具（工单 0015 / ADR 0003）。
+    """澄清智能体的工具集（工单 0015 / ADR 0003）。
 
-    澄清阶段不绑定任何文件工具：模型物理上无法提前写代码，
-    唯一出口是携带需求共识摘要的 start_build。
+    澄清阶段不绑定任何文件工具：模型物理上无法提前写代码；
+    提问出口是携结构化选项的 ask_options（前端渲染为可点选卡片），
+    收敛出口是携带需求共识摘要的 start_build。
     """
+
+    @tool
+    def ask_options(questions: str) -> str:
+        """提出澄清问题时调用，问题以可点选的选项卡片呈现。参数: questions — 问题清单 JSON 数组字符串，每项含 question（问题）、options（候选项字符串数组，2–4 个）、recommend（推荐项下标，从 0 起，无推荐可省）。"""
+        return "已发出澄清问题，等待用户选择或输入回答。"
 
     @tool
     def start_build(requirements_summary: str) -> str:
         """澄清完成（或用户要求跳过澄清）时调用，产出需求共识。参数: requirements_summary — 澄清后达成的需求共识摘要（中文 Markdown）。"""
         return "已记录需求共识，等待用户确认。"
 
-    return [start_build]
+    return [ask_options, start_build]
+
+
+def parse_clarify_payload(raw: str) -> tuple[list[dict] | None, str]:
+    """校验澄清智能体提交的选项式问题清单；非法时返回 (None, 错误文案) 交还模型修正。
+
+    约束：问题数 1–6；每题候选项 2–4 个且非空；recommend 为可选的合法下标。
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "questions 不是合法 JSON，请提交 JSON 数组字符串。"
+    if not isinstance(data, list) or not data:
+        return None, "问题清单必须是非空 JSON 数组。"
+    if len(data) > 6:
+        return None, f"一次最多提 6 个问题，当前为 {len(data)} 个，请合并或减少。"
+    questions: list[dict] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            return None, f"第 {i + 1} 个问题必须是 JSON 对象。"
+        question = str(item.get("question") or "").strip()
+        if not question:
+            return None, f"第 {i + 1} 个问题缺少 question。"
+        options_raw = item.get("options")
+        if not isinstance(options_raw, list) or not (2 <= len(options_raw) <= 4):
+            return None, f"第 {i + 1} 个问题的 options 必须是 2–4 个候选项的数组。"
+        options = [str(o or "").strip() for o in options_raw]
+        if not all(options):
+            return None, f"第 {i + 1} 个问题的候选项不能为空。"
+        recommend = item.get("recommend")
+        if recommend is not None:
+            try:
+                recommend = int(recommend)
+            except (TypeError, ValueError):
+                return None, f"第 {i + 1} 个问题的 recommend 必须是候选项下标。"
+            if not 0 <= recommend < len(options):
+                return None, f"第 {i + 1} 个问题的 recommend 下标越界。"
+        questions.append({"question": question, "options": options, "recommend": recommend})
+    return questions, ""
+
+
+def recover_clarify_payload(raw: str) -> list[dict] | None:
+    """模型未调 ask_options 而把选项式问题 JSON 写进 content 时，尽力恢复出问题清单。
+
+    部分推理模型会把 JSON 开头漏进 think 块、或尾部被截断缺 `]`；
+    故从后往前扫描每个 `[{` 候选起点，取到文末尝试解析，解析失败再补 `]` 重试，
+    返回首个通过 parse_clarify_payload 校验的清单；自由文本命中不了合法清单形状，天然不会误恢复。
+    """
+    starts = [m.start() for m in re.finditer(r"\[\s*\{", raw)]
+    for start in reversed(starts):
+        candidate = raw[start:]
+        for fixed in (candidate, candidate + "]"):
+            questions, _reason = parse_clarify_payload(fixed)
+            if questions is not None:
+                return questions
+    return None
 
 
 def build_breaker_tools() -> list:

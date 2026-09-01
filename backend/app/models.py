@@ -129,7 +129,8 @@ class Message(Base):
     # | tickets | tickets_confirm | ticket | event | thinking
     # （prd/prd_confirm 为团队模式，工单 0010；consensus/consensus_confirm 为需求澄清，工单 0015；
     # spec/spec_confirm 为需求规格，工单 0016；tickets/tickets_confirm 为工单清单，工单 0017；
-    # ticket 为单张工单的执行进度行，工单 0018）
+    # ticket 为单张工单的执行进度行，工单 0018；
+    # clarify_answer 为弹窗式澄清的答案消息标记，工单 0020）
     kind: Mapped[str] = mapped_column(String(16), default="text", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

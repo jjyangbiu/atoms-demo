@@ -27,7 +27,9 @@ from ..agent.tools import (
     build_clarify_tools,
     build_tools,
     execute_tool,
+    parse_clarify_payload,
     parse_ticket_payload,
+    recover_clarify_payload,
     resolve_sandboxed,
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
@@ -199,6 +201,9 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
         elif m.kind == "tickets":
             # 工单清单入上下文：重新拆解在旧清单基础上调整，执行阶段可见清单（工单 0017）
             history.append(AIMessage(content=f"以下是拆解出的工单清单（JSON）：\n\n{m.content}"))
+        elif m.kind == "clarify":
+            # 选项式澄清问题入上下文：后续轮次据此不重复问已答内容（诊断修复）
+            history.append(AIMessage(content=f"以下是我提出的澄清问题（含候选项，JSON）：\n\n{m.content}"))
         else:
             history.append(AIMessage(content=m.content))
     if window > 0:
@@ -926,6 +931,14 @@ async def _exec_tickets_stream(request: Request, project_id: int):
         # 进入下一单；每单重取历史与文件清单，前序交付成果自然进入上下文
 
 
+class _AskOptionsInvoked(Exception):
+    """澄清智能体调用 ask_options 的控制流信号：携选项式问题清单 JSON 终止循环。"""
+
+    def __init__(self, raw: str):
+        self.raw = raw
+        super().__init__("ask_options")
+
+
 class _StartBuildInvoked(Exception):
     """澄清智能体调用 start_build 的控制流信号：携需求共识摘要立即终止循环。"""
 
@@ -937,10 +950,12 @@ class _StartBuildInvoked(Exception):
 async def _clarify_stream(request: Request, project_id: int, user_text: str, history: list):
     """需求澄清流（工单 0015）：分轮问答直至无未决问题，产出需求共识卡片。
 
-    澄清智能体唯一工具是 start_build（无任何文件工具）：
-    - 模型返回纯文本 → 澄清提问，以 role=clarifier 落历史；
+    澄清智能体只绑定提问与收敛两个工具（无任何文件工具）：
+    - 模型调用 ask_options → 选项式问题以 clarify 事件外发并落库，前端渲染可点选卡片；
+      清单非法时错误文案经 ToolMessage 回传模型自行修正（同拆单范式）；
+    - 模型返回纯文本 → 兼容旧形态的澄清提问，以 role=clarifier 落历史；
     - 模型调用 start_build → 需求共识以 consensus 事件流式外发并落库，本轮结束；
-      start_build 的 ToolMessage 不回传模型，避免模型在共识后继续输出。
+      两个工具的 ToolMessage 都不回传模型，避免模型在提问/共识后继续输出。
     """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
@@ -953,12 +968,21 @@ async def _clarify_stream(request: Request, project_id: int, user_text: str, his
     def clarify_executor(tools, name, args):
         if name == "start_build":
             raise _StartBuildInvoked(str((args or {}).get("requirements_summary", "")))
+        if name == "ask_options":
+            raw = str((args or {}).get("questions", ""))
+            questions, reason = parse_clarify_payload(raw)
+            if questions is None:
+                # 非法清单交还模型修正，不中断循环（重试上限兜底，同拆单）
+                return False, f"问题清单不合法：{reason} 请修正后重新调用 ask_options。"
+            raise _AskOptionsInvoked(json.dumps(questions, ensure_ascii=False))
         return execute_tool(tools, name, args)
 
     consensus_summary: str | None = None
+    clarify_payload: str | None = None
     done_data: dict | None = None
     errored = False
     thinking_parts: list[str] = []
+    raw_parts: list[str] = []
     try:
         async for event in run_generation(
             model,
@@ -977,11 +1001,15 @@ async def _clarify_stream(request: Request, project_id: int, user_text: str, his
                     errored = True
                 if event.type == "thinking":
                     thinking_parts.append(event.data.get("content", ""))
-                # start_build 的工具事件不外发：澄清轮次对用户只呈现问答与共识卡片
+                if event.type in ("thinking", "text"):
+                    raw_parts.append(event.data.get("content", ""))
+                # ask_options/start_build 的工具事件不外发：澄清轮次对用户只呈现选项卡片、问答与共识卡片
                 if event.type != "tool":
                     yield _sse({"type": event.type, **event.data})
     except _StartBuildInvoked as invoked:
         consensus_summary = invoked.summary
+    except _AskOptionsInvoked as invoked:
+        clarify_payload = invoked.raw
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾
         _persist_partial_thinking(session_factory, project_id, "clarifier", thinking_parts)
         yield _sse({"type": "error", "detail": f"澄清中断: {e}"})
@@ -990,6 +1018,36 @@ async def _clarify_stream(request: Request, project_id: int, user_text: str, his
         # 刷新/断流触发的生成器关闭：落库已流出的思考后照旧退出（同工程师流）
         _persist_partial_thinking(session_factory, project_id, "clarifier", thinking_parts)
         raise
+
+    if clarify_payload is None and consensus_summary is None:
+        # 模型未调 ask_options 但可能把问题 JSON 写进了 content（部分推理模型会把
+        # JSON 开头漏进 think 块、尾部被截断）：恢复出合法清单即升级为卡片路径，
+        # 避免半截 JSON 以裸文本气泡呈现；恢复失败才走旧形态文本兼容路径。
+        recovered = recover_clarify_payload("".join(raw_parts))
+        if recovered is not None:
+            clarify_payload = json.dumps(recovered, ensure_ascii=False)
+
+    if clarify_payload is not None:
+        # 产出选项式澄清问题：卡片一次携完整清单外发并落库，等待用户点选或输入回答（确认门前置）
+        yield _sse({"type": "clarify", "content": clarify_payload})
+        try:
+            with session_factory() as session:
+                thinking_text = "".join(thinking_parts).strip()
+                if thinking_text:
+                    session.add(
+                        Message(
+                            project_id=project_id, role="clarifier", kind="thinking", content=thinking_text
+                        )
+                    )
+                session.add(
+                    Message(project_id=project_id, role="clarifier", kind="clarify", content=clarify_payload)
+                )
+                session.commit()
+        except Exception as e:  # noqa: BLE001 — 澄清落库失败须明示，不得静默断流
+            yield _sse({"type": "error", "detail": f"澄清保存失败: {e}"})
+            return
+        yield _sse({"type": "done", "text": clarify_payload})
+        return
 
     if consensus_summary is None:
         # 模型未调 start_build：本轮是一次澄清提问，收尾落库后结束（不写文件、不留快照）
@@ -1053,6 +1111,10 @@ async def send_message(
 
     settings = request.app.state.settings
     existing_files = _existing_file_paths(db, project_id)
+    # 弹窗式澄清答案标记（工单 0020）：答案消息落 kind=clarify_answer，
+    # 历史回看据此折叠进问答记录卡；普通消息仍为 text。仅澄清分流语义使用，
+    # 引导分支（PRD/执行期）不受标记影响。
+    user_kind = "clarify_answer" if body.clarify_answer else "text"
 
     # 团队模式分流（工单 0017 / ADR 0003）：
     # 历史项目（已有 PRD 消息）保留旧流程：待确认时引导先处理 PRD，已确认后进工程师；
@@ -1133,7 +1195,7 @@ async def send_message(
         _accept_rate_limit(request, user)
     try:
         user_message = Message(
-            project_id=project_id, role="user", kind="text", content=body.content
+            project_id=project_id, role="user", kind=user_kind, content=body.content
         )
         db.add(user_message)
         db.commit()

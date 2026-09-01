@@ -3,7 +3,8 @@
  * 事件协议与后端约定一致：每行 `data: {json}`，事件含 type 字段
  * （text | thinking | tool | done | error；团队模式历史项目另有 prd 增量事件（工单 0010），
  * 新团队项目需求规格阶段为 spec 增量事件（工单 0016），
- * 拆单阶段为 tickets 事件（内容为工单清单 JSON，工单 0017））。
+ * 拆单阶段为 tickets 事件（内容为工单清单 JSON，工单 0017）；
+ * 选项式澄清为 clarify 事件（内容为问题清单 JSON，一次携完整清单，诊断修复））。
  * thinking 为推理模型的思考过程增量，前端以小号可折叠块展示。
  */
 
@@ -20,6 +21,7 @@ export interface SseEvent {
     | 'consensus'
     | 'spec'
     | 'tickets'
+    | 'clarify'
     | string
   [key: string]: unknown
 }
