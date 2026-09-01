@@ -744,6 +744,10 @@ function pickPanelOption(qIdx: number, opt: string) {
   const per = panelAnswers.value[p.entryId] ?? {}
   per[qIdx] = { kind: 'option', text: opt }
   panelAnswers.value[p.entryId] = per
+  // 选中选项即自动切到下一题（诊断修复）；末题停留原页，等用户主动点「继续」提交
+  if (panelPage.value === qIdx && qIdx < panelQuestions.value.length - 1) {
+    panelPage.value = qIdx + 1
+  }
 }
 
 function setPanelCustom(qIdx: number, text: string) {
