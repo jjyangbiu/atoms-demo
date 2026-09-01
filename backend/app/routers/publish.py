@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..deps import get_current_user, get_db
 from ..models import Project, Publication, User
+from ..public_links import ensure_link, remove_link
 from ..rag.store import maybe_knowledge_store
 from ..schemas import PublishOut
 from ..serving import serve_project_file
@@ -91,6 +92,8 @@ def publish_project(
     slug = _generate_slug(db)
     db.add(Publication(project_id=project_id, slug=slug))
     db.commit()
+    # nginx 直出链接（工单 0013）：失败静默降级，后端 /p/ 路由仍为兜底
+    ensure_link(request.app.state.settings.storage_root, slug, project_id)
     _sink_to_knowledge(request.app, db, project, slug)
     return PublishOut(slug=slug, url=f"/p/{slug}")
 
@@ -108,6 +111,7 @@ def unpublish_project(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目尚未发布")
     db.delete(publication)
     db.commit()
+    remove_link(request.app.state.settings.storage_root, publication.slug)
     _drop_from_knowledge(request.app, publication.slug)
 
 

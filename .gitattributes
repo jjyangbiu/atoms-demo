@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# 部署脚本与 nginx 配置必须保持 LF：scp 直传或容器 COPY 时，CRLF 在 Linux 上不可用（工单 0014）
+*.sh text eol=lf
+*.conf text eol=lf

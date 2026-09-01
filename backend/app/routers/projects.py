@@ -34,6 +34,7 @@ from ..agent.tools import (
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, Publication, Snapshot, Ticket, User, _utcnow
+from ..public_links import remove_link
 from ..rag.store import maybe_knowledge_store
 from ..rate_limit import RateLimitRejected
 from ..schemas import (
@@ -143,6 +144,8 @@ def delete_project(
     db.commit()
     shutil.rmtree(project_dir(request, project_id), ignore_errors=True)
     if pub_slug:
+        # 连带移除 nginx 直出链接（工单 0013），公开入口立即消失
+        remove_link(request.app.state.settings.storage_root, pub_slug)
         store = maybe_knowledge_store(request.app)
         if store is not None:
             try:

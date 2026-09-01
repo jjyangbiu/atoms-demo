@@ -1,0 +1,56 @@
+# Atoms 容器化编排（工单 0013）：一条 `docker compose up -d` 拉起完整系统。
+#
+# - web：nginx（前端 SPA + /p/ 公开静态直出 + /api 反代含 /preview/ 鉴权代理）
+# - backend：FastAPI（uvicorn）
+# - atoms-data：唯一数据卷（SQLite、Milvus Lite、生成文件、公开链接），重启不丢
+#
+# 环境变量：复制 .env.example 为 .env 并填写 ATOMS_JWT_SECRET 与 ATOMS_LLM_API_KEY，
+# 完整说明见 docs/deployment.md。
+
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      # 存储路径：容器内固定值，同时写入数据卷挂载点（勿随意改动）
+      ATOMS_DATABASE_URL: ${ATOMS_DATABASE_URL:-sqlite:////app/data/atoms.db}
+      ATOMS_STORAGE_ROOT: ${ATOMS_STORAGE_ROOT:-/app/data/storage}
+      ATOMS_MILVUS_URI: ${ATOMS_MILVUS_URI:-/app/data/milvus/atoms.db}
+      # 认证：生产必须为 >=32 字节的随机串
+      ATOMS_JWT_SECRET: ${ATOMS_JWT_SECRET:?请在 .env 设置 ATOMS_JWT_SECRET（>=32 字节随机串）}
+      ATOMS_JWT_EXPIRES_MINUTES: ${ATOMS_JWT_EXPIRES_MINUTES:-10080}
+      # LLM（OpenAI 兼容）：API Key 经环境变量注入，不落盘镜像
+      ATOMS_LLM_API_KEY: ${ATOMS_LLM_API_KEY:?请在 .env 设置 ATOMS_LLM_API_KEY}
+      ATOMS_LLM_BASE_URL: ${ATOMS_LLM_BASE_URL:-https://api.minimaxi.com/v1}
+      ATOMS_LLM_MODEL: ${ATOMS_LLM_MODEL:-MiniMax-M3}
+      ATOMS_LLM_TEMPERATURE: ${ATOMS_LLM_TEMPERATURE:-0.2}
+      ATOMS_AGENT_MAX_STEPS: ${ATOMS_AGENT_MAX_STEPS:-20}
+      ATOMS_AGENT_MAX_RETRIES: ${ATOMS_AGENT_MAX_RETRIES:-2}
+      # embedding：置空则复用 LLM 端点与 Key
+      ATOMS_EMBEDDING_MODEL: ${ATOMS_EMBEDDING_MODEL:-embo-01}
+      ATOMS_EMBEDDING_BASE_URL: ${ATOMS_EMBEDDING_BASE_URL:-}
+      ATOMS_EMBEDDING_API_KEY: ${ATOMS_EMBEDDING_API_KEY:-}
+      # 生成限流（工单 0011 / 0014）：线上建议保守值 10 / 2
+      ATOMS_RATE_LIMIT_PER_USER_HOURLY: ${ATOMS_RATE_LIMIT_PER_USER_HOURLY:-10}
+      ATOMS_RATE_LIMIT_MAX_CONCURRENT: ${ATOMS_RATE_LIMIT_MAX_CONCURRENT:-2}
+      # 同源部署无需跨域；如需本地前端直连容器可追加来源
+      ATOMS_CORS_ORIGINS: ${ATOMS_CORS_ORIGINS:-}
+    volumes:
+      - atoms-data:/app/data
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${ATOMS_HTTP_PORT:-80}:80"
+    # 与 backend 挂同一路径：公开链接的绝对符号链接两边均可解析；只读即可
+    volumes:
+      - atoms-data:/app/data:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  atoms-data:

@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from .agent.model import default_model_factory
 from .config import Settings, get_settings
 from .db import Base, ensure_schema, make_engine
+from .public_links import resync as resync_public_links
 from .rag.embeddings import default_embedding_factory
 from .rate_limit import GenerationLimiter
 from .routers import auth, projects, publish, world
@@ -30,6 +31,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = make_engine(settings.database_url)
     Base.metadata.create_all(engine)
     ensure_schema(engine)
+    # 按发布记录重建 /p/ 直出符号链接（工单 0013）：容器重启后链接不丢；
+    # 失败逐条降级不阻断启动（后端 /p/ 路由仍为兜底）
+    resync_public_links(engine, settings.storage_root)
     app.state.engine = engine
     app.state.session_factory = sessionmaker(bind=engine, expire_on_commit=False)
 
