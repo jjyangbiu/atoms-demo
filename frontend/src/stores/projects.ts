@@ -30,20 +30,20 @@ export interface MessageOut {
   // tickets/tickets_confirm 为工单清单与清单确认（工单 0017）
   // ticket 为单张工单的执行进度行（工单 0018）
   kind:
-    | 'text'
-    | 'prd'
-    | 'prd_confirm'
-    | 'consensus'
-    | 'consensus_confirm'
-    | 'spec'
-    | 'spec_confirm'
-    | 'tickets'
-    | 'tickets_confirm'
-    | 'ticket'
-    | 'event'
-    | 'thinking'
-    | 'clarify'
-    | 'clarify_answer'
+  | 'text'
+  | 'prd'
+  | 'prd_confirm'
+  | 'consensus'
+  | 'consensus_confirm'
+  | 'spec'
+  | 'spec_confirm'
+  | 'tickets'
+  | 'tickets_confirm'
+  | 'ticket'
+  | 'event'
+  | 'thinking'
+  | 'clarify'
+  | 'clarify_answer'
   content: string
   created_at: string
 }
