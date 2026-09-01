@@ -54,6 +54,8 @@ export interface SnapshotOut {
   rev: number
   file_count: number
   created_at: string
+  // 形成该检查点的工单序号（工单 0019）；非检查点快照为 null
+  ticket_seq?: number | null
 }
 
 // 工单清单条目（工单 0017）：执行状态与检查点快照版本由串行执行写入（工单 0018）

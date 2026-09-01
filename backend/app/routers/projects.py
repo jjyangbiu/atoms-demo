@@ -1111,7 +1111,8 @@ async def send_message(
                 "已完成的工单不会重跑。"
             )
         else:
-            guidance = "工单正在按检查点串行执行：请稍候，全部完成后即可继续对话迭代。"
+            # 含检查点回滚后的重置场景（工单 0019）：未完成工单待用户手动「继续执行」
+            guidance = "仍有未完成工单：请在工单清单卡片上点击「继续执行」，从第一个未完成工单起点继续。"
         db.add(Message(project_id=project_id, role="user", kind="text", content=body.content))
         db.add(Message(project_id=project_id, role="system", kind="text", content=guidance))
         db.commit()
@@ -1540,21 +1541,64 @@ def _get_owned_snapshot(db: Session, project_id: int, snapshot_id: int) -> Snaps
     return snapshot
 
 
+def _checkpoint_seq_map(db: Session, project_id: int) -> dict[int, int]:
+    """快照 id → 所属检查点工单序号（工单 0019）：快照列表标注检查点来源。
+
+    按版本区间归属：检查点版本不晚于某工单当前检查点的最早工单即其所属。
+    续跑形成的新检查点取代旧引用后，旧版本快照仍保留来源标注，
+    回滚到旧检查点时用户仍能看到重置提示（与后端重置语义一致）。
+    """
+    checkpoint_revs = [
+        (row.seq, row.snapshot.rev)
+        for row in db.scalars(
+            select(Ticket)
+            .where(Ticket.project_id == project_id, Ticket.snapshot_id.isnot(None))
+            .order_by(Ticket.seq)
+        )
+        if row.snapshot is not None
+    ]
+    result: dict[int, int] = {}
+    for snapshot in db.scalars(
+        select(Snapshot).where(Snapshot.project_id == project_id)
+    ):
+        for seq, rev in checkpoint_revs:
+            if snapshot.rev <= rev:
+                result[snapshot.id] = seq
+                break
+    return result
+
+
+def _reset_tickets_after_checkpoint(db: Session, project_id: int, rev: int) -> None:
+    """回滚到检查点后，把该检查点之后的工单重置为未完成（工单 0019）。
+
+    未完成工单（失败待重试、断流遗留 running）一律归位 open；已完成工单的检查点
+    版本大于回滚目标即随之失效，重置 open 并清除引用；不晚于目标的检查点保持有效。
+    续跑经 /tickets/resume 从第一个未完成工单起点继续（序号升序即依赖序）。
+    """
+    for row in db.scalars(select(Ticket).where(Ticket.project_id == project_id)):
+        if row.status != "done" or (row.snapshot is not None and row.snapshot.rev > rev):
+            row.status = "open"
+            row.snapshot_id = None
+
+
 @router.get("/{project_id}/snapshots", response_model=list[SnapshotOut])
 def list_snapshots(
     project_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> list[Snapshot]:
-    """版本历史：按 rev 倒序（最新版本在前）。"""
+) -> list[dict]:
+    """版本历史：按 rev 倒序（最新版本在前）；检查点快照标注来源工单序号（工单 0019）。"""
     get_owned_project(project_id, user, db)
-    return list(
-        db.scalars(
+    checkpoint_seqs = _checkpoint_seq_map(db, project_id)
+    return [
+        SnapshotOut.model_validate(s).model_dump(mode="json")
+        | {"ticket_seq": checkpoint_seqs.get(s.id)}
+        for s in db.scalars(
             select(Snapshot)
             .where(Snapshot.project_id == project_id)
             .order_by(Snapshot.rev.desc())
         )
-    )
+    ]
 
 
 @router.get("/{project_id}/snapshots/{snapshot_id}", response_model=SnapshotDetailOut)
@@ -1568,6 +1612,7 @@ def get_snapshot(
     get_owned_project(project_id, user, db)
     snapshot = _get_owned_snapshot(db, project_id, snapshot_id)
     payload = SnapshotOut.model_validate(snapshot).model_dump(mode="json")
+    payload["ticket_seq"] = _checkpoint_seq_map(db, project_id).get(snapshot.id)
     payload["files"] = [
         {"path": path, "size": size}
         for path, size in list_snapshot_files(project_dir(request, project_id), snapshot)
@@ -1583,14 +1628,31 @@ def rollback_snapshot(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Snapshot:
-    """把当前文件恢复为该快照状态；后续迭代以其为基线。"""
+    """把当前文件恢复为该快照状态；后续迭代以其为基线。
+
+    团队模式检查点回滚（工单 0019）：该检查点之后的工单重置为未完成，由用户手动
+    「继续执行」从第一个未完成工单续跑（续跑不占新名额）；有工单执行中（running）
+    时拒绝回滚，避免与串行执行流竞态覆盖文件。
+    """
     get_owned_project(project_id, user, db)
     snapshot = _get_owned_snapshot(db, project_id, snapshot_id)
+    project = db.get(Project, project_id)
+    if project is not None and project.mode == "team":
+        running = db.scalar(
+            select(Ticket.id)
+            .where(Ticket.project_id == project_id, Ticket.status == "running")
+            .limit(1)
+        )
+        if running is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="工单执行中，请完成或重试后再回滚"
+            )
     root = project_dir(request, project_id)
     restore_snapshot(root, snapshot)
     _sync_file_index(db, project_id, root)
-    project = db.get(Project, project_id)
     if project is not None:
+        if project.mode == "team":
+            _reset_tickets_after_checkpoint(db, project_id, snapshot.rev)
         project.updated_at = _utcnow()
     db.commit()
     db.refresh(snapshot)

@@ -465,9 +465,13 @@ function formatTime(iso: string): string {
 }
 
 async function onRollback(snapshot: SnapshotOut) {
+  // 团队模式回滚到检查点：其后工单重置为待执行，由「继续执行」续跑（工单 0019）
+  const checkpointNote = snapshot.ticket_seq
+    ? `（工单 ${snapshot.ticket_seq} 的检查点，其后的工单将重置为待执行，可再「继续执行」）`
+    : ''
   try {
     await ElMessageBox.confirm(
-      `回滚到版本 ${snapshot.rev} 后，当前文件将被替换为该版本状态，后续迭代以其为基线。确定回滚？`,
+      `回滚到版本 ${snapshot.rev}${checkpointNote} 后，当前文件将被替换为该版本状态，后续迭代以其为基线。确定回滚？`,
       '回滚版本',
       { type: 'warning', confirmButtonText: '回滚', cancelButtonText: '取消' },
     )
@@ -477,7 +481,8 @@ async function onRollback(snapshot: SnapshotOut) {
   rollingBackId.value = snapshot.id
   try {
     await store.rollbackSnapshot(projectId.value, snapshot.id)
-    await Promise.all([loadFiles(), loadSnapshots()])
+    // 回滚可能重置工单状态（工单 0019）：工单态一并重拉，继续执行入口据最新状态重建
+    await Promise.all([loadFiles(), loadSnapshots(), loadTickets()])
     previewRev.value += 1
     ElMessage.success(`已回滚到版本 ${snapshot.rev}`)
     historyVisible.value = false
@@ -1139,6 +1144,10 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             <div class="snapshot-title">
               版本 {{ s.rev }}
               <el-tag v-if="s.rev === snapshots[0]?.rev" size="small" type="success">最新</el-tag>
+              <!-- 检查点标识（工单 0019）：回滚到检查点会重置其后工单并可续跑 -->
+              <el-tag v-if="s.ticket_seq" size="small" type="warning">
+                工单 {{ s.ticket_seq }} 检查点
+              </el-tag>
             </div>
             <div class="snapshot-meta">{{ formatTime(s.created_at) }} · {{ s.file_count }} 个文件</div>
           </div>

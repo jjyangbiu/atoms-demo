@@ -134,6 +134,8 @@ class SnapshotOut(BaseModel):
     rev: int
     file_count: int
     created_at: datetime
+    # 形成该检查点的工单序号（工单 0019）；非检查点快照为 None
+    ticket_seq: int | None = None
 
     model_config = {"from_attributes": True}
 
