@@ -46,7 +46,8 @@ class TestPublish:
         project = _generate_index(app, client, auth_headers)
         pub = _publish(client, auth_headers, project["id"])
         assert pub["slug"]
-        assert pub["url"] == f"/p/{pub['slug']}"
+        # 尾斜杠是链接规范形：相对资源引用以 /p/{slug}/ 为目录基准解析（见尾斜杠回归测试）
+        assert pub["url"] == f"/p/{pub['slug']}/"
 
         # 匿名（未登录）浏览器访问公开链接：全新客户端、不带任何 Cookie
         anonymous = TestClient(app)
@@ -173,6 +174,46 @@ class TestPublish:
         """公开链接始终指向项目目录当前文件：未发布过的路径形态同样 404。"""
         anonymous = TestClient(app)
         assert anonymous.get("/p/no-such-slug").status_code == 404
+
+    def test_public_root_redirects_to_trailing_slash(self, app, client, auth_headers):
+        """无尾斜杠的存量链接必须 307 重定向到带尾斜杠版本。
+
+        否则浏览器把 /p/{slug} 当“文件”，应用内相对引用（<link href="styles.css">）
+        会解析成 /p/styles.css 丢掉 slug 段 → 404，样式与脚本全部丢失、页面错乱；
+        预览 iframe 的 src 以显式文件名结尾不受影响，由此产生发布与预览不一致。
+        """
+        use_fake_model(
+            app,
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {
+                    "tool_calls": [
+                        (
+                            "write_file",
+                            {
+                                "path": "index.html",
+                                "content": '<link rel="stylesheet" href="styles.css"><h1>时钟</h1>',
+                            },
+                        )
+                    ]
+                },
+                {"tool_calls": [("write_file", {"path": "styles.css", "content": "h1{color:red}"})]},
+                {"text": "完成。"},
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        _stream_messages(client, auth_headers, project["id"], "做一个时钟应用")
+        confirm_first_build(client, auth_headers, project["id"])
+        pub = _publish(client, auth_headers, project["id"])
+
+        anonymous = TestClient(app)
+        # 无尾斜杠：307 跳向尾斜杠版本（跟随重定向后仍 200）
+        resp = anonymous.get(f"/p/{pub['slug']}", follow_redirects=False)
+        assert resp.status_code == 307
+        assert resp.headers["location"].endswith(f"/p/{pub['slug']}/")
+        # 跟随重定向后内容与直接访问尾斜杠版本一致；相对引用的子资源可命中
+        assert anonymous.get(f"/p/{pub['slug']}").status_code == 200
+        assert anonymous.get(f"/p/{pub['slug']}/styles.css").status_code == 200
 
     def test_public_link_blocks_path_traversal(self, app, client, auth_headers):
         project = _generate_index(app, client, auth_headers)

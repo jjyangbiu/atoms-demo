@@ -65,7 +65,7 @@ class TestWorldGallery:
         assert entry["title"] == project["name"]
         assert entry["description"] == "做一个时钟应用"  # 首个用户诉求即应用描述
         assert entry["author"] == "alice"
-        assert entry["preview_url"] == f"/p/{pub['slug']}"
+        assert entry["preview_url"] == f"/p/{pub['slug']}/"
         assert entry["published_at"]
 
         # 详情页同样匿名可访问

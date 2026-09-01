@@ -59,7 +59,7 @@ def _world_entry(db: Session, publication: Publication, project: Project) -> Wor
         title=project.name,
         description=_description(db, project.id),
         author=author,
-        preview_url=f"/p/{publication.slug}",
+        preview_url=f"/p/{publication.slug}/",
         published_at=publication.created_at,
         official=publication.official,
     )

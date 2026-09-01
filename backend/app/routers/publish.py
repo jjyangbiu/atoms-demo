@@ -1,6 +1,6 @@
 """发布与稳定链接（工单 0006）：发布/取消发布 + 匿名公开托管。
 
-- 发布为项目分配唯一稳定 slug，返回 /p/{slug} 公开链接
+- 发布为项目分配唯一稳定 slug，返回 /p/{slug}/ 公开链接（尾斜杠为规范形）
 - 公开托管直接读取项目目录的当前文件：迭代成功后内容自动更新而链接不变
 - 取消发布删除发布记录，公开链接立即 404
 - 同一项目至多一条活跃发布记录（models.Publication.project_id 唯一 + 幂等接口）
@@ -9,6 +9,7 @@
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -82,9 +83,9 @@ def publish_project(
     project = get_owned_project(project_id, user, db)
     existing = get_publication(db, project_id)
     if existing is not None:
-        # 幂等：重复发布返回同一稳定链接
+        # 幂等：重复发布返回同一稳定链接（尾斜杠规范形，相对资源引用以它为目录基准）
         response.status_code = status.HTTP_200_OK
-        return PublishOut(slug=existing.slug, url=f"/p/{existing.slug}")
+        return PublishOut(slug=existing.slug, url=f"/p/{existing.slug}/")
     if not (project_dir(request, project_id) / "index.html").is_file():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="还没有可发布的内容，请先生成应用"
@@ -95,7 +96,7 @@ def publish_project(
     # nginx 直出链接（工单 0013）：失败静默降级，后端 /p/ 路由仍为兜底
     ensure_link(request.app.state.settings.storage_root, slug, project_id)
     _sink_to_knowledge(request.app, db, project, slug)
-    return PublishOut(slug=slug, url=f"/p/{slug}")
+    return PublishOut(slug=slug, url=f"/p/{slug}/")
 
 
 @router.delete("/{project_id}/publish", status_code=status.HTTP_204_NO_CONTENT)
@@ -138,7 +139,12 @@ def _serve_public(request: Request, slug: str, rel_path: str, db: Session) -> Re
 
 @public_router.get("/p/{slug}")
 def public_root(slug: str, request: Request, db: Session = Depends(get_db)) -> Response:
-    return _serve_public(request, slug, "index.html", db)
+    # 无尾斜杠时浏览器把 /p/{slug} 当“文件”，应用内相对引用（styles.css）
+    # 会解析成 /p/styles.css 丢掉 slug 段 → 404，页面样式/脚本全丢；
+    # 307 跳向尾斜杠规范形，存量链接与直输 URL 都兼容（nginx 直出侧同样配置）。
+    if db.scalar(select(Publication.id).where(Publication.slug == slug)) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="应用不存在或已下架")
+    return RedirectResponse(url=f"/p/{slug}/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 @public_router.get("/p/{slug}/{file_path:path}")

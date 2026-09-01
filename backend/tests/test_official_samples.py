@@ -60,7 +60,7 @@ class TestOfficialFlag:
             entry = by_title[spec.name]
             assert entry["author"] == OFFICIAL_USERNAME
             assert entry["description"] == spec.ask[:120]
-            assert entry["preview_url"] == f"/p/{entry['slug']}"
+            assert entry["preview_url"] == f"/p/{entry['slug']}/"
             assert client.get(f"/p/{entry['slug']}").status_code == 200
 
     def test_official_sample_can_be_cloned(self, app, client):

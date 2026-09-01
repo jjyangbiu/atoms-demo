@@ -204,10 +204,11 @@ const previewSrc = computed(() =>
     : '',
 )
 
-// 发布状态（工单 0006）：稳定公开链接 /p/{slug}，任何人无需登录可访问；
-// 迭代成功后后端直接提供项目目录当前文件，链接内容自动同步而链接本身不变
+// 发布状态（工单 0006）：稳定公开链接 /p/{slug}/，任何人无需登录可访问；
+// 迭代成功后后端直接提供项目目录当前文件，链接内容自动同步而链接本身不变。
+// 尾斜杠不可省：缺了它浏览器会按“文件”解析相对资源引用，样式/脚本全丢。
 const publicUrl = computed(() =>
-  publishedSlug.value ? `${window.location.origin}/p/${publishedSlug.value}` : '',
+  publishedSlug.value ? `${window.location.origin}/p/${publishedSlug.value}/` : '',
 )
 
 function renderMarkdown(content: string) {

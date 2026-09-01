@@ -1,0 +1,11 @@
+INFO:     127.0.0.1:62805 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62831 - "GET /p/2ytpeyuz HTTP/1.1" 307 Temporary Redirect
+INFO:     127.0.0.1:62836 - "GET /p/2ytpeyuz/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62839 - "GET /p/no-such-slug HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:62875 - "GET /p/2ytpeyuz HTTP/1.1" 307 Temporary Redirect
+INFO:     127.0.0.1:62878 - "GET /p/2ytpeyuz/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62884 - "GET /p/2ytpeyuz/styles.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62885 - "GET /p/2ytpeyuz/app.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63096 - "GET /p/2ytpeyuz/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63101 - "GET /p/2ytpeyuz/styles.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63103 - "GET /p/2ytpeyuz/app.js HTTP/1.1" 200 OK
