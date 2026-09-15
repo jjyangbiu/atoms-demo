@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..agent.loop import run_generation
+from ..agent.loop import claims_completion, run_generation
 from ..agent.prompts import (
     BREAKER_SYSTEM_PROMPT,
     CLARIFIER_SYSTEM_PROMPT,
@@ -397,6 +397,65 @@ def _file_summaries(project_root: Path) -> list[dict]:
     return summaries
 
 
+# 磁盘事实注入的总量上限（字符）：只在口头完成升级链第二级使用，
+# 预算封顶防止大项目撑爆上下文；超预算文件给出 read_file 指引而非静默丢弃。
+_FACTS_BUDGET = 16000
+
+
+def _disk_facts(project_root: Path, iteration_log: list) -> str:
+    """系统直读磁盘的硬事实文本（口头完成升级链第二级的注入内容）。
+
+    两部分均为系统来源、可核验的事实，与对话记忆无关：
+    - 上一轮迭代的实际改动记录（iteration_log 由系统按工具调用结果追加）；
+    - 项目文件当前实际内容（近轮改动过的文件优先，总预算封顶）。
+    """
+    lines: list[str] = []
+    if iteration_log:
+        last = iteration_log[-1]
+        files = last.get("files") or []
+        files_desc = (
+            ", ".join(files) if files else "（无——系统核验：该轮未产生任何文件改动）"
+        )
+        lines.append(f"上一轮（第{last.get('round', '?')}轮）实际改动记录：{files_desc}")
+
+    # 文件排序：近三轮迭代日志里出现过的文件优先（争议最可能围绕它们），其余按路径
+    recent: list[str] = []
+    for entry in iteration_log[-3:]:
+        for p in entry.get("files") or []:
+            if p not in recent:
+                recent.append(p)
+    all_files: list[tuple[str, Path]] = []
+    if project_root.is_dir():
+        for f in sorted(project_root.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(project_root)
+            if "snapshots" in rel.parts:
+                continue
+            all_files.append((rel.as_posix(), f))
+    ordered = [
+        (p, f) for p, f in all_files if p in recent
+    ] + [(p, f) for p, f in all_files if p not in recent]
+
+    used = sum(len(x) for x in lines)
+    for rel, f in ordered:
+        remaining = _FACTS_BUDGET - used
+        if remaining <= 100:
+            lines.append(f"（事实预算已用尽，{rel} 等其余文件未列出；需要时用 read_file 读取）")
+            break
+        try:
+            content = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        header = f"--- {rel} 当前磁盘内容（系统刚读取） ---"
+        if len(header) + len(content) > remaining:
+            content = content[: max(0, remaining - len(header) - 30)] + "\n…（截断，完整内容用 read_file）"
+        block = f"{header}\n{content}"
+        lines.append(block)
+        used += len(block) + 2
+    return "\n\n".join(lines)
+
+
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -528,6 +587,9 @@ async def _engineer_stream(
             max_steps=settings.agent_max_steps,
             max_retries=settings.agent_max_retries,
             modification_tools={"write_file", "edit_file"},
+            # 硬闸升级链第二级：第二次口头完成时由系统直读磁盘生成权威事实注入，
+            # 不依赖模型“听话”——事实内容完全来自系统侧（文件实际内容+迭代日志）。
+            fact_provider=lambda: _disk_facts(sandbox.root, iteration_log),
         ):
             if event.type == "done":
                 # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
@@ -572,13 +634,30 @@ async def _engineer_stream(
                     Message(project_id=project_id, role="engineer", kind="thinking", content=thinking_text)
                 )
             final_text = done_data.get("text", "") if done_data else ""
+            # 硬输出闸（H1 治本）：只要本轮磁盘零改动，系统就无条件在持久化文本上
+            # 追加核验标注——标注由系统撰写、由代码保证，不依赖模型配合；断言检测
+            # （claims_completion）只决定标注措辞强度，即使措辞漏检，“无改动”的
+            # 事实照样落库。前端在流结束后 loadHistory 以持久化结果重渲染，
+            # 用户看到与回看的都是“声称+核验”成对出现，裸谎言无法单独存活。
+            no_change_round = bool(record_iteration and done_data is not None and not touched_files)
+            if final_text and no_change_round:
+                if claims_completion(final_text):
+                    final_text += (
+                        "\n\n（系统核验：智能体声称已完成修改，但本轮磁盘上没有产生任何文件改动，"
+                        "上述声称与磁盘实际状态不符。）"
+                    )
+                else:
+                    final_text += "\n\n（系统记录：本轮未产生文件改动。）"
             if final_text:
                 session.add(
                     Message(project_id=project_id, role="engineer", kind="text", content=final_text)
                 )
             _sync_file_index(session, project_id, sandbox.root)
-            # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）
-            if done_data is not None:
+            # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）。
+            # 零改动的用户对话轮不留档（硬闸）：磁盘与上一版完全一致，建快照只会
+            # 制造“版本 N+1”的假进展、污染回滚列表；轮次结局以磁盘事实为准。
+            # 团队工单执行（record_iteration=False）不受此影响，检查点语义保持原样。
+            if done_data is not None and not no_change_round:
                 snapshot = create_snapshot(
                     session, project_id, sandbox.root, settings.snapshot_max_kept
                 )
@@ -613,9 +692,12 @@ async def _engineer_stream(
         # 诊断修复：本轮未产生任何文件改动时，在 done 事件上附 warning，
         # 前端得以明确告知用户“本轮未改动文件”，避免模型“口头完成”误导。
         # 仅对用户对话轮（record_iteration）生效；团队工单执行是内部编排，不附警告。
+        # no_change 为结构化结局标记（硬闸）：轮次结局以磁盘事实为准，前端可据此
+        # 做持久化渲染（弹窗是一过性的，历史消息里的核验标注才是留痕）。
         payload = {"type": "done", **done_data}
         if record_iteration and not touched_files:
             payload["warning"] = "本轮未产生任何文件改动"
+            payload["no_change"] = True
         yield _emit(payload)
 
 

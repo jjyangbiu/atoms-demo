@@ -72,8 +72,12 @@ class TestIteration:
         last_call = model.received_messages[-1]
         contents = [getattr(m, "content", "") for m in last_call]
         assert "第三条指令" in contents  # 当前指令
-        assert "第二条指令" in contents and "ok1" in contents  # 最近一轮问答在窗口内
-        assert "第一条指令" not in contents and "ok0" not in contents  # 更早的被截掉
+        # 最近一轮问答在窗口内（回复文本可能被硬输出闸追加“系统记录”标注，按前缀匹配）
+        assert "第二条指令" in contents and any(c.startswith("ok1") for c in contents)
+        # 更早的被截掉（系统提示里的迭代日志含历史指令子串，用户消息须按精确成员匹配；
+        # 工程师回复可能被硬输出闸追加标注，按前缀匹配）
+        assert "第一条指令" not in contents
+        assert not any(c.startswith("ok0") for c in contents)
 
     def test_full_history_persists_despite_context_window(self, app, settings, client, auth_headers):
         settings.agent_history_window = 1
@@ -88,7 +92,8 @@ class TestIteration:
         resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
         texts = [m["content"] for m in resp.json() if m["kind"] == "text"]
         for expected in ["第一条指令", "第二条指令", "第三条指令", "ok0", "ok1", "ok2"]:
-            assert expected in texts, "窗口截断不得影响持久化完整性"
+            # 工程师回复可能被硬输出闸追加“系统记录”标注，按子串匹配
+            assert any(expected in t for t in texts), "窗口截断不得影响持久化完整性"
 
 
 class TestVerbalCompletionGuard:
@@ -156,7 +161,7 @@ class TestVerbalCompletionGuard:
             app,
             [
                 {"text": "已修改完成。"},  # 首次口头完成 → 触发反思
-                {"text": "已完成。"},  # 反思后仍口头完成 → 不再回喂（防死循环），done + warning
+                {"text": "已完成。"},  # 第 2 次 → 事实注入；脚本耗尽后收尾，done + warning
             ],
         )
         project = _create_project(client, auth_headers)

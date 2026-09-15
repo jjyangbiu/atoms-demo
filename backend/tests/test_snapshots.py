@@ -191,11 +191,18 @@ class TestRetention:
         settings.snapshot_max_kept = 3
         project = _create_project(client, auth_headers)
         for i in range(1, 5):
-            script = [
-                {"tool_calls": [("write_file", {"path": "index.html", "content": f"v{i}"})]}, {"text": "ok"}
-            ]
             if i == 1:
-                script.insert(0, FIRST_BUILD_CLARIFY_STEP)
+                script = [
+                    FIRST_BUILD_CLARIFY_STEP,
+                    {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"},
+                ]
+            else:
+                # 后续轮必须产生真实改动才建快照（零改动轮不留档是硬闸语义）：先读后改
+                script = [
+                    {"tool_calls": [("read_file", {"path": "index.html"})]},
+                    {"tool_calls": [("edit_file", {"path": "index.html", "old_text": f"v{i - 1}", "new_text": f"v{i}"})]},
+                    {"text": "ok"},
+                ]
             _generate(client, auth_headers, project["id"], script, text=f"第 {i} 轮")
 
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()

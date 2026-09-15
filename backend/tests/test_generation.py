@@ -247,13 +247,17 @@ class TestThinkingStream:
         assert "thinking" in kinds
         thinking_row = next(m for m in messages if m["kind"] == "thinking")
         assert thinking_row["content"] == "先分析需求。"
-        assert messages[-1]["role"] == "engineer" and messages[-1]["content"] == "构建完成。"
+        # 硬输出闸：该轮无工具调用（磁盘零改动），持久化文本被系统无条件追加记录标注
+        assert messages[-1]["role"] == "engineer"
+        assert messages[-1]["content"].startswith("构建完成。")
+        assert "系统记录：本轮未产生文件改动" in messages[-1]["content"]
 
         # 迭代一轮：思考行不入模型上下文（与工具事件行同等对待）
         _stream_messages(client, auth_headers, project["id"], "改一下")
         second_call = [getattr(m, "content", "") for m in model.received_messages[-1]]
         assert not any("先分析需求" in c for c in second_call)
-        assert "构建完成。" in second_call
+        # 轮1回复带硬输出闸标注后缀，按子串匹配
+        assert any("构建完成。" in c for c in second_call)
 
     def test_text_events_stream_live_not_buffered(self):
         """打字机效果的前提：模型还在流式产出时，前面的增量就已外发（而非整段缓冲后一次性 flush）。"""

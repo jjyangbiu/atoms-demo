@@ -106,20 +106,32 @@ class FileSandbox:
             )
         count = current.count(old_text)
         if count == 1:
-            return self._write_to_disk(path, current.replace(old_text, new_text, 1))
-        if count > 1:
+            updated = current.replace(old_text, new_text, 1)
+        elif count > 1:
             raise SandboxViolation(
                 f"old_text 在 {path} 中出现 {count} 次，无法确定修改哪一处；"
                 f"请提供更多上下文使 old_text 唯一"
             )
-        # 精确匹配落空：尝试忽略空白/缩进差异的模糊匹配
-        match = _locate_ignoring_whitespace(current, old_text)
-        if match is None:
+        else:
+            # 精确匹配落空：尝试忽略空白/缩进差异的模糊匹配
+            match = _locate_ignoring_whitespace(current, old_text)
+            if match is None:
+                raise SandboxViolation(
+                    f"在 {path} 中未找到要替换的内容（含忽略空白差异的模糊匹配）；"
+                    f"请先 read_file 确认当前内容，逐字复制 old_text"
+                )
+            updated = current[: match.start()] + new_text + current[match.end() :]
+        if updated == current:
+            # 零 diff 空操作（诊断修复 H3）：old_text 与 new_text 相同（或替换结果
+            # 与原文一致）不得计为成功修改——否则 touched_files 非空、无 warning、
+            # 迭代日志记为有改动、快照照建，但文件内容零变化，与“口头完成”同症状。
             raise SandboxViolation(
-                f"在 {path} 中未找到要替换的内容（含忽略空白差异的模糊匹配）；"
-                f"请先 read_file 确认当前内容，逐字复制 old_text"
+                f"本次替换是空操作：{path} 替换前后内容完全相同，文件未发生任何改动。"
+                "请核实目标状态是否已存在于磁盘：若已存在，向用户说明现状"
+                "（不要使用『已修改/已生效』之类完成断言措辞）；"
+                "若不存在，提供真正产生差异的 new_text。"
             )
-        return self._write_to_disk(path, current[: match.start()] + new_text + current[match.end() :])
+        return self._write_to_disk(path, updated)
 
 
 def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:

@@ -89,3 +89,29 @@ class TestEditFileLayeredLocalization:
             sandbox.edit_file("index.html", "<h1>Hello</h1>", "<h1>Hi</h1>")
         # 文件未被修改
         assert target.read_text(encoding="utf-8") == "<h1>Hello</h1>"
+
+    def test_noop_edit_raises(self, sandbox):
+        """old_text == new_text 的零 diff 空操作 → 拒绝，不得计为成功修改。
+
+        诊断修复 H3：空操作若返回成功，touched_files 非空 → 无 warning、
+        迭代日志记为有改动、快照照建，但磁盘零变化——与“口头完成”同症状。
+        """
+        _seed(sandbox, "index.html", "<h1>工作日历</h1>")
+        with pytest.raises(SandboxViolation, match="空操作"):
+            sandbox.edit_file("index.html", "<h1>工作日历</h1>", "<h1>工作日历</h1>")
+        assert sandbox.read_file("index.html") == "<h1>工作日历</h1>"
+
+    def test_fuzzy_noop_edit_raises(self, sandbox):
+        """模糊匹配命中但替换结果与原文一致 → 同样拒绝（零 diff 不分定位路径）。
+
+        old_text 是跨行片段折叠成的单行（精确匹配落空、模糊命中），
+        new_text 恰好还原文件原样的跨行内容 → 替换后内容不变。
+        """
+        _seed(sandbox, "index.html", "    <h1>Hello</h1>\n    <p>World</p>")
+        with pytest.raises(SandboxViolation, match="空操作"):
+            sandbox.edit_file(
+                "index.html",
+                "<h1>Hello</h1> <p>World</p>",
+                "<h1>Hello</h1>\n    <p>World</p>",
+            )
+        assert sandbox.read_file("index.html") == "    <h1>Hello</h1>\n    <p>World</p>"
