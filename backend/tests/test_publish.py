@@ -14,7 +14,13 @@
 
 from fastapi.testclient import TestClient
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, confirm_first_build, login, use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
+    confirm_first_build,
+    login,
+    use_fake_model,
+)
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -26,7 +32,7 @@ def _generate_index(app, client, headers, content="<h1>时钟</h1>") -> dict:
         [
             FIRST_BUILD_CLARIFY_STEP,
             {"tool_calls": [("write_file", {"path": "index.html", "content": content})]},
-            {"text": "完成。"},
+            _turn_result_step(summary="完成。", changed_files=["index.html"]),
         ],
     )
     project = _create_project(client, headers)
@@ -75,7 +81,7 @@ class TestPublish:
                     ]
                 },
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "h1{color:red}"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html", "styles.css"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -110,14 +116,14 @@ class TestPublish:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
-                {"text": "第一版。"},
+                _turn_result_step(summary="第一版。", changed_files=["index.html"]),
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {
                     "tool_calls": [
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
                     ]
                 },
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -199,7 +205,7 @@ class TestPublish:
                     ]
                 },
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "h1{color:red}"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html", "styles.css"]),
             ],
         )
         project = _create_project(client, auth_headers)

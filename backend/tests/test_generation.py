@@ -9,6 +9,7 @@ from pathlib import Path
 
 from conftest import (
     FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
     confirm_first_build,
     seed_project_files,
     use_fake_model,
@@ -47,7 +48,10 @@ class TestGeneration:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>时钟</h1>"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "h1{color:red}"})]},
-                {"text": "已完成：一个包含入口页与样式的时钟应用。"},
+                _turn_result_step(
+                    summary="已完成：一个包含入口页与样式的时钟应用。",
+                    changed_files=["index.html", "styles.css"],
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -57,9 +61,9 @@ class TestGeneration:
         events = confirm_first_build(client, auth_headers, project["id"])
 
         types = [e["type"] for e in events]
-        # 事件序列：工具 start/done 成对 → 最终文本 → done（持久化完成后才发出，且是最后一个事件）
+        # 事件序列：工具 start/done 成对 → 产物卡片 → done（持久化完成后才发出，且是最后一个事件）
         assert types.count("tool") == 4
-        assert "text" in types and types[-1] == "done"
+        assert "turn_result" in types and types[-1] == "done"
         write_starts = [e for e in events if e["type"] == "tool" and e["status"] == "start"]
         assert [e["args"]["path"] for e in write_starts] == ["index.html", "styles.css"]
 
@@ -74,7 +78,7 @@ class TestGeneration:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -87,7 +91,9 @@ class TestGeneration:
         kinds = [m["kind"] for m in messages]
         assert "consensus" in kinds and "consensus_confirm" in kinds  # 澄清与确认门留痕可回看
         assert "event" in kinds  # 工具事件留痕
-        assert messages[-1]["role"] == "engineer" and messages[-1]["content"] == "构建完成。"
+        # 工程师轮以产物卡片收尾（工单 0024/0025）：总结在卡片里
+        assert messages[-1]["role"] == "engineer" and messages[-1]["kind"] == "turn_result"
+        assert json.loads(messages[-1]["content"])["summary"] == "构建完成。"
 
     def test_iteration_carries_history_and_file_listing(self, app, client, auth_headers):
         model = use_fake_model(
@@ -95,10 +101,10 @@ class TestGeneration:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "第一版完成。"},
+                _turn_result_step(summary="第一版完成。", changed_files=["index.html"]),
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -110,7 +116,9 @@ class TestGeneration:
         second_call = model.received_messages[-1]
         assert "index.html" in second_call[0].content
         contents = [getattr(m, "content", "") for m in second_call]
-        assert "第一版" in contents and "第一版完成。" in contents and "改一下" in contents
+        assert "第一版" in contents and "改一下" in contents
+        # 上一轮回复以轮次产物结论摘要的形式入上下文（工单 0024）
+        assert any("第一版完成。" in c for c in contents)
         # 增量修改生效
         assert (
             _project_dir(app.state.settings, project["id"]) / "index.html"
@@ -122,7 +130,11 @@ class TestGeneration:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "../../evil.html", "content": "bad"})]},
-                {"text": "尝试越界。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="尝试越界。",
+                    no_change_reason="越界写入被沙箱拒绝，磁盘无改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -140,7 +152,11 @@ class TestGeneration:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "app.exe", "content": "bad"})]},
-                {"text": "尝试写可执行文件。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="尝试写可执行文件。",
+                    no_change_reason="扩展名不在白名单，写入被拒绝，磁盘无改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -222,10 +238,13 @@ class TestThinkingStream:
         think = "".join(e["content"] for e in events if e["type"] == "thinking")
         text = "".join(e["content"] for e in events if e["type"] == "text")
         assert think == "先分析需求。"
-        assert text == "构建完成。"
-        # 结论（done 与落库文本）不残留思考标签与内容
+        # 首次尝试的结论原样流出；随后降级链回喂一次（流式伪模型无法调工具），
+        # 第二次尝试（脚本耗尽文本）同样外流——只断言首次结论在最前
+        assert text.startswith("构建完成。")
+        # 结论（done 与落库卡片）不残留思考标签与内容；兜底卡片以首段散文作 summary
         assert events[-1]["type"] == "done"
         assert events[-1]["text"] == "构建完成。"
+        assert events[-1]["verdict"] == "fallback"
 
     def test_thinking_persisted_and_excluded_from_context(self, app, client, auth_headers):
         model = FakeStreamingModel(
@@ -247,16 +266,19 @@ class TestThinkingStream:
         assert "thinking" in kinds
         thinking_row = next(m for m in messages if m["kind"] == "thinking")
         assert thinking_row["content"] == "先分析需求。"
-        # 硬输出闸：该轮无工具调用（磁盘零改动），持久化文本被系统无条件追加记录标注
+        # 流式伪模型无法走唯一出口：降级链兜底为产物卡片（工单 0025），
+        # 首段散文作 summary，正文不再被追加任何标注文案
         assert messages[-1]["role"] == "engineer"
-        assert messages[-1]["content"].startswith("构建完成。")
-        assert "系统记录：本轮未产生文件改动" in messages[-1]["content"]
+        assert messages[-1]["kind"] == "turn_result"
+        card = json.loads(messages[-1]["content"])
+        assert card["summary"] == "构建完成。"
+        assert card["consistency"] == "fallback"
 
         # 迭代一轮：思考行不入模型上下文（与工具事件行同等对待）
         _stream_messages(client, auth_headers, project["id"], "改一下")
         second_call = [getattr(m, "content", "") for m in model.received_messages[-1]]
         assert not any("先分析需求" in c for c in second_call)
-        # 轮1回复带硬输出闸标注后缀，按子串匹配
+        # 轮1结论以轮次产物摘要的形式入上下文，按子串匹配
         assert any("构建完成。" in c for c in second_call)
 
     def test_text_events_stream_live_not_buffered(self):

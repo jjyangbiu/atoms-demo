@@ -9,7 +9,7 @@
 任何测试不得调用真实 MiniMax API。
 """
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, _turn_result_step, parse_sse, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 from test_team_tickets import BREAK_STEP, _confirm_tickets
@@ -20,7 +20,7 @@ SPEC_TEXT = "# 番茄钟 需求规格\n\n## 目标\n做一个番茄钟。"
 
 ENGINEER_BUILD_STEPS = [
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-    {"text": "已按规格完成。"},
+    _turn_result_step(summary="已按规格完成。", changed_files=["index.html"]),
 ]
 
 
@@ -290,7 +290,11 @@ class TestTeamPipelineQuota:
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
                 *ENGINEER_BUILD_STEPS,
-                {"text": "迭代完成。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮无文件改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")

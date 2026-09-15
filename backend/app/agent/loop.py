@@ -11,7 +11,7 @@
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -105,68 +105,9 @@ def summarize_args(args: dict) -> dict:
     return summary
 
 
-# 完成断言词：模型在文本里出现这些词、却没有任何成功的修改类工具调用时，视为“口头完成”幻觉，
-# 触发一次反思回喂（诊断修复：迭代轮模型不调工具就声称改完了，文件其实没动）。
-# 只覆盖中文强断言短语，避免误伤“ok”“无改动”这类合法闲聊/说明。
-COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
-    "已完成", "已修改", "已更新", "已改好", "已改完", "已经修改", "已经更新",
-    "已经完成", "已经改好", "改好了", "改完了", "修改完毕", "修改完成",
-    "更新完毕", "更新完成", "完成修改", "完成更新", "完成了修改", "完成了更新",
-)
-
-# 泛化断言句式（诊断修复 H2）：固定词表穷举不尽实际措辞——“已将标题替换为…”
-# “改动已生效”“已经帮你调整…”等都曾绕过守卫。按句式族正则补充：
-# - “已/已经”前缀族：24 字内（不跨标点，避免误伤“如果你已确认，我就开始修改”
-#   这类条件句）出现改动类动词即视为断言；
-# - 后缀族：改动类动词 + 完成/完毕/搞定/生效，或 改/更新/… + 好了/完了。
-# 宁可偶有误报（多一次反思回喂，模型说明理由即可退出），不可漏报口头完成。
-COMPLETION_CLAIM_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"已(?:经)?[^。，；！？!?\n]{0,24}?"
-        r"(?:修改|更新|替换|调整|改为|换成|改好|改完|添加|加上|删除|移除|优化|重构|修复|完成|搞定|生效|改)"
-    ),
-    re.compile(r"(?:修改|更新|替换|调整|优化|重构|修复|改动|变更)(?:已经|已)?(?:完成|完毕|搞定|生效)"),
-    re.compile(r"(?:改|更新|修改|替换|调整|修复)(?:好了|完了|好啦|完啦)"),
-    re.compile(r"(?:完成|搞定)了?(?:修改|更新|替换|调整|改动|修复)"),
-)
-
-
-def claims_completion(text: str) -> bool:
-    """文本是否含“已完成/已修改”一类的强断言（固定词表 + 泛化句式族）。"""
-    if any(p in text for p in COMPLETION_CLAIM_PATTERNS):
-        return True
-    return any(r.search(text) for r in COMPLETION_CLAIM_RES)
-
-
-def _build_reflection_message(modification_tools: set[str]) -> str:
-    tools_hint = "/".join(sorted(modification_tools))
-    return (
-        "系统检查：你上一条回复声称已完成修改，但本轮从未成功调用过 "
-        f"{tools_hint} 工具，磁盘上没有任何文件被改动。"
-        "请立即用 read_file 读取相关文件确认现状，再用 edit_file 完成实际改动。"
-        "如果你认为目标状态已经存在于磁盘（例如改动已在上一轮生效），"
-        "同样必须先 read_file 核实，并在回复中引用你读到的文件内容作为依据；"
-        "系统记录显示此前轮次是否有实际改动，仅凭对话记忆断言『已生效』不会被接受。"
-        "如果确实无需改动（例如用户只是询问、闲聊），请明确说明理由，"
-        "不要使用『已完成/已修改/已更新』之类的措辞。"
-    )
-
-
-def _build_facts_message(facts: str) -> str:
-    """升级链第二级：系统直读磁盘的硬事实注入（非劝说，是权威数据）。
-
-    口头完成第二次出现时，不再依赖模型"听话"，而是把系统刚从磁盘读取的
-    文件实际内容与历轮实际改动记录摆到模型面前：记忆与磁盘谁真谁假一目了然，
-    模型要么据实修改，要么逐字引用磁盘内容证明目标状态已存在。
-    """
-    return (
-        "系统核查：你再次声称修改已完成/已生效，但本轮磁盘上没有发生任何文件改动。"
-        "不要复述对话记忆——以下是系统刚刚直接从磁盘读取的实际状态"
-        "（权威事实，覆盖你的一切记忆）：\n\n"
-        f"{facts}\n\n"
-        "若用户要求的目标状态不在上述内容中，立即调用 edit_file 完成实际修改；"
-        "若确实已存在，在回复中逐字引用对应片段作为依据。"
-    )
+# 完成断言的中文措辞检测（固定短语表 + 正则族 + 三级升级链）已于工单 0025 整体退役：
+# 对措辞的猜测被自洽性核验取代——比对声明改动与磁盘真实改动，纯集合运算，不看措辞。
+# 循环只保留一个通用的收尾钩子 final_text_hook，由路由层注入核验与降级链逻辑。
 
 
 async def _attempt_stream(bound, messages: list, holder: dict) -> AsyncIterator[AgentEvent]:
@@ -204,27 +145,21 @@ async def run_generation(
     user_text: str,
     max_steps: int = 20,
     max_retries: int = 2,
-    modification_tools: set[str] | None = None,
-    fact_provider=None,
+    final_text_hook: Callable[[str], str | None] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """执行一轮生成：模型 ⇄ 工具循环直至模型给出最终文本。
 
     history 为 langchain 消息列表（不含本轮用户输入）。
     tool_executor 签名：(tools, name, args) -> (是否成功, 结果文本)。
-    modification_tools：会被视为“修改文件”的工具名集合（如 {"write_file", "edit_file"}）。
-      传入时开启“口头完成”升级链：模型未成功调用任何修改类工具却在文本里声称
-      “已完成/已修改”时——
-      第 1 次：回喂反思消息，要求 read_file 举证或实际修改；
-      第 2 次：经 fact_provider() 取系统直读磁盘的硬事实（文件当前内容 +
-               历轮实际改动记录）注入，让模型面对权威数据而非自己的记忆；
-      第 3 次：不再纠缠，直接收尾——用户可见输出的真实性由路由层的
-               无条件核验标注兜底（硬闸在系统侧，不依赖模型配合）。
-    fact_provider：无参可调用，返回磁盘事实文本（空串视为无事实可注入）。
+    final_text_hook：收尾钩子（工单 0025 / ADR 0005 降级链的路由层注入点）。
+      模型未调任何工具、试图以普通文本收尾时在发出 done 之前调用，入参是
+      洗去思考块的最终文本；返回一段文本则作为回喂消息注入并继续循环
+      （回喂决策与次数上限由钩子自己掌握），返回 None 则照常以 done 收尾。
+      钩子也可以抛出路由层的控制流信号（如轮次产物终结出口的
+      _SubmitTurnResultInvoked），异常沿生成器向上传播、由调用方捕获。
     """
     bound = model.bind_tools(tools) if hasattr(model, "bind_tools") else model
     messages = [SystemMessage(content=system_prompt), *history, HumanMessage(content=user_text)]
-    modified_any = False  # 本轮内是否有一次成功的修改类工具调用
-    claim_endings = 0  # 零改动却声称完成的收尾次数（升级链阶段计数）
 
     for _ in range(max_steps):
         # 单步模型调用（含重试）：事件实时外发，前端才有打字机效果；
@@ -254,27 +189,12 @@ async def run_generation(
         if not tool_calls:
             # 最终文本洗去思考块：流式增量里已拆走，这里是兜底（如非流式回退）
             final_text = strip_think_blocks(getattr(msg, "content", "") or "")
-            # 口头完成升级链：零改动 + 断言措辞 → 反思 → 磁盘事实注入 → 放行收尾
-            if (
-                modification_tools
-                and not modified_any
-                and claims_completion(final_text)
-            ):
-                claim_endings += 1
-                if claim_endings == 1:
+            if final_text_hook is not None:
+                feedback = final_text_hook(final_text)
+                if feedback is not None:
                     messages.append(msg)
-                    messages.append(
-                        HumanMessage(content=_build_reflection_message(modification_tools))
-                    )
+                    messages.append(HumanMessage(content=feedback))
                     continue
-                if claim_endings == 2 and fact_provider is not None:
-                    facts = fact_provider()
-                    if facts:
-                        messages.append(msg)
-                        messages.append(
-                            HumanMessage(content=_build_facts_message(facts))
-                        )
-                        continue
             yield AgentEvent("done", {"text": final_text})
             return
 
@@ -292,8 +212,6 @@ async def run_generation(
                     "result": result[:500],
                 },
             )
-            if ok and modification_tools and name in modification_tools:
-                modified_any = True
             messages.append(ToolMessage(content=result, tool_call_id=call_id))
 
     yield AgentEvent("error", {"detail": f"智能体超过最大步数（{max_steps}）仍未完成"})

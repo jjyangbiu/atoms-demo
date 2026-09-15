@@ -18,6 +18,7 @@ from app.rag.seeds import SEED_TEMPLATES
 from app.rag.store import get_knowledge_store
 from conftest import (
     FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
     confirm_first_build,
     use_fake_embeddings,
     use_fake_model,
@@ -66,7 +67,7 @@ class TestSearchTemplatesTool:
                         ("write_file", {"path": "index.html", "content": "<h1>记账</h1>"})
                     ]
                 },
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -97,7 +98,7 @@ class TestSearchTemplatesTool:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -129,7 +130,7 @@ class TestWorldSemanticSearch:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>私</h1>"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -179,7 +180,11 @@ class TestPublishSinkLoop:
             app,
             [
                 {"tool_calls": [("search_templates", {"query": "记账"})]},
-                {"text": "完成。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="完成。",
+                    no_change_reason="本轮仅检索参考，无文件改动。",
+                ),
             ],
         )
         _stream_messages(client, auth_headers, project["id"], "参考已有应用再聊聊")

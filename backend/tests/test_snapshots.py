@@ -16,6 +16,7 @@ from app.config import Settings
 from app.main import create_app
 from conftest import (
     FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
     confirm_first_build,
     login,
     use_fake_model,
@@ -45,12 +46,12 @@ class TestSnapshotCreation:
             client, auth_headers, project["id"],
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, _turn_result_step(summary="ok", changed_files=["index.html"])
             ],
         )
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("read_file", {"path": "index.html"})]}, {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]}, {"text": "ok"}],
+            [{"tool_calls": [("read_file", {"path": "index.html"})]}, {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]}, _turn_result_step(summary="ok", changed_files=["index.html"])],
         )
 
         resp = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers)
@@ -78,7 +79,7 @@ class TestSnapshotCreation:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html", "styles.css"]),
             ],
         )
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
@@ -102,7 +103,7 @@ class TestSnapshotCreation:
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 # 智能体不得写入快照存放区
                 {"tool_calls": [("write_file", {"path": "snapshots/evil.html", "content": "bad"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         assert any(e["type"] == "tool" and e["status"] == "error" for e in events)
@@ -120,7 +121,7 @@ class TestRollback:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "extra.html", "content": "extra"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html", "extra.html"]),
             ],
         )
         _generate(
@@ -128,7 +129,7 @@ class TestRollback:
             [
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
@@ -153,7 +154,7 @@ class TestRollback:
             [
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v3"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         read_done = [e for e in events if e["type"] == "tool" and e.get("status") == "done" and e["name"] == "read_file"]
@@ -173,7 +174,7 @@ class TestRollback:
             client, auth_headers, project["id"],
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, _turn_result_step(summary="ok", changed_files=["index.html"])
             ],
         )
         snap_id = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]["id"]
@@ -194,14 +195,14 @@ class TestRetention:
             if i == 1:
                 script = [
                     FIRST_BUILD_CLARIFY_STEP,
-                    {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"},
+                    {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, _turn_result_step(summary="ok", changed_files=["index.html"]),
                 ]
             else:
                 # 后续轮必须产生真实改动才建快照（零改动轮不留档是硬闸语义）：先读后改
                 script = [
                     {"tool_calls": [("read_file", {"path": "index.html"})]},
                     {"tool_calls": [("edit_file", {"path": "index.html", "old_text": f"v{i - 1}", "new_text": f"v{i}"})]},
-                    {"text": "ok"},
+                    _turn_result_step(summary="ok", changed_files=["index.html"]),
                 ]
             _generate(client, auth_headers, project["id"], script, text=f"第 {i} 轮")
 
@@ -218,7 +219,7 @@ class TestRetention:
             client, auth_headers, project["id"],
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"}
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, _turn_result_step(summary="ok", changed_files=["index.html"])
             ],
         )
         assert client.delete(f"/api/projects/{project['id']}", headers=auth_headers).status_code == 204
@@ -232,7 +233,7 @@ class TestFileContent:
             client, auth_headers, project["id"],
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]}, {"text": "ok"}
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>hi</h1>"})]}, _turn_result_step(summary="ok", changed_files=["index.html"])
             ],
         )
         resp = client.get(f"/api/projects/{project['id']}/files/index.html", headers=auth_headers)
@@ -264,7 +265,7 @@ class TestFileContent:
             rel_app,
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>rel</h1>"})]}, {"text": "ok"},
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>rel</h1>"})]}, _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         rel_client = TestClient(rel_app)
@@ -289,7 +290,7 @@ class TestSnapshotDiff:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         snap = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]
@@ -312,7 +313,7 @@ class TestSnapshotDiff:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html", "styles.css"]),
             ],
         )
         # 迭代：只改 index.html、新增 app.js；styles.css 不动
@@ -322,7 +323,7 @@ class TestSnapshotDiff:
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"tool_calls": [("write_file", {"path": "app.js", "content": "// js"})]},
-                {"text": "ok"},
+                _turn_result_step(summary="ok", changed_files=["index.html", "app.js"]),
             ],
         )
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
@@ -344,7 +345,7 @@ class TestSnapshotDiff:
             client, auth_headers, project["id"],
             [
                 FIRST_BUILD_CLARIFY_STEP,
-                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"},
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, _turn_result_step(summary="ok", changed_files=["index.html"]),
             ],
         )
         snap_id = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]["id"]

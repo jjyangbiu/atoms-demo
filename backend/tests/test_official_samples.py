@@ -18,19 +18,20 @@ from app.official_samples import (
     OFFICIAL_USERNAME,
     seed_official_samples,
 )
-from conftest import FIRST_BUILD_CLARIFY_STEP, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, _turn_result_step, use_fake_model
 from test_world import _register_and_login
 
-# 每个示例消耗一段“澄清收敛 → 确认后首轮生成（写文件→收尾）→ 迭代（局部改→收尾）”
-# 脚本，乘上示例数供整轮灌入使用——与灌入实现的对话链路一一对应（工单 0015），
-# 澄清与迭代环节同样在回归覆盖内。
+# 每个示例消耗一段“澄清收敛 → 确认后首轮生成（写文件→终结出口）→ 迭代（局部改→终结出口）”
+# 脚本，乘上示例数供整轮灌入使用——与灌入实现的对话链路一一对应（工单 0015/0025），
+# 澄清与迭代环节同样在回归覆盖内。工程师轮以 submit_turn_result 收尾（工单 0024），
+# 申报与磁盘真实改动一致，自洽性核验一次通过。
 _ONE_SAMPLE_SCRIPT = [
     FIRST_BUILD_CLARIFY_STEP,
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>示例</h1>"})]},
-    {"text": "已完成。"},
+    _turn_result_step(summary="已完成。", changed_files=["index.html"]),
     {"tool_calls": [("read_file", {"path": "index.html"})]},
     {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "示例", "new_text": "官方示例"})]},
-    {"text": "已调整。"},
+    _turn_result_step(summary="已调整。", changed_files=["index.html"]),
 ]
 
 

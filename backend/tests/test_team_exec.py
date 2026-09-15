@@ -11,7 +11,7 @@
 
 import json
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, _turn_result_step, parse_sse, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 from test_team_tickets import (
@@ -24,11 +24,11 @@ from test_team_tickets import (
 
 TICKET1_STEPS = [
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>骨架</h1>"})]},
-    {"text": "骨架页面已完成。"},
+    _turn_result_step(summary="骨架页面已完成。", changed_files=["index.html"]),
 ]
 TICKET2_STEPS = [
     {"tool_calls": [("write_file", {"path": "timer.js", "content": "// 计时核心"})]},
-    {"text": "计时核心已完成。"},
+    _turn_result_step(summary="计时核心已完成。", changed_files=["timer.js"]),
 ]
 
 # 工单 2 的模型调用失败：重试三步全抛（未外发内容时每步都会重试，见 loop.run_generation），
@@ -162,9 +162,14 @@ class TestSerialExecution:
         payloads = [json.loads(m["content"]) for m in ticket_rows]
         assert [(p["seq"], p["status"]) for p in payloads] == [(1, "done"), (2, "done")]
         assert payloads[0]["snapshot_rev"] == 1 and payloads[1]["snapshot_rev"] == 2
-        # 每单的工程师结论也在历史里
-        texts = [m["content"] for m in messages if m["kind"] == "text" and m["role"] == "engineer"]
-        assert "骨架页面已完成。" in texts and "计时核心已完成。" in texts
+        # 每单的工程师结论也在历史里：以轮次产物卡片留痕（工单 0024/0025，不再有纯文本行）
+        cards = [
+            json.loads(m["content"])
+            for m in messages
+            if m["kind"] == "turn_result" and m["role"] == "engineer"
+        ]
+        summaries = [c["summary"] for c in cards]
+        assert "骨架页面已完成。" in summaries and "计时核心已完成。" in summaries
 
 
 class TestFailureAndRetry:
@@ -281,7 +286,11 @@ class TestExecQuota:
                 *TICKET1_STEPS,
                 *TICKET2_FAIL_STEPS,
                 *TICKET2_STEPS,
-                {"text": "迭代完成。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮仅确认，无文件改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")

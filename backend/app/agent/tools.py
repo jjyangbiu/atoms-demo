@@ -134,12 +134,11 @@ class FileSandbox:
             updated = current[: match.start()] + new_text + current[match.end() :]
         if updated == current:
             # 零 diff 空操作（诊断修复 H3）：old_text 与 new_text 相同（或替换结果
-            # 与原文一致）不得计为成功修改——否则 touched_files 非空、无 warning、
-            # 迭代日志记为有改动、快照照建，但文件内容零变化，与“口头完成”同症状。
+            # 与原文一致）不得计为成功修改——否则 touched_files 非空、迭代日志记为
+            # 有改动、快照照建，但文件内容零变化。
             raise SandboxViolation(
                 f"本次替换是空操作：{path} 替换前后内容完全相同，文件未发生任何改动。"
-                "请核实目标状态是否已存在于磁盘：若已存在，向用户说明现状"
-                "（不要使用『已修改/已生效』之类完成断言措辞）；"
+                "请核实目标状态是否已存在于磁盘：若已存在，向用户说明现状；"
                 "若不存在，提供真正产生差异的 new_text。"
             )
         return self._write_to_disk(path, updated)
@@ -323,8 +322,9 @@ def parse_turn_result_payload(raw: str) -> tuple[dict | None, str]:
     约束：JSON 对象；intent 限于 TURN_RESULT_INTENTS；summary 一律非空（卡片主文案）；
     changed_files 可缺省（视为空数组），给出则须为非空路径字符串数组（只到文件级，
     区域级留给后续裁判，工单 0028）；no_change 意图在 summary 之外还须附
-    no_change_reason（无需改动的理由）。声明的改动文件仅供后续自洽性核验（工单 0025），
-    卡片清单一律以磁盘真实改动为权威（工单 0022 成果），不采信这里的申报。
+    no_change_reason（无需改动的理由）。声明的改动文件供自洽性核验（工单 0025）：
+    提交时与磁盘真实改动比对，失配把精确差异回喂一次；卡片清单一律以磁盘真实
+    改动为权威（工单 0022 成果），不采信这里的申报。
     """
     try:
         data = json.loads(raw)

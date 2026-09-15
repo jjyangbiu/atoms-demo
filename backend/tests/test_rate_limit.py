@@ -18,9 +18,14 @@ import threading
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
-from conftest import seed_project_files, use_fake_model
+from conftest import _turn_result_step, seed_project_files, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
+
+_NO_CHANGE_STEP = _turn_result_step(
+    intent="no_change", summary="完成", no_change_reason="本轮无文件改动。"
+)
+"""共享脚本步：零改动迭代轮以 no_change 终结出口自洽收尾（工单 0024/0025）。"""
 
 
 class FakeClock:
@@ -89,7 +94,7 @@ class TestUserHourlyLimit:
     def test_exceed_quota_returns_429_with_retry_info(self, app, client, auth_headers):
         _use_clock(app)
         app.state.rate_limiter.per_user_hourly = 2
-        use_fake_model(app, [{"text": "完成"}] * 3)
+        use_fake_model(app, [_NO_CHANGE_STEP] * 3)
         project = _create_project(client, auth_headers)
         # 预置文件：迭代消息按次计数（首建流水线名额语义见 test_clarification）
         seed_project_files(app, project["id"])
@@ -117,7 +122,7 @@ class TestUserHourlyLimit:
     def test_window_slides_with_controllable_clock(self, app, client, auth_headers):
         clock = _use_clock(app)
         app.state.rate_limiter.per_user_hourly = 1
-        use_fake_model(app, [{"text": "完成"}] * 3)
+        use_fake_model(app, [_NO_CHANGE_STEP] * 3)
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"])
 
@@ -148,7 +153,7 @@ class TestUserHourlyLimit:
     def test_rejected_request_does_not_consume_quota(self, app, client, auth_headers):
         clock = _use_clock(app)
         app.state.rate_limiter.per_user_hourly = 1
-        use_fake_model(app, [{"text": "完成"}] * 2)
+        use_fake_model(app, [_NO_CHANGE_STEP] * 2)
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"])
 
@@ -176,9 +181,13 @@ class TestTeamModeLimits:
         use_fake_model(
             app,
             [
-                {"text": "迭代完成。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮无文件改动。",
+                ),
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-                {"text": "实现完成。"},
+                _turn_result_step(summary="实现完成。", changed_files=["index.html"]),
             ],
         )
 
@@ -307,7 +316,7 @@ class TestLimitConfiguration:
         app.state.rate_limiter.per_user_hourly = 0
         app.state.rate_limiter.max_concurrent = 0
         _use_clock(app)
-        use_fake_model(app, [{"text": "完成"}] * 3)
+        use_fake_model(app, [_NO_CHANGE_STEP] * 3)
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"])
         for i in range(3):

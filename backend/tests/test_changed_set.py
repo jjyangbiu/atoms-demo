@@ -3,13 +3,15 @@
 两个接缝（工单 0022 预定）：
 - 沙箱单元：FileSandbox 记录本轮真实改动的文件集（与「本轮已读文件集」同构）；
   编辑失败、被闸门拒绝、零 diff 空操作均不计入。
-- fake 模型集成：留档快照、迭代日志、无改动警告三处硬闸由轮前/轮后磁盘指纹
+- fake 模型集成：留档快照、迭代日志、自洽性核验三处硬闸由轮前/轮后磁盘指纹
   比对驱动——权威来源是磁盘状态，不再解析流式事件的参数字段。
+  （原第三闸「无改动警告」的 warning/no_change 字段已随措辞机器退役，
+  轮次结局由收尾事件的核验结论 verdict 表达，工单 0025。）
 任何测试不得调用真实 MiniMax API。
 """
 
 import pytest
-from conftest import seed_project_files, use_fake_model
+from conftest import _turn_result_step, seed_project_files, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -129,7 +131,7 @@ class TestChangedSetDrivesGates:
                         ("edit_file", {"path": "index.html", "old_text": "v2", "new_text": "v2"})
                     ]
                 },
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -141,9 +143,10 @@ class TestChangedSetDrivesGates:
         # 迭代日志：只记磁盘真实改动的 index.html
         log = _load_log(app, project["id"])
         assert log[-1]["files"] == ["index.html"]
-        # 无改动警告不触发（磁盘确有改动）
+        # 申报与磁盘一致：核验结论为自洽，done 不携已退役的 warning/no_change 字段
         done_events = [e for e in events if e["type"] == "done"]
-        assert done_events and "warning" not in done_events[-1]
+        assert done_events and done_events[-1].get("verdict") == "consistent"
+        assert "warning" not in done_events[-1] and "no_change" not in done_events[-1]
         # 留档快照照建（有真实改动）
         resp = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers)
         assert len(resp.json()) == 1
@@ -151,7 +154,7 @@ class TestChangedSetDrivesGates:
     def test_all_edits_failed_round_is_no_change(
         self, app, settings, client, auth_headers
     ):
-        """工具调了但全失败：磁盘零改动 → 警告 + no_change + 不建快照。"""
+        """工具调了但全失败：磁盘零改动 → 自报 no_change 自洽收尾 + 不建快照。"""
         use_fake_model(
             app,
             [
@@ -161,7 +164,11 @@ class TestChangedSetDrivesGates:
                         ("edit_file", {"path": "index.html", "old_text": "不存在", "new_text": "x"})
                     ]
                 },
-                {"text": "本轮说明。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="本轮说明。",
+                    no_change_reason="编辑未命中目标内容，磁盘无改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -170,8 +177,10 @@ class TestChangedSetDrivesGates:
 
         done_events = [e for e in events if e["type"] == "done"]
         assert done_events, "应以 done 事件收尾"
-        assert done_events[-1].get("warning") == "本轮未产生任何文件改动"
-        assert done_events[-1].get("no_change") is True
+        # 轮次结局由核验结论表达：零改动 + 申报零改动 = 自洽的合法结局
+        assert done_events[-1].get("verdict") == "consistent"
+        assert done_events[-1]["artifact"]["changed_files"] == []
+        assert "warning" not in done_events[-1] and "no_change" not in done_events[-1]
         log = _load_log(app, project["id"])
         assert log[-1]["files"] == []
         # 零改动轮不留档（硬闸）
@@ -204,7 +213,9 @@ class TestChangedSetDrivesGates:
                         )
                     ]
                 },
-                {"text": "两个文件都已更新。"},
+                _turn_result_step(
+                    summary="两个文件都已更新。", changed_files=["index.html", "styles.css"]
+                ),
             ],
         )
         project = _create_project(client, auth_headers)

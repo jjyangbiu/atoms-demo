@@ -127,3 +127,37 @@ def seed_project_files(app, project_id, files: dict[str, str] | None = None) -> 
                 )
             )
         session.commit()
+
+
+# --- 工程师轮终结出口的共享脚本步（规格 0021「共享脚本步常量」房规，工单 0024/0025） ---
+
+
+def _turn_result_step(
+    intent: str = "modify_code",
+    summary: str = "已把标题改为深色主题。",
+    changed_files: list[str] | None = None,
+    no_change_reason: str = "",
+) -> dict:
+    """伪模型脚本步：调用 submit_turn_result 提交轮次产物（共享脚本步房规）。"""
+    payload = {
+        "intent": intent,
+        "summary": summary,
+        "changed_files": changed_files if changed_files is not None else [],
+        "no_change_reason": no_change_reason,
+    }
+    return {
+        "tool_calls": [
+            ("submit_turn_result", {"payload": json.dumps(payload, ensure_ascii=False)})
+        ]
+    }
+
+
+EDIT_STEPS = [
+    {"tool_calls": [("read_file", {"path": "index.html"})]},
+    {
+        "tool_calls": [
+            ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
+        ]
+    },
+]
+"""伪模型脚本步：一次真实成功的文件编辑（种子文件 index.html 内容 v1 → v2）。"""

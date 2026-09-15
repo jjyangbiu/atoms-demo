@@ -15,7 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, seed_project_files, use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
+    parse_sse,
+    seed_project_files,
+    use_fake_model,
+)
 from fake_model import FakeStreamingModel
 from test_generation import _stream_messages
 from test_projects import _create_project
@@ -56,7 +62,7 @@ class TestClarifyRouting:
                 {"text": "❓ Q1 - 配色：深色还是浅色？\n➤ 推荐：深色"},
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>时钟</h1>"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -117,7 +123,7 @@ class TestConsensusGate:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>时钟</h1>"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -147,7 +153,7 @@ class TestConsensusGate:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "红"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -165,7 +171,7 @@ class TestConsensusGate:
                 {"tool_calls": [("start_build", {"requirements_summary": "共识一：浅色主题。"})]},
                 {"tool_calls": [("start_build", {"requirements_summary": "共识二：深色主题。"})]},
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "深色"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -197,7 +203,7 @@ class TestConsensusGate:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "ok"})]},
-                {"text": "构建完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -236,8 +242,12 @@ class TestQuotaSemantics:
                 {"text": "❓ Q1 - 配色？\n➤ 推荐：深色"},
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "ok"})]},
-                {"text": "构建完成。"},
-                {"text": "迭代完成。"},
+                _turn_result_step(summary="构建完成。", changed_files=["index.html"]),
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮仅确认，无文件改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -272,7 +282,7 @@ class TestExistingFilesSkipClarify:
             [
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)

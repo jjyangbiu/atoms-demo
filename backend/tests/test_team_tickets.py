@@ -12,7 +12,7 @@
 
 import json
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, parse_sse, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, _turn_result_step, parse_sse, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 
@@ -55,12 +55,12 @@ BREAK_STEP = {"tool_calls": [("submit_tickets", {"tickets": TICKETS_PAYLOAD})]}
 
 SECOND_BREAK_STEP = {"tool_calls": [("submit_tickets", {"tickets": SECOND_TICKETS_PAYLOAD})]}
 
-# 清单确认后的检查点串行执行（工单 0018）：两张工单各两步（写文件 + 收尾文本）
+# 清单确认后的检查点串行执行（工单 0018）：两张工单各两步（写文件 + 终结出口）
 EXEC_STEPS = [
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-    {"text": "工单 1 完成。"},
+    _turn_result_step(summary="工单 1 完成。", changed_files=["index.html"]),
     {"tool_calls": [("write_file", {"path": "timer.js", "content": "// 计时"})]},
-    {"text": "工单 2 完成。"},
+    _turn_result_step(summary="工单 2 完成。", changed_files=["timer.js"]),
 ]
 
 
@@ -296,7 +296,11 @@ class TestTicketsConfirm:
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
                 *EXEC_STEPS,
-                {"text": "已调整。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="已调整。",
+                    no_change_reason="本轮无文件改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -367,7 +371,11 @@ class TestTeamTicketsQuota:
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
                 *EXEC_STEPS,
-                {"text": "迭代完成。"},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮无文件改动。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")

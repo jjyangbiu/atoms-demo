@@ -9,7 +9,7 @@
 任何测试不得调用真实 MiniMax API。
 """
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, use_fake_model
+from conftest import FIRST_BUILD_CLARIFY_STEP, _turn_result_step, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 from test_team_exec import TICKET1_STEPS, TICKET2_FAIL_STEPS, TICKET2_STEPS, _confirm_tickets, _resume_tickets
@@ -203,7 +203,18 @@ class TestRollbackResumeQuota:
         app.state.rate_limiter.clock = clock
         app.state.rate_limiter.per_user_hourly = 1
         project, _ = _full_exec(
-            app, client, auth_headers, [*EXEC_SCRIPT, *TICKET2_STEPS, {"text": "迭代完成。"}]
+            app,
+            client,
+            auth_headers,
+            [
+                *EXEC_SCRIPT,
+                *TICKET2_STEPS,
+                _turn_result_step(
+                    intent="no_change",
+                    summary="迭代完成。",
+                    no_change_reason="本轮无文件改动。",
+                ),
+            ],
         )
         pid = project["id"]
 

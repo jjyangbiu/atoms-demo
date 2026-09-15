@@ -3,8 +3,9 @@
 两个接缝（沿用 0022 既定接缝）：
 - 解析器单测：parse_turn_result_payload / recover_turn_result_payload
   （app.agent.tools 的公共函数，同 parse_clarify_payload 房规）；
-- fake 模型集成：HTTP API 层走 _engineer_stream，覆盖正常出口、
-  正文 JSON 恢复、散文兜底三条路径。
+- fake 模型集成：HTTP API 层走 _engineer_stream，覆盖正常出口、正文 JSON
+  恢复、散文兜底卡片（0025 降级链）三条路径；申报与磁盘的自洽性核验
+  专项测试见 tests/test_self_consistency.py。
 任何测试不得调用真实 MiniMax API。
 """
 
@@ -12,7 +13,9 @@ import json
 
 import pytest
 from conftest import (
+    EDIT_STEPS,
     FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
     confirm_first_build,
     seed_project_files,
     use_fake_model,
@@ -22,37 +25,6 @@ from test_generation import _stream_messages
 from test_projects import _create_project
 from test_team_exec import _confirm_tickets
 from test_team_tickets import SPEC_TEXT, TICKETS_PAYLOAD, _confirm_consensus, _confirm_spec
-
-
-def _turn_result_step(
-    intent: str = "modify_code",
-    summary: str = "已把标题改为深色主题。",
-    changed_files: list[str] | None = None,
-    no_change_reason: str = "",
-) -> dict:
-    """伪模型脚本步：调用 submit_turn_result 提交轮次产物（共享脚本步房规）。"""
-    payload = {
-        "intent": intent,
-        "summary": summary,
-        "changed_files": changed_files if changed_files is not None else [],
-        "no_change_reason": no_change_reason,
-    }
-    return {
-        "tool_calls": [
-            ("submit_turn_result", {"payload": json.dumps(payload, ensure_ascii=False)})
-        ]
-    }
-
-
-EDIT_STEPS = [
-    {"tool_calls": [("read_file", {"path": "index.html"})]},
-    {
-        "tool_calls": [
-            ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
-        ]
-    },
-]
-"""伪模型脚本步：一次真实成功的文件编辑（磁盘产生改动）。"""
 
 
 class TestTurnResultExit:
@@ -65,7 +37,9 @@ class TestTurnResultExit:
             app,
             [
                 *EDIT_STEPS,
-                # 谎报改动清单：卡片必须以磁盘真实改动为权威（0022 成果）
+                # 谎报改动清单：失配回喂一次后仍谎报 → 卡片以磁盘真实改动为权威
+                # （0022 成果），核验结论以结构化字段标注（0025）
+                _turn_result_step(changed_files=["styles.css", "phantom.html"]),
                 _turn_result_step(changed_files=["styles.css", "phantom.html"]),
             ],
         )
@@ -87,11 +61,14 @@ class TestTurnResultExit:
         assert messages[-1]["kind"] == "turn_result"
         card = json.loads(messages[-1]["content"])
         assert card["intent"] == "modify_code"
+        # summary 保持模型原文：核验结论走结构化字段，不再追加说明文案（0025）
         assert card["summary"] == "已把标题改为深色主题。"
         # 改动清单以磁盘为权威：谎报的 styles.css/phantom.html 不得出现
         assert card["changed_files"] == ["index.html"]
-        # 完整 payload：模型申报原样留档（0025 自洽性核验的原料），但不作权威
+        # 完整 payload：模型申报原样留档，与核验结论字段成对呈现（0025）
         assert card["declared_files"] == ["styles.css", "phantom.html"]
+        assert card["consistency"] == "mismatch"
+        assert card["mismatch_kind"] == "file_set_mismatch"
         # 卡片携本轮快照引用（展开看本轮 diff 的入口）
         snaps = client.get(
             f"/api/projects/{project['id']}/snapshots", headers=auth_headers
@@ -100,8 +77,9 @@ class TestTurnResultExit:
         assert card["snapshot_id"] == snaps[0]["id"]
         assert card["snapshot_rev"] == snaps[0]["rev"]
 
-        # 正常出口轮：done 不携任何惩罚性字段；迭代日志照常记磁盘真实改动
+        # 失配轮：done 携核验结论而非退役的 warning/no_change 字段；迭代日志照常记磁盘真实改动
         assert "warning" not in events[-1] and "no_change" not in events[-1]
+        assert events[-1]["verdict"] == "mismatch"
         log = _load_log(app, project["id"])
         assert log[-1]["files"] == ["index.html"]
 
@@ -157,7 +135,9 @@ class TestTurnResultExit:
             [
                 *EDIT_STEPS,
                 _turn_result_step(summary="标题已换成深色主题。", changed_files=["index.html"]),
-                {"text": "好的。"},
+                _turn_result_step(
+                    intent="no_change", summary="好的。", no_change_reason="仅确认现状。"
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -211,16 +191,21 @@ class TestTurnResultExit:
             for m in messages
         )
 
-    def test_false_modify_code_claim_keeps_system_verification(
+    def test_false_modify_code_claim_flagged_as_verbal_completion(
         self, app, settings, client, auth_headers
     ):
-        """自报「已改动代码」但磁盘零改动：卡片路径不得比散文更干净——
-        H1 硬输出闸同等生效（系统无条件追加核验标注、done 携警告）；
-        完整的声明与事实成对核验归工单 0025。"""
+        """自报「已改动代码」但磁盘零改动 → 判定为口头完成失配（工单 0025）：
+        精确差异回喂一次，仍失配则结论以结构化字段标注在卡片与收尾事件上，
+        不再往 summary/正文追加系统核验文案、不再附 warning/no_change 字段。"""
         use_fake_model(
             app,
             [
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
+                _turn_result_step(
+                    intent="modify_code",
+                    summary="已完成修改。",
+                    changed_files=["index.html"],
+                ),
                 _turn_result_step(
                     intent="modify_code",
                     summary="已完成修改。",
@@ -234,14 +219,15 @@ class TestTurnResultExit:
 
         done = events[-1]
         assert done["type"] == "done"
-        # 与散文路径同一警告（口头完成不因改走出口而免罚）
-        assert done.get("warning") == "本轮未产生任何文件改动"
-        assert done.get("no_change") is True
+        # 退役字段不得再现；核验结论以结构化字段携带
+        assert "warning" not in done and "no_change" not in done
+        assert done["verdict"] == "mismatch" and done["mismatch_kind"] == "verbal_completion"
         tr_events = [e for e in events if e["type"] == "turn_result"]
         card = json.loads(tr_events[0]["content"])
         assert card["intent"] == "modify_code" and card["changed_files"] == []
-        # 核验标注由系统撰写、由代码保证：声称与核验成对出现，裸谎言无法单独存活
-        assert "系统核验" in card["summary"] and "不符" in card["summary"]
+        assert card["consistency"] == "mismatch" and card["mismatch_kind"] == "verbal_completion"
+        # summary 保持模型原文：不再有系统追加的核验说明文案
+        assert card["summary"] == "已完成修改。"
         messages = client.get(
             f"/api/projects/{project['id']}/messages", headers=auth_headers
         ).json()
@@ -249,6 +235,7 @@ class TestTurnResultExit:
             [m for m in messages if m["kind"] == "turn_result"][-1]["content"]
         )
         assert persisted["summary"] == card["summary"]
+        assert not any(m["role"] == "engineer" and m["kind"] == "text" for m in messages)
         # 零改动轮不留档（硬闸不变）
         snaps = client.get(
             f"/api/projects/{project['id']}/snapshots", headers=auth_headers
@@ -258,7 +245,8 @@ class TestTurnResultExit:
 
 class TestTurnResultRecovery:
     """模型把产物 JSON 写进正文而没走工具：按房规恢复为卡片路径，
-    不得把 JSON 残段渲染成裸文本气泡；恢复失败才落回散文兜底。"""
+    不得把 JSON 残段渲染成裸文本气泡；恢复失败则回喂一次唯一出口提示，
+    仍散文收尾才由系统按磁盘事实兜底成卡片（工单 0025 降级链）。"""
 
     def test_json_in_prose_recovered_as_card(self, app, settings, client, auth_headers):
         use_fake_model(
@@ -302,27 +290,35 @@ class TestTurnResultRecovery:
         ).json()
         assert len(snaps) == 1 and card["snapshot_rev"] == snaps[0]["rev"]
 
-    def test_prose_fallback_keeps_existing_behavior(self, app, settings, client, auth_headers):
-        """散文兜底（expand 只加不删）：既有收尾行为原样——text 落库、
-        快照照建、迭代日志的改动文件以磁盘真实值填充，绝无 turn_result 卡片。"""
+    def test_prose_fallback_lands_on_fallback_card(self, app, settings, client, auth_headers):
+        """降级链末端（工单 0025 / ADR 0005）：模型以散文收尾、回喂一次后仍不走
+        唯一出口 → 系统按磁盘事实兜底成卡片——首段散文作 summary，意图与改动
+        清单以磁盘真实值填充；兜底不没收用户的工作成果：快照照建、迭代日志照常。"""
         use_fake_model(app, [*EDIT_STEPS, {"text": "已更新。"}])
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"], {"index.html": "v1"})
         events = _stream_messages(client, auth_headers, project["id"], "改一下")
 
-        assert all(e["type"] != "turn_result" for e in events)
+        assert any(e["type"] == "turn_result" for e in events)
         assert events[-1]["type"] == "done" and events[-1]["text"] == "已更新。"
+        assert events[-1]["verdict"] == "fallback"
+        assert "warning" not in events[-1] and "no_change" not in events[-1]
         messages = client.get(
             f"/api/projects/{project['id']}/messages", headers=auth_headers
         ).json()
-        assert not any(m["kind"] == "turn_result" for m in messages)
-        assert messages[-1]["role"] == "engineer" and messages[-1]["kind"] == "text"
-        assert messages[-1]["content"] == "已更新。"
+        # 散文收尾不再落 text 消息：一切工程师轮都以产物卡片收尾
+        assert messages[-1]["kind"] == "turn_result"
+        assert not any(m["role"] == "engineer" and m["kind"] == "text" for m in messages)
+        card = json.loads(messages[-1]["content"])
+        assert card["consistency"] == "fallback" and card["mismatch_kind"] is None
+        assert card["summary"] == "已更新。"
+        assert card["intent"] == "modify_code"
+        # 兜底路径下声明改动一律以磁盘真实值填充，绝不采信模型申报
+        assert card["changed_files"] == ["index.html"] and card["declared_files"] == []
         snaps = client.get(
             f"/api/projects/{project['id']}/snapshots", headers=auth_headers
         ).json()
         assert len(snaps) == 1
-        # 兜底路径下声明改动一律以磁盘真实值填充（迭代日志）
         log = _load_log(app, project["id"])
         assert log[-1]["files"] == ["index.html"]
 

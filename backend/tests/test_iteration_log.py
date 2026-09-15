@@ -7,7 +7,7 @@
 任何测试不得调用真实 MiniMax API。
 """
 
-from conftest import seed_project_files, use_fake_model
+from conftest import _turn_result_step, seed_project_files, use_fake_model
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -32,7 +32,7 @@ class TestIterationLog:
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
                     ]
                 },
-                {"text": "第一轮完成。"},
+                _turn_result_step(summary="第一轮完成。", changed_files=["index.html"]),
                 # 第二轮迭代：先读后改 index.html
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {
@@ -40,7 +40,7 @@ class TestIterationLog:
                         ("edit_file", {"path": "index.html", "old_text": "v2", "new_text": "v3"})
                     ]
                 },
-                {"text": "第二轮完成。"},
+                _turn_result_step(summary="第二轮完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -64,9 +64,13 @@ class TestIterationLog:
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
                     ]
                 },
-                {"text": "第一轮完成。"},
-                # 第二轮纯文本、无文件改动
-                {"text": "第二轮无改动。"},
+                _turn_result_step(summary="第一轮完成。", changed_files=["index.html"]),
+                # 第二轮申报零改动、磁盘确实无改动：自洽的合法结局
+                _turn_result_step(
+                    intent="no_change",
+                    summary="第二轮无改动。",
+                    no_change_reason="本轮无需改动文件。",
+                ),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -82,7 +86,17 @@ class TestIterationLog:
 
     def test_survives_history_window_truncation(self, app, settings, client, auth_headers):
         settings.agent_history_window = 1  # 仅保留最近一轮问答
-        model = use_fake_model(app, [{"text": f"ok{i}"} for i in range(3)])
+        model = use_fake_model(
+            app,
+            [
+                _turn_result_step(
+                    intent="no_change",
+                    summary=f"ok{i}",
+                    no_change_reason="本轮无需改动文件。",
+                )
+                for i in range(3)
+            ],
+        )
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"], {"index.html": "v1"})
         _stream_messages(client, auth_headers, project["id"], "第一条指令")

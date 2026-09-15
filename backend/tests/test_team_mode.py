@@ -10,7 +10,7 @@
 
 import json
 
-from conftest import use_fake_model
+from conftest import _turn_result_step, use_fake_model
 from test_generation import _project_dir, _stream_messages
 from test_projects import _create_project
 
@@ -74,7 +74,7 @@ class TestLegacyPrdConfirm:
             app,
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>番茄钟</h1>"})]},
-                {"text": "已按 PRD 完成。"},
+                _turn_result_step(summary="已按 PRD 完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -117,7 +117,7 @@ class TestLegacyPrdConfirm:
             app,
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -135,10 +135,10 @@ class TestLegacyPrdConfirm:
             app,
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -161,7 +161,7 @@ class TestLegacyPrdConfirm:
             app,
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -180,7 +180,7 @@ class TestLegacyPrdConfirm:
             app,
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -219,7 +219,16 @@ class TestExistingFilesSkipStages:
         self, app, client, auth_headers
     ):
         """克隆等场景：团队模式项目已有文件时，首条消息直接进工程师。"""
-        use_fake_model(app, [{"text": "已按诉求修改。"}])
+        use_fake_model(
+            app,
+            [
+                _turn_result_step(
+                    intent="no_change",
+                    summary="已按诉求修改。",
+                    no_change_reason="本轮无文件改动。",
+                )
+            ],
+        )
         project = _create_project(client, auth_headers, mode="team")
         # 预置文件索引（模拟克隆得到的带文件项目；分流判断以索引为准）
         from app.models import ProjectFile

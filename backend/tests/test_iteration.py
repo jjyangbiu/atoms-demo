@@ -4,8 +4,8 @@
 - 迭代仅修改受影响文件，未涉及文件内容不变（伪模型断言）
 - 迭代上下文 = 系统提示（含文件清单）+ 最近 N 条对话 + 当前指令
 - 对话历史完整持久化，窗口截断只影响喂给模型的部分
-- “口头完成”守卫：模型未调用工具就在文本里声称已修改时，循环反思回喂一次；
-  若仍不改，done 事件附 warning 提醒前端（诊断修复）
+（原「口头完成」守卫的措辞检测与升级链已于工单 0025 整体退役，由自洽性核验
+取代——见 tests/test_self_consistency.py。）
 任何测试不得调用真实 MiniMax API。
 """
 
@@ -13,6 +13,7 @@ from pathlib import Path
 
 from conftest import (
     FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
     confirm_first_build,
     seed_project_files,
     use_fake_model,
@@ -34,11 +35,13 @@ class TestIteration:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
-                {"text": "第一版完成。"},
+                _turn_result_step(
+                    summary="第一版完成。", changed_files=["index.html", "styles.css"]
+                ),
                 # 迭代轮：先读后改（read-before-write 强制）
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -61,7 +64,15 @@ class TestIteration:
 
     def test_history_window_keeps_recent_messages_only(self, app, settings, client, auth_headers):
         settings.agent_history_window = 1  # 仅保留最近一轮问答
-        model = use_fake_model(app, [{"text": f"ok{i}"} for i in range(3)])
+        model = use_fake_model(
+            app,
+            [
+                _turn_result_step(
+                    intent="no_change", summary=f"ok{i}", no_change_reason="仅确认，无需改动。"
+                )
+                for i in range(3)
+            ],
+        )
         project = _create_project(client, auth_headers)
         # 预置文件：三轮都是纯迭代，窗口语义不被首建澄清分流干扰（工单 0015）
         seed_project_files(app, project["id"])
@@ -72,16 +83,24 @@ class TestIteration:
         last_call = model.received_messages[-1]
         contents = [getattr(m, "content", "") for m in last_call]
         assert "第三条指令" in contents  # 当前指令
-        # 最近一轮问答在窗口内（回复文本可能被硬输出闸追加“系统记录”标注，按前缀匹配）
-        assert "第二条指令" in contents and any(c.startswith("ok1") for c in contents)
+        # 最近一轮问答在窗口内（工程师回复以轮次产物结论摘要的形式入上下文）
+        assert "第二条指令" in contents and any("ok1" in c for c in contents)
         # 更早的被截掉（系统提示里的迭代日志含历史指令子串，用户消息须按精确成员匹配；
-        # 工程师回复可能被硬输出闸追加标注，按前缀匹配）
+        # 轮次产物摘要只注入最近一轮，更早轮次不得出现）
         assert "第一条指令" not in contents
-        assert not any(c.startswith("ok0") for c in contents)
+        assert not any("ok0" in c for c in contents)
 
     def test_full_history_persists_despite_context_window(self, app, settings, client, auth_headers):
         settings.agent_history_window = 1
-        use_fake_model(app, [{"text": f"ok{i}"} for i in range(3)])
+        use_fake_model(
+            app,
+            [
+                _turn_result_step(
+                    intent="no_change", summary=f"ok{i}", no_change_reason="仅确认，无需改动。"
+                )
+                for i in range(3)
+            ],
+        )
         project = _create_project(client, auth_headers)
         # 同上：预置文件走纯迭代链路（工单 0015）
         seed_project_files(app, project["id"])
@@ -90,107 +109,9 @@ class TestIteration:
         _stream_messages(client, auth_headers, project["id"], "第三条指令")
 
         resp = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers)
-        texts = [m["content"] for m in resp.json() if m["kind"] == "text"]
+        # 工程师回复以轮次产物卡片（JSON，含 summary）持久化，用户消息仍是纯文本
+        texts = [
+            m["content"] for m in resp.json() if m["kind"] in ("text", "turn_result")
+        ]
         for expected in ["第一条指令", "第二条指令", "第三条指令", "ok0", "ok1", "ok2"]:
-            # 工程师回复可能被硬输出闸追加“系统记录”标注，按子串匹配
             assert any(expected in t for t in texts), "窗口截断不得影响持久化完整性"
-
-
-class TestVerbalCompletionGuard:
-    """“口头完成”守卫（诊断修复）。
-
-    背景：用户报告“把标题从『工作日历-Test』改成『工作日历』”，模型未调 edit_file 就
-    回复“已改好”，旧实现无条件发 done，文件未动、快照照旧创建，用户被误导。
-
-    防御：
-    1) loop.run_generation 发现“模型声称完成 + 本轮无任何修改类工具成功”时，回喂一次反思；
-    2) 反思后仍不改，done 事件附 warning 字段提醒前端；
-    3) 合法闲聊轮（文本不含完成断言词）不触发任何防御。
-    """
-
-    def test_reflection_recovers_when_model_complies(self, app, settings, client, auth_headers):
-        """模型先“口头完成”，反思后乖乖调工具 → 文件真改了、done 不带 warning。"""
-        model = use_fake_model(
-            app,
-            [
-                # 迭代轮第一步：未调工具，直接声称已改好 → 应触发反思
-                {"text": "已修改完成。"},
-                # 反思后模型乖乖先 read 再 edit
-                {"tool_calls": [("read_file", {"path": "index.html"})]},
-                {
-                    "tool_calls": [
-                        (
-                            "edit_file",
-                            {
-                                "path": "index.html",
-                                "old_text": "工作日历-Test",
-                                "new_text": "工作日历",
-                            },
-                        )
-                    ]
-                },
-                {"text": "已将标题改为工作日历。"},
-            ],
-        )
-        project = _create_project(client, auth_headers)
-        seed_project_files(app, project["id"], {"index.html": "<h1>工作日历-Test</h1>"})
-        events = _stream_messages(
-            client, auth_headers, project["id"], "把标题改成工作日历"
-        )
-
-        # 反思消息已回喂给模型（received_messages 第二步首条 HumanMessage 含“系统检查”）
-        assert len(model.received_messages) >= 2
-        reflection_turn = model.received_messages[1]
-        assert any(
-            "系统检查" in getattr(m, "content", "") for m in reflection_turn
-        ), "未向模型回喂反思消息"
-
-        # 文件真改了
-        pdir = _project_dir(settings, project["id"])
-        assert (
-            pdir / "index.html"
-        ).read_text(encoding="utf-8") == "<h1>工作日历</h1>"
-
-        # done 事件存在且不带 warning（touched_files 非空）
-        done_events = [e for e in events if e["type"] == "done"]
-        assert done_events and "warning" not in done_events[-1]
-
-    def test_persistent_verbal_completion_emits_warning(self, app, settings, client, auth_headers):
-        """模型反思后仍不改 → done 事件附 warning，文件保持原样。"""
-        use_fake_model(
-            app,
-            [
-                {"text": "已修改完成。"},  # 首次口头完成 → 触发反思
-                {"text": "已完成。"},  # 第 2 次 → 事实注入；脚本耗尽后收尾，done + warning
-            ],
-        )
-        project = _create_project(client, auth_headers)
-        seed_project_files(app, project["id"], {"index.html": "<h1>工作日历-Test</h1>"})
-        events = _stream_messages(
-            client, auth_headers, project["id"], "把标题改成工作日历"
-        )
-
-        # 文件未被改动
-        pdir = _project_dir(settings, project["id"])
-        assert (
-            pdir / "index.html"
-        ).read_text(encoding="utf-8") == "<h1>工作日历-Test</h1>"
-
-        # done 事件带 warning，前端得以提醒用户
-        done_events = [e for e in events if e["type"] == "done"]
-        assert done_events, "反思后仍应发 done 事件收尾"
-        assert done_events[-1].get("warning") == "本轮未产生任何文件改动"
-
-    def test_chat_only_round_skips_reflection_but_still_warns(self, app, settings, client, auth_headers):
-        """合法闲聊轮（文本不含完成断言词）不触发反思回喂；
-        但因本轮未改动文件，done 仍附 warning（选项 A 的完整语义：只要未改就提醒）。"""
-        model = use_fake_model(app, [{"text": "你好，需要我做什么？"}])
-        project = _create_project(client, auth_headers)
-        seed_project_files(app, project["id"], {"index.html": "<h1>hi</h1>"})
-        events = _stream_messages(client, auth_headers, project["id"], "你好")
-
-        # 未回喂反思（只有一次模型调用）
-        assert len(model.received_messages) == 1
-        # done 事件仍带 warning（touched_files 为空）
-        done_events = [e for e in events if e["type"] == "done"]
-        assert done_events and done_events[-1].get("warning") == "本轮未产生任何文件改动"

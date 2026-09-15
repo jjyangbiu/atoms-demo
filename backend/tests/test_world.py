@@ -15,7 +15,13 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from conftest import FIRST_BUILD_CLARIFY_STEP, confirm_first_build, login, use_fake_model
+from conftest import (
+    FIRST_BUILD_CLARIFY_STEP,
+    _turn_result_step,
+    confirm_first_build,
+    login,
+    use_fake_model,
+)
 from test_generation import _stream_messages
 from test_projects import _create_project
 
@@ -29,7 +35,7 @@ def _generate_and_publish(
         [
             FIRST_BUILD_CLARIFY_STEP,
             {"tool_calls": [("write_file", {"path": "index.html", "content": content})]},
-            {"text": "完成。"},
+            _turn_result_step(summary="完成。", changed_files=["index.html"]),
         ],
     )
     project = _create_project(client, headers, name=name)
@@ -79,7 +85,7 @@ class TestWorldGallery:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>私</h1>"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -99,7 +105,7 @@ class TestWorldGallery:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v</h1>"})]},
-                {"text": "完成。"},
+                _turn_result_step(summary="完成。", changed_files=["index.html"]),
             ]
             * 2,
         )
@@ -159,14 +165,14 @@ class TestClone:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
-                {"text": "第一版。"},
+                _turn_result_step(summary="第一版。", changed_files=["index.html"]),
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {
                     "tool_calls": [
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
                     ]
                 },
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)
@@ -207,14 +213,15 @@ class TestClone:
             [
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
-                {"text": "第一版。"},
+                _turn_result_step(summary="第一版。", changed_files=["index.html"]),
+                # 克隆副本上的迭代（eve）：对复制来的文件同样先读后改
                 {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {
                     "tool_calls": [
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})
                     ]
                 },
-                {"text": "已更新。"},
+                _turn_result_step(summary="已更新。", changed_files=["index.html"]),
             ],
         )
         project = _create_project(client, auth_headers)

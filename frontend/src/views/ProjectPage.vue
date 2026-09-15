@@ -87,15 +87,19 @@ interface ChatEntry {
   turnResult?: TurnResultInfo
 }
 
-// 轮次产物卡片字段（工单 0024 / ADR 0005「第 8 层」）：
+// 轮次产物卡片字段（工单 0024/0025 / ADR 0005「第 8 层」）：
 // changed_files 是磁盘真实改动（后端以轮前/轮末指纹比对为权威），
-// declared_files 是模型申报（仅留档，卡片不展示），snapshot_* 为本轮快照引用
+// declared_files 是模型申报（仅留档，卡片不展示），snapshot_* 为本轮快照引用；
+// consistency 是自洽性核验结论（consistent/mismatch/fallback，旧卡片无此字段为 null），
+// 核验结论只以卡片徽标呈现，不再追加进正文（工单 0025）
 interface TurnResultInfo {
   intent: 'modify_code' | 'no_change'
   summary: string
   changed_files: string[]
   declared_files: string[]
   no_change_reason: string
+  consistency: 'consistent' | 'mismatch' | 'fallback' | null
+  mismatch_kind: string | null
   snapshot_id: number | null
   snapshot_rev: number | null
 }
@@ -104,12 +108,18 @@ function parseTurnResult(content: string): TurnResultInfo | null {
   try {
     const data = JSON.parse(content) as Record<string, unknown>
     if (typeof data !== 'object' || data === null) return null
+    const consistency = data.consistency
     return {
       intent: data.intent === 'no_change' ? 'no_change' : 'modify_code',
       summary: String(data.summary ?? ''),
       changed_files: Array.isArray(data.changed_files) ? data.changed_files.map(String) : [],
       declared_files: Array.isArray(data.declared_files) ? data.declared_files.map(String) : [],
       no_change_reason: typeof data.no_change_reason === 'string' ? data.no_change_reason : '',
+      consistency:
+        consistency === 'consistent' || consistency === 'mismatch' || consistency === 'fallback'
+          ? consistency
+          : null,
+      mismatch_kind: typeof data.mismatch_kind === 'string' ? data.mismatch_kind : null,
       snapshot_id: typeof data.snapshot_id === 'number' ? data.snapshot_id : null,
       snapshot_rev: typeof data.snapshot_rev === 'number' ? data.snapshot_rev : null,
     }
@@ -1138,13 +1148,9 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         errorDetail.value = String(event.detail ?? '生成失败')
         // 错误收尾即收起弹窗（工单 0020）：pending 仍在的话重开入口会出现
         panelOpen.value = false
-      } else if (event.type === 'done') {
-        // 诊断修复：后端在本轮未改动任何文件时附 warning，弹一条提醒，
-        // 避免模型“口头完成”（声称改好了但磁盘未动）误导用户。
-        if (typeof event.warning === 'string' && event.warning) {
-          ElMessage.warning({ message: event.warning, duration: 6000 })
-        }
       }
+      // done 事件不再需要前端处置：核验结论随 turn_result 卡片徽标呈现（工单 0025），
+      // 「无改动警告」弹窗与 warning/no_change 字段已随措辞机器退役
       scrollToBottom()
     }, stopCtrl.value?.signal)
   } catch (e) {
@@ -1294,7 +1300,8 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
               </div>
             </div>
             <div v-else-if="entry.kind === 'turn_result'" class="msg agent-msg">
-              <!-- 轮次产物卡片（工单 0024）：一句话总结 + 磁盘权威的改动文件清单 + 本轮 diff 入口；
+              <!-- 轮次产物卡片（工单 0024/0025）：一句话总结 + 磁盘权威的改动文件清单
+                   + 自洽性核验结论徽标 + 本轮 diff 入口；
                    总结只讲结论，不复述工具调用过程（出口 payload 约束） -->
               <div class="prd-card turn-result-card">
                 <div class="prd-head">
@@ -1303,6 +1310,30 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     无需改动
                   </el-tag>
                   <el-tag v-else size="small" type="success">已改动代码</el-tag>
+                  <el-tag
+                    v-if="entry.turnResult?.consistency === 'mismatch'"
+                    size="small"
+                    type="danger"
+                    data-testid="verdict-badge-mismatch"
+                  >
+                    申报失配
+                  </el-tag>
+                  <el-tag
+                    v-else-if="entry.turnResult?.consistency === 'fallback'"
+                    size="small"
+                    type="warning"
+                    data-testid="verdict-badge-fallback"
+                  >
+                    兜底收尾
+                  </el-tag>
+                  <el-tag
+                    v-else-if="entry.turnResult?.consistency === 'consistent'"
+                    size="small"
+                    type="success"
+                    data-testid="verdict-badge-consistent"
+                  >
+                    核验自洽
+                  </el-tag>
                 </div>
                 <div
                   class="bubble markdown prd-body"
