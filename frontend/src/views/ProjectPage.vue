@@ -1073,6 +1073,12 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         errorDetail.value = String(event.detail ?? '生成失败')
         // 错误收尾即收起弹窗（工单 0020）：pending 仍在的话重开入口会出现
         panelOpen.value = false
+      } else if (event.type === 'done') {
+        // 诊断修复：后端在本轮未改动任何文件时附 warning，弹一条提醒，
+        // 避免模型“口头完成”（声称改好了但磁盘未动）误导用户。
+        if (typeof event.warning === 'string' && event.warning) {
+          ElMessage.warning({ message: event.warning, duration: 6000 })
+        }
       }
       scrollToBottom()
     }, stopCtrl.value?.signal)
@@ -1358,6 +1364,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                 effect="plain"
               >
                 <span v-if="entry.tool?.status === 'start'" class="tool-running">⚙ {{ toolLabel(entry.tool) }}…</span>
+                <span v-else-if="entry.tool?.status === 'error'">✗ {{ entry.tool ? toolLabel(entry.tool) : '' }}</span>
                 <span v-else>✓ {{ entry.tool ? toolLabel(entry.tool) : '' }}</span>
               </el-tag>
               <span v-if="entry.tool?.status === 'error'" class="tool-error-text">

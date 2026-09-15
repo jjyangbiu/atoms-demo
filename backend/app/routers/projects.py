@@ -527,6 +527,7 @@ async def _engineer_stream(
             user_text,
             max_steps=settings.agent_max_steps,
             max_retries=settings.agent_max_retries,
+            modification_tools={"write_file", "edit_file"},
         ):
             if event.type == "done":
                 # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
@@ -609,7 +610,13 @@ async def _engineer_stream(
     if done_data is not None:
         if result is not None:
             result["ok"] = True
-        yield _emit({"type": "done", **done_data})
+        # 诊断修复：本轮未产生任何文件改动时，在 done 事件上附 warning，
+        # 前端得以明确告知用户“本轮未改动文件”，避免模型“口头完成”误导。
+        # 仅对用户对话轮（record_iteration）生效；团队工单执行是内部编排，不附警告。
+        payload = {"type": "done", **done_data}
+        if record_iteration and not touched_files:
+            payload["warning"] = "本轮未产生任何文件改动"
+        yield _emit(payload)
 
 
 async def _spec_stream(request: Request, project_id: int, user_text: str, history: list):

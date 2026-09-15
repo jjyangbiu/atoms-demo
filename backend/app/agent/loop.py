@@ -105,6 +105,32 @@ def summarize_args(args: dict) -> dict:
     return summary
 
 
+# 完成断言词：模型在文本里出现这些词、却没有任何成功的修改类工具调用时，视为“口头完成”幻觉，
+# 触发一次反思回喂（诊断修复：迭代轮模型不调工具就声称改完了，文件其实没动）。
+# 只覆盖中文强断言短语，避免误伤“ok”“无改动”这类合法闲聊/说明。
+COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
+    "已完成", "已修改", "已更新", "已改好", "已改完", "已经修改", "已经更新",
+    "已经完成", "已经改好", "改好了", "改完了", "修改完毕", "修改完成",
+    "更新完毕", "更新完成", "完成修改", "完成更新", "完成了修改", "完成了更新",
+)
+
+
+def _claims_completion(text: str) -> bool:
+    """文本是否含“已完成/已修改”一类的强断言词。"""
+    return any(p in text for p in COMPLETION_CLAIM_PATTERNS)
+
+
+def _build_reflection_message(modification_tools: set[str]) -> str:
+    tools_hint = "/".join(sorted(modification_tools))
+    return (
+        "系统检查：你上一条回复声称已完成修改，但本轮从未成功调用过 "
+        f"{tools_hint} 工具，磁盘上没有任何文件被改动。"
+        "请立即用 read_file 读取相关文件确认现状，再用 edit_file 完成实际改动；"
+        "如果确实无需改动（例如用户只是询问、闲聊，或改动已在上一轮生效），"
+        "请明确说明理由，不要使用『已完成/已修改/已更新』之类的措辞。"
+    )
+
+
 async def _attempt_stream(bound, messages: list, holder: dict) -> AsyncIterator[AgentEvent]:
     """单次模型调用：逐字产出 text/thinking delta，累积结果写入 holder["msg"]。"""
     if hasattr(bound, "astream"):
@@ -140,14 +166,20 @@ async def run_generation(
     user_text: str,
     max_steps: int = 20,
     max_retries: int = 2,
+    modification_tools: set[str] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """执行一轮生成：模型 ⇄ 工具循环直至模型给出最终文本。
 
     history 为 langchain 消息列表（不含本轮用户输入）。
     tool_executor 签名：(tools, name, args) -> (是否成功, 结果文本)。
+    modification_tools：会被视为“修改文件”的工具名集合（如 {"write_file", "edit_file"}）。
+      传入时开启“口头完成”反思守卫：若模型未成功调用过任何修改类工具就在文本里声称
+      “已完成/已修改”，循环会回喂一次反思消息让模型重做；仅一次，避免死循环。
     """
     bound = model.bind_tools(tools) if hasattr(model, "bind_tools") else model
     messages = [SystemMessage(content=system_prompt), *history, HumanMessage(content=user_text)]
+    modified_any = False  # 本轮内是否有一次成功的修改类工具调用
+    reflection_used = False  # 反思守卫已触发过（防死循环：只给模型一次机会）
 
     for _ in range(max_steps):
         # 单步模型调用（含重试）：事件实时外发，前端才有打字机效果；
@@ -176,7 +208,21 @@ async def run_generation(
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             # 最终文本洗去思考块：流式增量里已拆走，这里是兜底（如非流式回退）
-            yield AgentEvent("done", {"text": strip_think_blocks(getattr(msg, "content", "") or "")})
+            final_text = strip_think_blocks(getattr(msg, "content", "") or "")
+            # 反思守卫：模型声称完成却从未调用任何修改类工具 → 回喂一次让它真去改
+            if (
+                modification_tools
+                and not modified_any
+                and not reflection_used
+                and _claims_completion(final_text)
+            ):
+                reflection_used = True
+                messages.append(msg)
+                messages.append(
+                    HumanMessage(content=_build_reflection_message(modification_tools))
+                )
+                continue
+            yield AgentEvent("done", {"text": final_text})
             return
 
         messages.append(msg)
@@ -193,6 +239,8 @@ async def run_generation(
                     "result": result[:500],
                 },
             )
+            if ok and modification_tools and name in modification_tools:
+                modified_any = True
             messages.append(ToolMessage(content=result, tool_call_id=call_id))
 
     yield AgentEvent("error", {"detail": f"智能体超过最大步数（{max_steps}）仍未完成"})
