@@ -27,10 +27,13 @@ from ..agent.tools import (
     build_breaker_tools,
     build_clarify_tools,
     build_tools,
+    build_turn_result_tool,
     execute_tool,
     parse_clarify_payload,
     parse_ticket_payload,
+    parse_turn_result_payload,
     recover_clarify_payload,
+    recover_turn_result_payload,
     resolve_sandboxed,
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
@@ -210,6 +213,16 @@ def _llm_history(db: Session, project_id: int, before_message_id: int, window: i
         elif m.kind == "clarify":
             # 选项式澄清问题入上下文：后续轮次据此不重复问已答内容（诊断修复）
             history.append(AIMessage(content=f"以下是我提出的澄清问题（含候选项，JSON）：\n\n{m.content}"))
+        elif m.kind == "turn_result":
+            # 轮次产物卡片入上下文（工单 0024）：后续轮次可见上一轮的结论摘要；
+            # 原始 JSON 不入上下文——改动文件以迭代日志/系统提示的磁盘记录为权威，
+            # 申报清单（declared_files）不回喂，避免模型把自己的申报当成事实复述。
+            try:
+                summary = str(json.loads(m.content).get("summary") or "").strip()
+            except ValueError:
+                summary = ""
+            if summary:
+                history.append(AIMessage(content=f"以下是我上一轮的轮次产物结论：{summary}"))
         else:
             history.append(AIMessage(content=m.content))
     if window > 0:
@@ -531,6 +544,14 @@ async def _limited_stream(stream, request: Request):
         request.app.state.rate_limiter.release()
 
 
+class _SubmitTurnResultInvoked(Exception):
+    """工程师调用 submit_turn_result 的控制流信号：携轮次产物终止本轮循环（工单 0024）。"""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        super().__init__("submit_turn_result")
+
+
 async def _engineer_stream(
     request: Request,
     project_id: int,
@@ -569,6 +590,22 @@ async def _engineer_stream(
     sandbox = FileSandbox(project_dir(request, project_id))
     # 知识库可用时附带 search_templates 检索工具（工单 0009）；不可用时降级为纯文件工具
     tools = build_tools(sandbox, maybe_knowledge_store(request.app))
+    # 唯一终结出口（工单 0024 / ADR 0005「第 8 层」）：与文件工具同一清单绑定，
+    # 首建轮、迭代轮与团队工单执行共用本路径，不单加开关。
+    # 出口以工具调用为载体而非 response_format——二者是互斥的输出通道。
+    tools = [*tools, *build_turn_result_tool()]
+
+    def engineer_executor(tool_list, name, args):
+        """拦截终结出口：非法产物错误文案交还模型修正（同澄清/拆单范式），
+        合法则抛控制流信号终止循环——循环对模型实现的约定不变。"""
+        if name == "submit_turn_result":
+            raw = str((args or {}).get("payload", ""))
+            parsed, reason = parse_turn_result_payload(raw)
+            if parsed is None:
+                return False, f"轮次产物不合法：{reason} 请修正后重新调用 submit_turn_result。"
+            raise _SubmitTurnResultInvoked(parsed)
+        return execute_tool(tool_list, name, args)
+
     # 迭代日志（Layer 5）：读入历轮改动摘要注入系统提示，弥补对话窗口截断的失忆。
     # 团队工单执行（record_iteration=False）是内部编排而非用户对话轮，不读迭代日志。
     iteration_log: list = []
@@ -584,12 +621,14 @@ async def _engineer_stream(
     pre_round = _fingerprint(summaries)
 
     done_data: dict | None = None
+    turn_result_payload: dict | None = None
     thinking_parts: list[str] = []
+    raw_parts: list[str] = []
     try:
         async for event in run_generation(
             model,
             tools,
-            execute_tool,
+            engineer_executor,
             system_prompt,
             history,
             user_text,
@@ -607,6 +646,18 @@ async def _engineer_stream(
                 if event.type == "thinking":
                     # 思考增量另存一份：正常收尾合并落库；中断时也据已流出部分落库（诊断修复）
                     thinking_parts.append(event.data.get("content", ""))
+                if event.type in ("thinking", "text"):
+                    # 原始输出留一份：模型把产物 JSON 写进正文时据此恢复（房规同澄清流）
+                    raw_parts.append(event.data.get("content", ""))
+                if event.type == "tool" and event.data.get("name") == "submit_turn_result":
+                    # 终结出口的工具事件不外发：对用户本轮只呈现产物卡片（事件行的
+                    # 展示与折叠归工单 0023）。落库仍按 _persist_event 既有契约
+                    # （ADR 0005：刷新页面可回看完整过程，是排查越界改动的证据链）——
+                    # 非法 payload 的修正尝试照样留档；合法出口时循环在发出 done 事件
+                    # 前即抛控制流信号，其完整 payload 由卡片消息本身留档。
+                    if event.data.get("status") != "start":
+                        _persist_event(session_factory, project_id, event.data)
+                    continue
                 if result is not None and event.type == "error":
                     result["ok"] = False
                     result["error"] = event.data.get("detail", "")
@@ -617,6 +668,9 @@ async def _engineer_stream(
                     # 三处硬闸的判据一律来自轮末磁盘指纹比对。
                     if event.data.get("status") != "start":
                         _persist_event(session_factory, project_id, event.data)
+    except _SubmitTurnResultInvoked as invoked:
+        # 终结信号：本轮到此为止，轮次产物进入结构化收尾（散文路径原样兜底）
+        turn_result_payload = invoked.payload
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
         if result is not None:
             result["ok"] = False
@@ -638,6 +692,27 @@ async def _engineer_stream(
         p for p in set(pre_round) | set(post_round) if pre_round.get(p) != post_round.get(p)
     }
 
+    # 模型未调 submit_turn_result 而把产物 JSON 写进正文时（部分推理模型会把 JSON
+    # 漏进 think 块、尾部被截断），按既有房规从后往前扫描恢复；恢复失败才走散文
+    # 兜底——expand 只加不删，既有散文收尾行为原样保留（工单 0024）。
+    # 有意不实现 ADR 0005 降级链的「仍无则回喂一次唯一出口提示、再不听以该散文作
+    # summary 兜底」：那会把散文兜底改成卡片形态，与本工单「既有散文路径兜底收尾、
+    # 既有集成测试不改动全绿」冲突；完整降级链归工单 0025 的自洽性核验一并落地。
+    if turn_result_payload is None and done_data is not None:
+        turn_result_payload = recover_turn_result_payload("".join(raw_parts))
+    completed = done_data is not None or turn_result_payload is not None
+    no_change_round = bool(record_iteration and completed and not touched_files)
+    # 自报「已改动代码」而磁盘零改动：自报与磁盘事实相悖（散文路径的 H1 硬输出闸
+    # 同等适用于卡片路径，出口不得比散文更干净）。自报「无需改动」是合法结局，不在此列。
+    mismatch_round = bool(
+        no_change_round
+        and turn_result_payload is not None
+        and turn_result_payload["intent"] == "modify_code"
+    )
+
+    snapshot: Snapshot | None = None
+    card_json: str | None = None
+    final_summary = ""
     try:
         with session_factory() as session:
             thinking_text = "".join(thinking_parts).strip()
@@ -645,43 +720,76 @@ async def _engineer_stream(
                 session.add(
                     Message(project_id=project_id, role="engineer", kind="thinking", content=thinking_text)
                 )
-            final_text = done_data.get("text", "") if done_data else ""
-            # 硬输出闸（H1 治本）：只要本轮磁盘零改动，系统就无条件在持久化文本上
-            # 追加核验标注——标注由系统撰写、由代码保证，不依赖模型配合；断言检测
-            # （claims_completion）只决定标注措辞强度，即使措辞漏检，“无改动”的
-            # 事实照样落库。前端在流结束后 loadHistory 以持久化结果重渲染，
-            # 用户看到与回看的都是“声称+核验”成对出现，裸谎言无法单独存活。
-            no_change_round = bool(record_iteration and done_data is not None and not touched_files)
-            if final_text and no_change_round:
-                if claims_completion(final_text):
-                    final_text += (
-                        "\n\n（系统核验：智能体声称已完成修改，但本轮磁盘上没有产生任何文件改动，"
-                        "上述声称与磁盘实际状态不符。）"
-                    )
-                else:
-                    final_text += "\n\n（系统记录：本轮未产生文件改动。）"
-            if final_text:
-                session.add(
-                    Message(project_id=project_id, role="engineer", kind="text", content=final_text)
-                )
-            _sync_file_index(session, project_id, sandbox.root)
+            # 快照先行：产物卡片要携快照引用（展开看本轮 diff 的入口）。
             # 每次成功生成（首轮与迭代）自动留档一版快照；失败的生成不留档（工单 0007）。
             # 零改动的用户对话轮不留档（硬闸）：磁盘与上一版完全一致，建快照只会
             # 制造“版本 N+1”的假进展、污染回滚列表；轮次结局以磁盘事实为准。
             # 团队工单执行（record_iteration=False）不受此影响，检查点语义保持原样。
-            if done_data is not None and not no_change_round:
+            if completed and not no_change_round:
                 snapshot = create_snapshot(
                     session, project_id, sandbox.root, settings.snapshot_max_kept
                 )
+                session.flush()  # 卡片落库前需要 snapshot.id
                 if result is not None:
                     result["snapshot"] = snapshot
                 if extra_finalize is not None:
                     extra_finalize(session, snapshot)
+            if turn_result_payload is not None:
+                # 轮次产物卡片（工单 0024）：改动文件清单一律以磁盘真实改动为权威
+                # （0022 成果），绝不采信模型申报；申报清单原样留在 declared_files
+                # 供后续自洽性核验（工单 0025）比对，只到文件级、不涉区域。
+                summary_text = turn_result_payload["summary"]
+                if mismatch_round:
+                    # H1 硬输出闸（治本）同等生效：核验标注由系统撰写、由代码保证，
+                    # 不依赖模型配合；实时卡片与回看卡片同一文案，声称与核验成对出现。
+                    summary_text += (
+                        "\n\n（系统核验：智能体自报已改动代码，但本轮磁盘上没有产生任何文件改动，"
+                        "自报与磁盘实际状态不符。）"
+                    )
+                final_summary = summary_text
+                card = {
+                    "intent": turn_result_payload["intent"],
+                    "summary": summary_text,
+                    "changed_files": sorted(touched_files),
+                    "declared_files": turn_result_payload["changed_files"],
+                    "no_change_reason": turn_result_payload["no_change_reason"],
+                    "snapshot_id": snapshot.id if snapshot is not None else None,
+                    "snapshot_rev": snapshot.rev if snapshot is not None else None,
+                }
+                card_json = json.dumps(card, ensure_ascii=False)
+                session.add(
+                    Message(
+                        project_id=project_id,
+                        role="engineer",
+                        kind="turn_result",
+                        content=card_json,
+                    )
+                )
+            else:
+                final_text = done_data.get("text", "") if done_data else ""
+                # 硬输出闸（H1 治本）：只要本轮磁盘零改动，系统就无条件在持久化文本上
+                # 追加核验标注——标注由系统撰写、由代码保证，不依赖模型配合；断言检测
+                # （claims_completion）只决定标注措辞强度，即使措辞漏检，“无改动”的
+                # 事实照样落库。前端在流结束后 loadHistory 以持久化结果重渲染，
+                # 用户看到与回看的都是“声称+核验”成对出现，裸谎言无法单独存活。
+                if final_text and no_change_round:
+                    if claims_completion(final_text):
+                        final_text += (
+                            "\n\n（系统核验：智能体声称已完成修改，但本轮磁盘上没有产生任何文件改动，"
+                            "上述声称与磁盘实际状态不符。）"
+                        )
+                    else:
+                        final_text += "\n\n（系统记录：本轮未产生文件改动。）"
+                if final_text:
+                    session.add(
+                        Message(project_id=project_id, role="engineer", kind="text", content=final_text)
+                    )
+            _sync_file_index(session, project_id, sandbox.root)
             project_row = session.get(Project, project_id)
             if project_row is not None:
                 project_row.updated_at = _utcnow()
                 # Layer 5：仅成功的对话轮留痕；JSON 列整体重赋值以触发 SQLAlchemy 变更检测
-                if done_data is not None and record_iteration:
+                if completed and record_iteration:
                     log = list(project_row.iteration_log or [])
                     log.append(
                         {
@@ -698,19 +806,32 @@ async def _engineer_stream(
             result["error"] = f"生成收尾失败: {e}"
         yield _emit({"type": "error", "detail": f"生成收尾失败: {e}"})
         return
-    if done_data is not None:
+    if completed:
         if result is not None:
             result["ok"] = True
-        # 诊断修复：本轮未产生任何文件改动时，在 done 事件上附 warning，
-        # 前端得以明确告知用户“本轮未改动文件”，避免模型“口头完成”误导。
-        # 仅对用户对话轮（record_iteration）生效；团队工单执行是内部编排，不附警告。
-        # no_change 为结构化结局标记（硬闸）：轮次结局以磁盘事实为准，前端可据此
-        # 做持久化渲染（弹窗是一过性的，历史消息里的核验标注才是留痕）。
-        payload = {"type": "done", **done_data}
-        if record_iteration and not touched_files:
-            payload["warning"] = "本轮未产生任何文件改动"
-            payload["no_change"] = True
-        yield _emit(payload)
+        if turn_result_payload is not None:
+            # 结构化收尾（工单 0024）：卡片事件携完整 payload 外发，done 只携总结。
+            # 自报「无需改动」是合法结局、不触发任何惩罚（分类器只决定能力边界、
+            # 不决定义务）；唯一例外是自报与磁盘事实相悖（mismatch_round），此时
+            # 与散文路径附同一组 warning/no_change 字段——出口不得比散文更干净。
+            yield _emit({"type": "turn_result", "content": card_json})
+            done_payload = {"type": "done", "text": final_summary}
+            if mismatch_round:
+                done_payload["warning"] = "本轮未产生任何文件改动"
+                done_payload["no_change"] = True
+            yield _emit(done_payload)
+        else:
+            # 散文兜底路径：行为与既往完全一致（expand 只加不删）。
+            # 诊断修复：本轮未产生任何文件改动时，在 done 事件上附 warning，
+            # 前端得以明确告知用户“本轮未改动文件”，避免模型“口头完成”误导。
+            # 仅对用户对话轮（record_iteration）生效；团队工单执行是内部编排，不附警告。
+            # no_change 为结构化结局标记（硬闸）：轮次结局以磁盘事实为准，前端可据此
+            # 做持久化渲染（弹窗是一过性的，历史消息里的核验标注才是留痕）。
+            payload = {"type": "done", **done_data}
+            if record_iteration and not touched_files:
+                payload["warning"] = "本轮未产生任何文件改动"
+                payload["no_change"] = True
+            yield _emit(payload)
 
 
 async def _spec_stream(request: Request, project_id: int, user_text: str, history: list):

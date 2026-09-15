@@ -311,6 +311,88 @@ def parse_ticket_payload(raw: str) -> tuple[list[dict] | None, str]:
     return tickets, ""
 
 
+# 轮次产物终结出口（工单 0024 / ADR 0005「第 8 层」）：工程师轮唯一结构化收尾。
+# 自报意图二值：改动代码 / 无需改动（分类器只决定能力边界、不决定义务，
+# 改动代码轮自报「无需改动」同样合法收尾）。
+TURN_RESULT_INTENTS = ("modify_code", "no_change")
+
+
+def parse_turn_result_payload(raw: str) -> tuple[dict | None, str]:
+    """校验工程师提交的轮次产物；非法时返回 (None, 错误文案) 交还模型修正。
+
+    约束：JSON 对象；intent 限于 TURN_RESULT_INTENTS；summary 一律非空（卡片主文案）；
+    changed_files 可缺省（视为空数组），给出则须为非空路径字符串数组（只到文件级，
+    区域级留给后续裁判，工单 0028）；no_change 意图在 summary 之外还须附
+    no_change_reason（无需改动的理由）。声明的改动文件仅供后续自洽性核验（工单 0025），
+    卡片清单一律以磁盘真实改动为权威（工单 0022 成果），不采信这里的申报。
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "payload 不是合法 JSON，请提交 JSON 对象字符串。"
+    if not isinstance(data, dict):
+        return None, "轮次产物必须是 JSON 对象。"
+    intent = str(data.get("intent") or "").strip()
+    if intent not in TURN_RESULT_INTENTS:
+        return None, f"intent 必须是 {' 或 '.join(TURN_RESULT_INTENTS)} 之一。"
+    summary = str(data.get("summary") or "").strip()
+    if not summary:
+        return None, "summary 不能为空：须给用户一句简短的中文总结。"
+    no_change_reason = str(data.get("no_change_reason") or "").strip()
+    if intent == "no_change" and not no_change_reason:
+        return None, "intent 为 no_change 时须给出 no_change_reason（无需改动的理由）。"
+    files_raw = data.get("changed_files")
+    if files_raw is None:
+        files_raw = []
+    if not isinstance(files_raw, list):
+        return None, "changed_files 必须是文件路径数组（无改动时为空数组）。"
+    changed_files = [str(f or "").strip() for f in files_raw]
+    if any(not f for f in changed_files):
+        return None, "changed_files 含空路径。"
+    return (
+        {
+            "intent": intent,
+            "summary": summary,
+            "changed_files": changed_files,
+            "no_change_reason": no_change_reason,
+        },
+        "",
+    )
+
+
+def recover_turn_result_payload(raw: str) -> dict | None:
+    """模型未调 submit_turn_result 而把产物 JSON 写进正文时，尽力恢复出合法产物。
+
+    房规同 recover_clarify_payload：部分推理模型会把 JSON 开头漏进 think 块、
+    或尾部被截断缺 `}`；从后往前扫描每个 `{` 候选起点，取到文末尝试解析，
+    解析失败再补 `}` 重试，返回首个通过 parse_turn_result_payload 校验的产物；
+    自由散文过不了 intent 枚举闸，天然不会误恢复。
+    """
+    starts = [m.start() for m in re.finditer(r"\{", raw)]
+    for start in reversed(starts):
+        candidate = raw[start:]
+        for fixed in (candidate, candidate + "}"):
+            parsed, _reason = parse_turn_result_payload(fixed)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def build_turn_result_tool() -> list:
+    """工程师轮的唯一终结出口工具（工单 0024）。
+
+    出口以工具调用为载体而非 response_format——二者是互斥的输出通道：
+    绑了工具还强制 JSON 输出，模型往往吐 JSON 而不调工具，循环直接断掉。
+    """
+
+    @tool
+    def submit_turn_result(payload: str) -> str:
+        """本轮全部工作完成时调用，提交轮次产物并结束本轮——这是唯一的收尾出口，不要用普通文本收尾。参数: payload — 轮次产物 JSON 对象字符串，含 intent（"modify_code" 改动了代码 / "no_change" 无需改动）、summary（给用户看的简短中文 Markdown 总结，只讲结论与现状，不复述调用过程）、changed_files（声明改动的文件路径数组，无改动为 []）、no_change_reason（无需改动时的理由，改动了代码则为 ""）。"""
+        return "已提交轮次产物。"
+
+    return [submit_turn_result]
+
+
 def execute_tool(tools: list, name: str, args: dict) -> tuple[bool, str]:
     """按名称执行工具，返回 (是否成功, 结果文本)；异常转成失败结果交还模型。"""
     for t in tools:

@@ -29,6 +29,7 @@ export interface MessageOut {
   // spec/spec_confirm 为需求规格与规格确认（工单 0016）
   // tickets/tickets_confirm 为工单清单与清单确认（工单 0017）
   // ticket 为单张工单的执行进度行（工单 0018）
+  // turn_result 为工程师轮次产物卡片（内容为产物 JSON，工单 0024）
   kind:
   | 'text'
   | 'prd'
@@ -44,6 +45,7 @@ export interface MessageOut {
   | 'thinking'
   | 'clarify'
   | 'clarify_answer'
+  | 'turn_result'
   content: string
   created_at: string
 }

@@ -53,6 +53,7 @@ interface ChatEntry {
     | 'ticket_progress'
     | 'thinking'
     | 'clarify'
+    | 'turn_result'
   // content 为打字机当前已显现的文本；raw 为已收到的完整增量（打字机源）
   content: string
   raw?: string
@@ -82,6 +83,39 @@ interface ChatEntry {
   recordCollapsed?: boolean
   // 未确认但其后已有任何消息 = 被取代（工单 0020 取代语义）：标签展示“已被取代”而非“待确认”
   superseded?: boolean
+  // 轮次产物卡片（工单 0024）：一句话总结 + 磁盘权威的改动文件清单 + 本轮 diff 入口
+  turnResult?: TurnResultInfo
+}
+
+// 轮次产物卡片字段（工单 0024 / ADR 0005「第 8 层」）：
+// changed_files 是磁盘真实改动（后端以轮前/轮末指纹比对为权威），
+// declared_files 是模型申报（仅留档，卡片不展示），snapshot_* 为本轮快照引用
+interface TurnResultInfo {
+  intent: 'modify_code' | 'no_change'
+  summary: string
+  changed_files: string[]
+  declared_files: string[]
+  no_change_reason: string
+  snapshot_id: number | null
+  snapshot_rev: number | null
+}
+
+function parseTurnResult(content: string): TurnResultInfo | null {
+  try {
+    const data = JSON.parse(content) as Record<string, unknown>
+    if (typeof data !== 'object' || data === null) return null
+    return {
+      intent: data.intent === 'no_change' ? 'no_change' : 'modify_code',
+      summary: String(data.summary ?? ''),
+      changed_files: Array.isArray(data.changed_files) ? data.changed_files.map(String) : [],
+      declared_files: Array.isArray(data.declared_files) ? data.declared_files.map(String) : [],
+      no_change_reason: typeof data.no_change_reason === 'string' ? data.no_change_reason : '',
+      snapshot_id: typeof data.snapshot_id === 'number' ? data.snapshot_id : null,
+      snapshot_rev: typeof data.snapshot_rev === 'number' ? data.snapshot_rev : null,
+    }
+  } catch {
+    return null
+  }
 }
 
 interface ClarifyQuestion {
@@ -437,6 +471,15 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
       } else {
         result.push({ id: `msg-${m.id}`, kind: 'user', content: m.content })
       }
+    } else if (m.kind === 'turn_result') {
+      // 轮次产物卡片（工单 0024）：刷新后由持久化历史重建；
+      // 解析失败降级为文本气泡，不丢消息
+      const info = parseTurnResult(m.content)
+      result.push(
+        info
+          ? { id: `msg-${m.id}`, kind: 'turn_result', content: m.content, turnResult: info }
+          : { id: `msg-${m.id}`, kind: 'text', content: m.content },
+      )
     } else if (m.kind === 'thinking') {
       // 思考历史回看：整段直出、默认折叠（诊断修复）
       result.push({ id: `msg-${m.id}`, kind: 'thinking', content: m.content, collapsed: true })
@@ -562,6 +605,17 @@ function formatTime(iso: string): string {
 function onViewDiff(snapshot: SnapshotOut) {
   diffSnapshot.value = snapshot
   diffVisible.value = true
+}
+
+// 产物卡片进本轮 diff（工单 0024）：复用版本差异面板，只需快照 id/rev
+function onViewTurnDiff(info: TurnResultInfo) {
+  if (info.snapshot_id == null) return
+  onViewDiff({
+    id: info.snapshot_id,
+    rev: info.snapshot_rev ?? 0,
+    file_count: 0,
+    created_at: '',
+  })
 }
 
 async function onRollback(snapshot: SnapshotOut) {
@@ -1012,6 +1066,17 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
           clarifyQuestions: parseClarify(content),
           clarifyAnswered: false,
         })
+      } else if (event.type === 'turn_result') {
+        // 轮次产物卡片（工单 0024）：事件一次携完整 payload，直接解析渲染；
+        // 流结束后以持久化历史重渲染（同其他卡片）
+        closeStreamingSegments()
+        const content = String(event.content ?? '')
+        entries.value.push({
+          id: nextId(),
+          kind: 'turn_result',
+          content,
+          turnResult: parseTurnResult(content) ?? undefined,
+        })
       } else if (event.type === 'ticket_progress') {
         // 工单执行进度（工单 0018）：同步卡片内工单状态与接口态，追加一行进度供实时可见；
         // 卡片内序号是相对编号，按清单下标对齐服务端 seq（重拆后续编也不错位）；
@@ -1226,6 +1291,49 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     澄清问题内容解析失败，可收起弹窗后直接在输入框回答
                   </div>
                 </div>
+              </div>
+            </div>
+            <div v-else-if="entry.kind === 'turn_result'" class="msg agent-msg">
+              <!-- 轮次产物卡片（工单 0024）：一句话总结 + 磁盘权威的改动文件清单 + 本轮 diff 入口；
+                   总结只讲结论，不复述工具调用过程（出口 payload 约束） -->
+              <div class="prd-card turn-result-card">
+                <div class="prd-head">
+                  <span class="prd-role">本轮产物</span>
+                  <el-tag v-if="entry.turnResult?.intent === 'no_change'" size="small" type="info">
+                    无需改动
+                  </el-tag>
+                  <el-tag v-else size="small" type="success">已改动代码</el-tag>
+                </div>
+                <div
+                  class="bubble markdown prd-body"
+                  v-html="renderMarkdown(entry.turnResult?.summary || '')"
+                />
+                <div v-if="entry.turnResult?.no_change_reason" class="turn-result-reason">
+                  理由：{{ entry.turnResult.no_change_reason }}
+                </div>
+                <div class="turn-result-files">
+                  <template v-if="entry.turnResult?.changed_files.length">
+                    <div class="turn-result-files-title">
+                      改动文件（{{ entry.turnResult.changed_files.length }}）
+                    </div>
+                    <div
+                      v-for="f in entry.turnResult.changed_files"
+                      :key="f"
+                      class="turn-result-file"
+                    >
+                      {{ f }}
+                    </div>
+                  </template>
+                  <div v-else class="turn-result-files-title">本轮无文件改动</div>
+                </div>
+                <el-button
+                  v-if="entry.turnResult?.snapshot_id != null"
+                  size="small"
+                  data-testid="turn-result-diff-button"
+                  @click="onViewTurnDiff(entry.turnResult)"
+                >
+                  查看本轮 diff
+                </el-button>
               </div>
             </div>
             <div v-else-if="entry.kind === 'consensus'" class="msg agent-msg">
@@ -2204,6 +2312,37 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   font-size: 13px;
   color: #409eff;
   padding-left: 12px;
+}
+
+/* 轮次产物卡片（工单 0024） */
+.turn-result-reason {
+  font-size: 13px;
+  color: #909399;
+  line-height: 1.6;
+}
+
+.turn-result-files {
+  border-top: 1px dashed #ebeef5;
+  padding-top: 8px;
+}
+
+.turn-result-files-title {
+  font-size: 12px;
+  color: #909399;
+  margin-bottom: 4px;
+}
+
+.turn-result-file {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  color: #303133;
+  padding: 2px 0 2px 12px;
+  word-break: break-all;
+}
+
+.turn-result-file::before {
+  content: '· ';
+  color: #67c23a;
 }
 
 .right-panel {
