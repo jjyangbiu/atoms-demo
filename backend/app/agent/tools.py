@@ -144,17 +144,33 @@ class FileSandbox:
         return self._write_to_disk(path, updated)
 
 
+def _read_file_tool(sandbox: FileSandbox):
+    @tool
+    def read_file(path: str) -> str:
+        """读取项目内文件内容。参数: path — 相对项目根目录的文件路径，如 index.html。"""
+        return sandbox.read_file(path)
+
+    return read_file
+
+
+def _search_templates_tool(knowledge_store):
+    @tool
+    def search_templates(query: str) -> str:
+        """检索模板知识库，获取相关应用模板与技术片段作为参考。参数: query — 想构建的应用或功能描述。"""
+        hits = knowledge_store.search(query, top_k=5)
+        if not hits:
+            return "未找到相关模板，可直接开始生成。"
+        return "\n\n".join(f"【{h['title']}】\n{h['text']}" for h in hits)
+
+    return search_templates
+
+
 def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
     """以闭包绑定沙箱，产出可供模型 bind_tools 的 LangChain 工具。
 
     knowledge_store 可用时（工单 0009）额外提供 search_templates 模板检索工具；
     知识库不可用时不注册该工具，生成主链路不受影响。
     """
-
-    @tool
-    def read_file(path: str) -> str:
-        """读取项目内文件内容。参数: path — 相对项目根目录的文件路径，如 index.html。"""
-        return sandbox.read_file(path)
 
     @tool
     def write_file(path: str, content: str) -> str:
@@ -166,18 +182,23 @@ def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
         """对已有文件做局部替换。old_text 必须从 read_file 结果逐字复制且在文件中唯一；空白/缩进有差异时尝试模糊匹配。修改前必须先 read_file。"""
         return sandbox.edit_file(path, old_text, new_text)
 
-    tools = [read_file, write_file, edit_file]
+    tools = [_read_file_tool(sandbox), write_file, edit_file]
     if knowledge_store is not None:
+        tools.append(_search_templates_tool(knowledge_store))
+    return tools
 
-        @tool
-        def search_templates(query: str) -> str:
-            """检索模板知识库，获取相关应用模板与技术片段作为参考。参数: query — 想构建的应用或功能描述。"""
-            hits = knowledge_store.search(query, top_k=5)
-            if not hits:
-                return "未找到相关模板，可直接开始生成。"
-            return "\n\n".join(f"【{h['title']}】\n{h['text']}" for h in hits)
 
-        tools.append(search_templates)
+def build_readonly_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
+    """只读工具集（工单 0027 / ADR 0005「第 7 层」）：咨询轮的全部能力。
+
+    仅 read_file + search_templates（知识库可用时），物理上不含任何写文件工具，
+    也不含终结出口——沿用澄清智能体「不绑文件工具则物理上无法写代码」的手法：
+    不靠劝说，靠能力缺失。能力边界决定核验义务：绑不到写工具就不可能产生产物，
+    自洽性恒真，故咨询轮以流式纯文本收尾，不产卡片、不核验、不入日志、不留快照。
+    """
+    tools = [_read_file_tool(sandbox)]
+    if knowledge_store is not None:
+        tools.append(_search_templates_tool(knowledge_store))
     return tools
 
 

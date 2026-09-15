@@ -73,6 +73,19 @@ def use_fake_model(app, script: list) -> FakeModel:
     return model
 
 
+def use_fake_utility_model(app, script: list) -> FakeModel:
+    """把辅助模型的可编程伪模型工厂装上（工单 0027），返回伪模型实例供断言。
+
+    辅助模型注入点全仓唯一，供意图分类器与后续正确性裁判（工单 0028）共用
+    （规格 0021「辅助接缝」）：分类器恒为第一次调用、裁判恒为最后一次，
+    二者永不重叠，按序排布脚本即可。received_messages 记录每次调用收到的
+    消息——「分类器不得看见文件内容」与「注入点隔离」经它断言。
+    """
+    model = FakeModel(script)
+    app.state.utility_model_factory = lambda settings: model
+    return model
+
+
 def use_fake_embeddings(app, dim: int = 256) -> FakeEmbedder:
     """把应用的桩 embedding 工厂装上，返回桩实例供断言（如调用计数）。"""
     embedder = FakeEmbedder(dim)
@@ -161,3 +174,35 @@ EDIT_STEPS = [
     },
 ]
 """伪模型脚本步：一次真实成功的文件编辑（种子文件 index.html 内容 v1 → v2）。"""
+
+
+# --- 意图分类的共享脚本步（规格 0021「共享脚本步常量」房规，工单 0027） ---
+
+
+def _intent_step(
+    intent: str = "modify_code",
+    user_goal: str = "按用户诉求调整应用。",
+    target_files: list[str] | None = None,
+) -> dict:
+    """辅助伪模型脚本步：意图分类调用的 JSON 输出（分类不绑工具、不流式）。"""
+    return {
+        "text": json.dumps(
+            {
+                "intent": intent,
+                "user_goal": user_goal,
+                "target_files": target_files if target_files is not None else [],
+            },
+            ensure_ascii=False,
+        )
+    }
+
+
+INTENT_MODIFY_STEP = _intent_step(
+    intent="modify_code", user_goal="把标题改成深色主题。", target_files=["index.html"]
+)
+"""辅助伪模型脚本步：意图分类判为「改动代码」（该轮绑完整工具集）。"""
+
+INTENT_CONSULT_STEP = _intent_step(
+    intent="consult", user_goal="咨询应用现状，无改动诉求。", target_files=[]
+)
+"""辅助伪模型脚本步：意图分类判为「咨询」（该轮只绑只读工具集）。"""

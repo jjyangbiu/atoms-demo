@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import sessionmaker
 
-from .agent.model import default_model_factory
+from .agent.model import default_model_factory, default_utility_model_factory
 from .config import Settings, get_settings
 from .db import Base, ensure_schema, make_engine
 from .public_links import resync as resync_public_links
@@ -20,6 +20,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     # 测试可替换为可编程伪模型工厂（见 tests/fake_model.py）
     app.state.model_factory = default_model_factory
+    # 辅助模型注入点（工单 0027 / 规格 0021）：意图分类与后续正确性裁判共用的
+    # 唯一一处注入点；调用侧未取到时回落既有 model_factory（加法式接缝，
+    # 既有测试文件与既有调用点零改动）
+    app.state.utility_model_factory = default_utility_model_factory
     # 测试可替换为桩 embedding 工厂（见 tests/conftest.py）；知识库懒构建，见 rag.store
     app.state.embedding_factory = default_embedding_factory
     app.state.knowledge_store = None

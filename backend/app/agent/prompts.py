@@ -62,15 +62,34 @@ def _render_log_entry(entry: dict, pos: int) -> str:
     # 空 files 渲染为系统核验事实（而非含义模糊的“（无）”）：
     # 该轮没有产生任何文件改动是磁盘事实，模型不得据对话记忆断言“已生效”。
     files_desc = ", ".join(files) if files else "（无——系统核验：该轮未产生任何文件改动）"
-    user_text = (entry.get("user_text") or "")[:100]
+    # 诉求注入优先用分类器蒸馏的 user_goal（工单 0027）：50 字内的目标比截断的
+    # 原话头部信息密度更高；旧条目无 user_goal 时回落截断原话（存量兼容）。
+    user_goal = (entry.get("user_goal") or "").strip()
+    injected_ask = user_goal or (entry.get("user_text") or "")[:100]
     return (
-        f"- 第{seq}次改动：用户诉求“{user_text}”；"
+        f"- 第{seq}次改动：用户诉求“{injected_ask}”；"
         f"改动文件：{files_desc}{_verdict_suffix(entry)}"
     )
 
 
+def _render_file_listing(file_summaries: list[dict]) -> str:
+    """文件清单渲染（路径+行数+哈希）：工程师提示、分类器提示、咨询提示共用。"""
+    return "\n".join(
+        f"- {s['path']}（{s['lines']} 行，哈希 {s['hash']}）" for s in file_summaries
+    )
+
+
+def _render_iteration_log(iteration_log: list[dict]) -> str:
+    """迭代日志逐条渲染：工程师提示与分类器提示共用。"""
+    return "\n".join(
+        _render_log_entry(e, pos) for pos, e in enumerate(iteration_log, start=1)
+    )
+
+
 def build_system_prompt(
-    file_summaries: list[dict], iteration_log: list[dict] | None = None
+    file_summaries: list[dict],
+    iteration_log: list[dict] | None = None,
+    intent_hint: dict | None = None,
 ) -> str:
     """拼接系统提示；附上文件摘要清单与迭代日志供多轮迭代参考。
 
@@ -78,18 +97,80 @@ def build_system_prompt(
       说明记忆已过时，必须 read_file。
     - iteration_log：按「改动」累积的摘要（系统自动追加、不截断），弥补对话窗口截断
       导致的失忆。序号语义是「第 N 次改动」而非「第 N 轮对话」（工单 0026）。
+    - intent_hint：意图分类器的蒸馏结果（工单 0027，分类失败时为 None）——预期触及
+      文件只作上下文注入参考，绝不当沙箱硬闸：工程师以真实需要为准，越出预期文件的
+      改动照样合法（轮末自洽性核验看磁盘，不看这份预判）。蒸馏的 user_goal 不注入
+      本轮提示：它的唯一去处是迭代日志注入（ADR 0005「迭代日志调整」），且后续裁判
+      的输入禁区明确包含它（不给智能体任何自述）。
     """
     prompt = ENGINEER_SYSTEM_PROMPT
     if file_summaries:
-        listing = "\n".join(
-            f"- {s['path']}（{s['lines']} 行，哈希 {s['hash']}）" for s in file_summaries
-        )
-        prompt += f"\n\n当前项目已有文件：\n{listing}"
+        prompt += f"\n\n当前项目已有文件：\n{_render_file_listing(file_summaries)}"
     if iteration_log:
-        log_lines = "\n".join(
-            _render_log_entry(e, pos) for pos, e in enumerate(iteration_log, start=1)
+        prompt += (
+            "\n\n迭代日志（按改动累积的摘要，帮你了解项目演进，避免重复或漏改）：\n"
+            f"{_render_iteration_log(iteration_log)}"
         )
-        prompt += f"\n\n迭代日志（按改动累积的摘要，帮你了解项目演进，避免重复或漏改）：\n{log_lines}"
+    if intent_hint and intent_hint.get("target_files"):
+        prompt += (
+            "\n\n本轮意图预判（分类器输出，仅供参考，不是硬性限制）：\n"
+            f"- 预期触及文件：{', '.join(intent_hint['target_files'])}"
+            "（只是预判：实际需要时可读写项目内任何文件，以真实需要为准）"
+        )
+    return prompt
+
+
+# 意图分类器（工单 0027 / ADR 0005「第 7 层」）：不绑工具、JSON Mode 收尾，
+# 只判能力边界（该轮绑什么工具集），不判义务（改不改得动由轮内机制自证）。
+INTENT_CLASSIFIER_SYSTEM_PROMPT = """你是 Atoms Demo 平台的意图分类器。判断用户对既有项目发来的最新消息属于哪种意图，只输出一个 JSON 对象，不输出任何其他文字。
+
+JSON 字段：
+- intent：只有两个合法值——"modify_code"（用户希望新增、修改或调整应用）或 "consult"（用户只是提问、了解情况或查看现状，没有改动诉求）。
+- user_goal：一句话蒸馏用户这条消息的核心诉求，不超过 50 字。
+- target_files：预计会触及的文件路径数组（从下方文件清单中选；咨询或无法判断时为空数组）。
+
+判定规则：
+1. 二值判定，不做更细的分类：不区分提问与闲聊，不区分大改与小改。
+2. 只要消息里带有想改点什么的诉求，就判 modify_code；拿不准时也判 modify_code——只有确定用户没有任何改动诉求时才判 consult。
+3. “改回上一版”“恢复以前的样子”这类请求判 consult：版本回退有专门的版本历史入口，不属于本轮代码改动。
+4. 只输出 JSON 对象本身：不要解释，不要 Markdown 代码块。"""
+
+
+def build_intent_prompt(
+    file_summaries: list[dict], iteration_log: list[dict] | None = None
+) -> str:
+    """分类器输入（工单 0027 验收）：文件清单（路径+行数+内容哈希）与迭代日志。
+
+    最近对话轮由调用方以 history 追加、用户当前话以 HumanMessage 追加；
+    文件内容绝不注入——分类是「输入小、输出小」的独立小调用（ADR 0005 成本边界）。
+    """
+    prompt = INTENT_CLASSIFIER_SYSTEM_PROMPT
+    if file_summaries:
+        prompt += f"\n\n当前项目文件清单：\n{_render_file_listing(file_summaries)}"
+    if iteration_log:
+        prompt += f"\n\n迭代日志：\n{_render_iteration_log(iteration_log)}"
+    return prompt
+
+
+# 咨询轮智能体（工单 0027 / ADR 0005「第 7 层」）：只绑只读工具集，
+# 以流式纯文本收尾——能力缺失代替劝说，物理上写不了文件。
+CONSULT_SYSTEM_PROMPT = """你是 Atoms Demo 平台的咨询智能体，回答用户对既有项目的提问。本轮是咨询轮：你只有只读能力（read_file 读取文件，可能还有 search_templates 检索模板），没有任何写文件的能力。
+
+工作方式：
+1. 回答涉及具体代码或内容时，先用 read_file 查看真实文件，引用实际内容作答，不凭记忆猜测。
+2. 用简洁清晰的中文纯文本直接回答；本轮不生成、不修改任何文件，也不需要调用任何收尾工具。
+3. 若用户其实想改动应用，或要求“改回上一版”：如实说明咨询轮不能也不会直接改文件——改动诉求请作为新消息再发一次，版本回退请使用页面上的版本历史回滚入口。"""
+
+
+def build_consult_prompt(
+    file_summaries: list[dict], iteration_log: list[dict] | None = None
+) -> str:
+    """咨询轮系统提示：同工程师轮一样附文件清单与迭代日志（回答现状也需要它们）。"""
+    prompt = CONSULT_SYSTEM_PROMPT
+    if file_summaries:
+        prompt += f"\n\n当前项目已有文件：\n{_render_file_listing(file_summaries)}"
+    if iteration_log:
+        prompt += f"\n\n迭代日志（项目演进摘要）：\n{_render_iteration_log(iteration_log)}"
     return prompt
 
 

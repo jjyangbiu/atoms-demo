@@ -14,11 +14,14 @@ from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from ..agent.intent import INTENT_CONSULT, classify_intent
 from ..agent.loop import run_generation
 from ..agent.prompts import (
     BREAKER_SYSTEM_PROMPT,
     CLARIFIER_SYSTEM_PROMPT,
     SPEC_AGENT_SYSTEM_PROMPT,
+    build_consult_prompt,
+    build_intent_prompt,
     build_system_prompt,
 )
 from ..agent.tools import (
@@ -26,6 +29,7 @@ from ..agent.tools import (
     SandboxViolation,
     build_breaker_tools,
     build_clarify_tools,
+    build_readonly_tools,
     build_tools,
     build_turn_result_tool,
     execute_tool,
@@ -563,6 +567,118 @@ def _consistency_feedback(kind: str, declared: set[str], touched: set[str]) -> s
     )
 
 
+# --- 意图识别与咨询轮（工单 0027 / ADR 0005「第 7 层」） ---
+
+
+async def _classify_round_intent(
+    request: Request, summaries: list, iteration_log: list, history: list, user_text: str
+) -> dict | None:
+    """经辅助模型注入点执行意图分类；任何失败返回 None（调用方静默降级为改动代码）。
+
+    注入点全仓唯一（app.state.utility_model_factory，规格 0021「辅助接缝」），供
+    分类器与后续正确性裁判（工单 0028）共用；取不到时回落既有 model_factory
+    （加法式接缝，既有调用点零改动）。分类不消耗生成名额：名额在 send_message
+    接受时已按「一轮一次」扣定，一轮里调用几次模型都与之无关（ADR 0005 成本边界）。
+    """
+    settings = request.app.state.settings
+    factory = (
+        getattr(request.app.state, "utility_model_factory", None)
+        or request.app.state.model_factory
+    )
+    try:
+        utility_model = factory(settings)
+    except Exception:  # noqa: BLE001 — 辅助模型不可用（如未配 Key）不得阻断轮次
+        return None
+    return await classify_intent(
+        utility_model, build_intent_prompt(summaries, iteration_log), history, user_text
+    )
+
+
+async def _consult_stream(
+    request: Request,
+    project_id: int,
+    user_text: str,
+    history: list,
+    model,
+    sandbox: FileSandbox,
+    summaries: list,
+    iteration_log: list,
+):
+    """咨询轮生成流（工单 0027）：只读工具集 + 流式纯文本收尾。
+
+    对工程师轮各机制的「有意缺席」清单（ADR 0005：能力边界决定核验义务）：
+    - 绑 build_readonly_tools——物理上无写能力、无终结出口（不靠劝说，靠能力缺失）；
+    - 无 final_text_hook——纯文本就是合法收尾，不做正文 JSON 恢复与出口回喂；
+    - 无产物卡片、无自洽性核验、不留快照、不入迭代日志——绑不到写工具就
+      不可能产生产物，自洽性恒真，日志按「改动」累积也就无账可入；
+    - 回答以 role=engineer, kind=text 落库（刷新可回看），done 事件只携文本，
+      不携 verdict/artifact 字段（前端对既有 text/done 事件的消费零改动）。
+
+    仅由 send_message 分派的用户对话迭代轮进入（user_round=True 且项目已有文件；
+    确认驱动的流水线轮与团队工单执行不进分类器，永不触发分流），故不挂接
+    result/on_event/extra_finalize 三个串行编排钩子。
+    """
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    tools = build_readonly_tools(sandbox, maybe_knowledge_store(request.app))
+    system_prompt = build_consult_prompt(summaries, iteration_log)
+
+    done_data: dict | None = None
+    thinking_parts: list[str] = []
+    try:
+        async for event in run_generation(
+            model,
+            tools,
+            execute_tool,
+            system_prompt,
+            history,
+            user_text,
+            max_steps=settings.agent_max_steps,
+            max_retries=settings.agent_max_retries,
+        ):
+            if event.type == "done":
+                # done 先扣下：落库完成后才外发，保证它是流的最后一个事件
+                done_data = event.data
+            else:
+                if event.type == "thinking":
+                    thinking_parts.append(event.data.get("content", ""))
+                yield _sse({"type": event.type, **event.data})
+                if event.type == "tool" and event.data.get("status") != "start":
+                    # 事件行落库照旧（ADR 0005：刷新可回看完整过程的证据链）
+                    _persist_event(session_factory, project_id, event.data)
+    except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，已流出思考仍落库
+        _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
+        yield _sse({"type": "error", "detail": f"生成中断: {e}"})
+        return
+    except BaseException:
+        # 刷新/断流触发的生成器关闭：落库已流出的思考后照旧退出（房规同工程师流）
+        _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
+        raise
+    if done_data is None:
+        # 循环已以 error 事件收尾（模型调用失败/超步数），不再重复报错
+        return
+
+    answer = done_data.get("text", "")
+    try:
+        with session_factory() as session:
+            thinking_text = "".join(thinking_parts).strip()
+            if thinking_text:
+                session.add(
+                    Message(project_id=project_id, role="engineer", kind="thinking", content=thinking_text)
+                )
+            session.add(
+                Message(project_id=project_id, role="engineer", kind="text", content=answer)
+            )
+            project_row = session.get(Project, project_id)
+            if project_row is not None:
+                project_row.updated_at = _utcnow()
+            session.commit()
+    except Exception as e:  # noqa: BLE001 — 落库失败须明示，不得静默断流
+        yield _sse({"type": "error", "detail": f"回答保存失败: {e}"})
+        return
+    yield _sse({"type": "done", "text": answer})
+
+
 async def _engineer_stream(
     request: Request,
     project_id: int,
@@ -572,6 +688,7 @@ async def _engineer_stream(
     on_event: Callable[[dict], dict] | None = None,
     extra_finalize: Callable[[Session, Snapshot], None] | None = None,
     record_iteration: bool = True,
+    user_round: bool = False,
 ):
     """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。
 
@@ -581,6 +698,10 @@ async def _engineer_stream(
     - extra_finalize：收尾落盘同一事务内的附加写入（如工单标 done 与检查点引用）。
     - record_iteration：是否将本轮计入迭代日志（Layer 5）。团队工单执行是内部编排而非
       用户对话轮，传 False——既不读也不写迭代日志，避免把工单指令当“用户说”注入后续提示。
+    - user_round：本轮是否用户对话消息轮（send_message 分派，工单 0027）。只有用户轮
+      进意图分类器（ADR 0005 第 7 层「落到工程师智能体的用户对话轮」）——确认驱动的
+      确定性流水线轮（共识/PRD/规格确认后的实现轮）不分类：其确认文案不携带用户诉求，
+      交给分类器等于用 LLM 替换状态机，一旦判为咨询，实现轮被污染成只读问答。
     """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
@@ -632,7 +753,27 @@ async def _engineer_stream(
     # _file_summaries 本就读磁盘（路径 + 行数 + 内容哈希），系统提示注入复用同一次扫描；
     # 基准取磁盘而非上一个快照——越界轮不建快照会使快照序列与磁盘序列脱钩。
     summaries = _file_summaries(sandbox.root)
-    system_prompt = build_system_prompt(summaries, iteration_log)
+
+    # 意图分类闸（工单 0027 / ADR 0005「第 7 层」）：只有「落到工程师智能体的用户对话轮」
+    # 进分类器——user_round 仅由 send_message 置 True。首建轮（summaries 为空）、
+    # 确认驱动的确定性流水线轮（共识/PRD/规格确认，含克隆团队项目确认规格后的直接实现轮）
+    # 与团队工单执行（内部编排）全部排除；克隆项目的第一条消息走 send_message，
+    # 就是普通迭代轮，照常分类。分类失败（返回 None）静默降级为改动代码：
+    # 假阴性没有轮内自愈机制，宁可多绑工具。
+    classification: dict | None = None
+    if user_round and summaries:
+        classification = await _classify_round_intent(
+            request, summaries, iteration_log, history, user_text
+        )
+    if classification is not None and classification["intent"] == INTENT_CONSULT:
+        # 咨询轮：只绑只读工具集，流式纯文本收尾——不产卡片、不核验、不入日志、不留快照
+        async for chunk in _consult_stream(
+            request, project_id, user_text, history, model, sandbox, summaries, iteration_log
+        ):
+            yield chunk
+        return
+
+    system_prompt = build_system_prompt(summaries, iteration_log, intent_hint=classification)
     pre_round = _fingerprint(summaries)
 
     # 自洽性核验状态（工单 0025）：每轮至多一次精确差异回喂，出口工具路径与
@@ -850,6 +991,10 @@ async def _engineer_stream(
                         {
                             "seq": len(log) + 1,
                             "user_text": user_text,
+                            # 分类器蒸馏的用户目标（工单 0027）：接管后续轮次的日志
+                            # 注入（渲染侧优先用它，替代截断原话）；分类缺席（降级、
+                            # 团队工单执行、首建轮）时为空串，渲染回落截断原话。
+                            "user_goal": (classification or {}).get("user_goal") or "",
                             "files": sorted(touched_files),
                             "verdict": verdict,
                             "mismatch_kind": mismatch_kind,
@@ -1555,8 +1700,9 @@ async def send_message(
                 async for chunk in _break_stream(request, project_id, body.content, history):
                     yield chunk
             else:
+                # 用户对话轮（迭代/首建）：唯一进意图分类器的入口（工单 0027）
                 async for chunk in _engineer_stream(
-                    request, project_id, body.content, history
+                    request, project_id, body.content, history, user_round=True
                 ):
                     yield chunk
 

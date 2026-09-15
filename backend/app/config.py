@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     llm_model: str = "MiniMax-M3"
     llm_api_key: str = ""
     llm_temperature: float = 0.2
+    # 辅助模型（工单 0027 / ADR 0005「成本边界」）：意图分类与后续正确性裁判这类
+    # 「输入小、输出小、不需要强推理」的独立小调用使用的模型；默认（置空）等于
+    # llm_model——本次不切实测过的小模型，实测成本或延迟有问题时改这一项即可切。
+    llm_utility_model: str = ""
     # 智能体单次生成的最大工具循环步数与失败重试次数
     agent_max_steps: int = 20
     agent_max_retries: int = 2
