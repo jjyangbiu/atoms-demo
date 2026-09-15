@@ -96,6 +96,7 @@ class TestGeneration:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "第一版完成。"},
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"text": "已更新。"},
             ],

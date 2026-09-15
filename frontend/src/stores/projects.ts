@@ -62,6 +62,21 @@ export interface SnapshotOut {
   ticket_seq?: number | null
 }
 
+// 差异面板（Layer 6 安全网）：某版相对前一版的文件级改动
+export interface DiffFileOut {
+  path: string
+  status: 'added' | 'modified' | 'removed'
+  old: string
+  new: string
+}
+
+export interface SnapshotDiffOut {
+  // 首版无基线时 base_rev 为 null
+  base_rev: number | null
+  target_rev: number
+  files: DiffFileOut[]
+}
+
 // 工单清单条目（工单 0017）：执行状态与检查点快照版本由串行执行写入（工单 0018）
 export interface TicketOut {
   seq: number
@@ -104,6 +119,13 @@ export const useProjectStore = defineStore('projects', () => {
     return api<SnapshotOut[]>(`/api/projects/${projectId}/snapshots`)
   }
 
+  async function fetchSnapshotDiff(
+    projectId: number,
+    snapshotId: number,
+  ): Promise<SnapshotDiffOut> {
+    return api<SnapshotDiffOut>(`/api/projects/${projectId}/snapshots/${snapshotId}/diff`)
+  }
+
   async function fetchTickets(projectId: number): Promise<TicketOut[]> {
     return api<TicketOut[]>(`/api/projects/${projectId}/tickets`)
   }
@@ -130,6 +152,7 @@ export const useProjectStore = defineStore('projects', () => {
     fetchMessages,
     fetchFiles,
     fetchSnapshots,
+    fetchSnapshotDiff,
     fetchTickets,
     rollbackSnapshot,
     publishProject,

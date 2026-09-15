@@ -111,6 +111,7 @@ class TestPublish:
                 FIRST_BUILD_CLARIFY_STEP,
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>v1</h1>"})]},
                 {"text": "第一版。"},
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {
                     "tool_calls": [
                         ("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})

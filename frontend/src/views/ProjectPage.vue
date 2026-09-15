@@ -16,6 +16,8 @@ import {
 
 // 代码视图异步加载：Monaco 体积较大，仅在切到代码 Tab 时才拉取（工单 0007）
 const CodeView = defineAsyncComponent(() => import('@/components/CodeView.vue'))
+// 差异面板同样按需异步加载（Layer 6 安全网）：仅在打开某版本“查看改动”时才拉取
+const DiffPanel = defineAsyncComponent(() => import('@/components/DiffPanel.vue'))
 
 interface ToolInfo {
   name: string
@@ -188,6 +190,9 @@ const fileList = ref<FileOut[]>([])
 const snapshots = ref<SnapshotOut[]>([])
 const historyVisible = ref(false)
 const rollingBackId = ref<number | null>(null)
+// 差异面板（Layer 6 安全网）：查看某版本相对前一版的文件级改动
+const diffVisible = ref(false)
+const diffSnapshot = ref<SnapshotOut | null>(null)
 let seq = 0
 let lastUserContent = ''
 
@@ -551,6 +556,12 @@ async function loadTickets() {
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleString()
+}
+
+// 打开差异面板：核对该版本相对前一版改了哪些文件（Layer 6 安全网）
+function onViewDiff(snapshot: SnapshotOut) {
+  diffSnapshot.value = snapshot
+  diffVisible.value = true
 }
 
 async function onRollback(snapshot: SnapshotOut) {
@@ -1596,18 +1607,40 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             </div>
             <div class="snapshot-meta">{{ formatTime(s.created_at) }} · {{ s.file_count }} 个文件</div>
           </div>
-          <el-button
-            size="small"
-            :loading="rollingBackId === s.id"
-            :disabled="generating || rollingBackId !== null"
-            data-testid="rollback-button"
-            @click="onRollback(s)"
-          >
-            回滚
-          </el-button>
+          <div class="snapshot-actions">
+            <el-button size="small" text data-testid="diff-button" @click="onViewDiff(s)">
+              查看改动
+            </el-button>
+            <el-button
+              size="small"
+              :loading="rollingBackId === s.id"
+              :disabled="generating || rollingBackId !== null"
+              data-testid="rollback-button"
+              @click="onRollback(s)"
+            >
+              回滚
+            </el-button>
+          </div>
         </li>
       </ul>
     </el-drawer>
+
+    <el-dialog
+      v-model="diffVisible"
+      :title="diffSnapshot ? `版本 ${diffSnapshot.rev} 的改动` : '改动'"
+      width="72%"
+      top="6vh"
+      destroy-on-close
+      data-testid="diff-dialog"
+    >
+      <div class="diff-dialog-body">
+        <DiffPanel
+          v-if="diffSnapshot"
+          :project-id="projectId"
+          :snapshot-id="diffSnapshot.id"
+        />
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -2206,6 +2239,17 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   padding: 10px 12px;
   border: 1px solid #ebeef5;
   border-radius: 8px;
+}
+
+.snapshot-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.diff-dialog-body {
+  height: 70vh;
 }
 
 .snapshot-title {

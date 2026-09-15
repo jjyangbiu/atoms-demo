@@ -33,7 +33,8 @@ class TestIteration:
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
                 {"text": "第一版完成。"},
-                # 迭代轮：只改 index.html
+                # 迭代轮：先读后改（read-before-write 强制）
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"text": "已更新。"},
             ],

@@ -146,3 +146,20 @@ class SnapshotOut(BaseModel):
 
 class SnapshotDetailOut(SnapshotOut):
     files: list[FileOut] = []
+
+
+class DiffFileOut(BaseModel):
+    """单个变更文件的差异（Layer 6 安全网）：status ∈ added | modified | removed。"""
+
+    path: str
+    status: str
+    old: str
+    new: str
+
+
+class SnapshotDiffOut(BaseModel):
+    """某快照相对前一版的文件级差异清单；base_rev 为 None 表示首版（全部新增）。"""
+
+    base_rev: int | None
+    target_rev: int
+    files: list[DiffFileOut] = []

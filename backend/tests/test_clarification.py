@@ -270,6 +270,7 @@ class TestExistingFilesSkipClarify:
         use_fake_model(
             app,
             [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"text": "已更新。"},
             ],

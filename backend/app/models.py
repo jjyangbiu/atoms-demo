@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -31,6 +31,8 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     # engineer | team（team 模式在后续工单交付）
     mode: Mapped[str] = mapped_column(String(16), default="engineer", nullable=False)
+    # 迭代日志：每轮成功生成的改动摘要（系统自动追加、不截断），弥补对话窗口截断的失忆
+    iteration_log: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

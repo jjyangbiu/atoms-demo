@@ -104,3 +104,40 @@ def _prune_old_snapshots(
     for stale in all_rows[max_kept:]:
         shutil.rmtree(snapshots_root(project_root) / str(stale.rev), ignore_errors=True)
         session.delete(stale)
+
+
+def read_snapshot_file(project_root: Path, rev: int, rel_path: str) -> str | None:
+    """读取某快照版本内指定文件的文本内容；不存在或不可解码返回 None。"""
+    source = snapshots_root(project_root) / str(rev) / rel_path
+    if not source.is_file():
+        return None
+    try:
+        return source.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+def diff_snapshot(project_root: Path, base: Snapshot | None, target: Snapshot) -> list[dict]:
+    """比较目标快照与基线快照，返回有内容变化的文件（added/modified/removed）。
+
+    base 为 None（首个快照）时，目标内全部文件视为 added；未改动的文件不出现在结果里。
+    Layer 6 安全网：让用户在每轮迭代后核对“只改了该改的文件”，捕捉意外波及的改动。
+    """
+    base_files = (
+        {p for p, _ in list_snapshot_files(project_root, base)} if base is not None else set()
+    )
+    target_files = {p for p, _ in list_snapshot_files(project_root, target)}
+    changed: list[dict] = []
+    for path in sorted(base_files | target_files):
+        old = read_snapshot_file(project_root, base.rev, path) if base is not None else None
+        new = read_snapshot_file(project_root, target.rev, path)
+        if old == new:
+            continue
+        if old is None:
+            file_status = "added"
+        elif new is None:
+            file_status = "removed"
+        else:
+            file_status = "modified"
+        changed.append({"path": path, "status": file_status, "old": old or "", "new": new or ""})
+    return changed

@@ -40,20 +40,40 @@ def resolve_sandboxed(root: Path, rel_path: str) -> Path:
     return candidate
 
 
+def _locate_ignoring_whitespace(current: str, old_text: str) -> re.Match | None:
+    """在 current 中定位 old_text，忽略空白/缩进差异。
+
+    把 old_text 按空白拆成 token，用 \\s+ 连接成正则，在 current 中搜索。
+    仅在唯一命中时返回 Match（含原始空白区间），0 或多处命中返回 None。
+    """
+    tokens = old_text.split()
+    if not tokens:
+        return None
+    pattern = r"\s+".join(re.escape(t) for t in tokens)
+    matches = list(re.finditer(pattern, current))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 class FileSandbox:
     """绑定到单个项目目录的文件工具实现。"""
 
     def __init__(self, root: Path):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self._read_this_round: set[str] = set()
 
     def read_file(self, path: str) -> str:
         target = resolve_sandboxed(self.root, path)
         if not target.is_file():
             raise SandboxViolation(f"文件不存在: {path}")
-        return target.read_text(encoding="utf-8")
+        content = target.read_text(encoding="utf-8")
+        self._read_this_round.add(path)
+        return content
 
-    def write_file(self, path: str, content: str) -> str:
+    def _write_to_disk(self, path: str, content: str) -> str:
+        """实际落盘（内部方法，不做存在性检查；edit_file 也经此持久化）。"""
         target = resolve_sandboxed(self.root, path)
         data = content.encode("utf-8")
         if len(data) > MAX_FILE_BYTES:
@@ -62,11 +82,44 @@ class FileSandbox:
         target.write_text(content, encoding="utf-8")
         return f"已写入 {path}（{len(data)} 字节）"
 
+    def write_file(self, path: str, content: str) -> str:
+        target = resolve_sandboxed(self.root, path)
+        if target.is_file():
+            raise SandboxViolation(
+                f"文件 {path} 已存在；修改已有文件必须走 edit_file（先 read_file 再 edit_file），"
+                f"write_file 只用于新建文件"
+            )
+        result = self._write_to_disk(path, content)
+        self._read_this_round.add(path)  # 模型刚创建的文件，内容已知，无需再 read
+        return result
+
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
+        """分层定位替换：精确唯一 → 精确歧义 → 空白模糊 → 失败指引。"""
+        if path not in self._read_this_round:
+            raise SandboxViolation(
+                f"修改 {path} 前必须先 read_file 确认当前内容；不得凭记忆修改"
+            )
         current = self.read_file(path)
-        if old_text not in current:
-            raise SandboxViolation(f"在 {path} 中未找到要替换的内容，请先 read_file 确认")
-        return self.write_file(path, current.replace(old_text, new_text, 1))
+        if not old_text:
+            raise SandboxViolation(
+                "old_text 不能为空；请先 read_file 确认要修改的内容，再提供精确的 old_text"
+            )
+        count = current.count(old_text)
+        if count == 1:
+            return self._write_to_disk(path, current.replace(old_text, new_text, 1))
+        if count > 1:
+            raise SandboxViolation(
+                f"old_text 在 {path} 中出现 {count} 次，无法确定修改哪一处；"
+                f"请提供更多上下文使 old_text 唯一"
+            )
+        # 精确匹配落空：尝试忽略空白/缩进差异的模糊匹配
+        match = _locate_ignoring_whitespace(current, old_text)
+        if match is None:
+            raise SandboxViolation(
+                f"在 {path} 中未找到要替换的内容（含忽略空白差异的模糊匹配）；"
+                f"请先 read_file 确认当前内容，逐字复制 old_text"
+            )
+        return self._write_to_disk(path, current[: match.start()] + new_text + current[match.end() :])
 
 
 def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
@@ -83,12 +136,12 @@ def build_tools(sandbox: FileSandbox, knowledge_store=None) -> list:
 
     @tool
     def write_file(path: str, content: str) -> str:
-        """创建新文件或整体覆盖已有文件。参数: path — 相对路径；content — 完整文件内容。"""
+        """创建新文件。不能用于修改已有文件（修改请用 edit_file）。参数: path — 相对路径；content — 完整文件内容。"""
         return sandbox.write_file(path, content)
 
     @tool
     def edit_file(path: str, old_text: str, new_text: str) -> str:
-        """对已有文件做局部替换（替换第一处出现的 old_text）。修改前请先 read_file。"""
+        """对已有文件做局部替换。old_text 必须从 read_file 结果逐字复制且在文件中唯一；空白/缩进有差异时尝试模糊匹配。修改前必须先 read_file。"""
         return sandbox.edit_file(path, old_text, new_text)
 
     tools = [read_file, write_file, edit_file]

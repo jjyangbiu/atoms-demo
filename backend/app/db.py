@@ -23,7 +23,8 @@ def ensure_schema(engine) -> None:
     """create_all 不改存量表：首期后新增的列对旧库自动补齐。
 
     项目没有迁移框架且只支持 SQLite（同 official_samples._ensure_official_column 先例）：
-    工单 0018 给 tickets 表新增检查点快照引用列 snapshot_id。
+    - 工单 0018 给 tickets 表新增检查点快照引用列 snapshot_id；
+    - Layer 5 给 projects 表新增迭代日志列 iteration_log。
     """
     if engine.dialect.name != "sqlite":
         return
@@ -32,3 +33,10 @@ def ensure_schema(engine) -> None:
     if columns and "snapshot_id" not in columns:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE tickets ADD COLUMN snapshot_id INTEGER"))
+    with engine.connect() as conn:
+        project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
+    if project_columns and "iteration_log" not in project_columns:
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE projects ADD COLUMN iteration_log JSON NOT NULL DEFAULT '[]'")
+            )

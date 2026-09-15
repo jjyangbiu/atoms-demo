@@ -28,6 +28,7 @@ _ONE_SAMPLE_SCRIPT = [
     FIRST_BUILD_CLARIFY_STEP,
     {"tool_calls": [("write_file", {"path": "index.html", "content": "<h1>示例</h1>"})]},
     {"text": "已完成。"},
+    {"tool_calls": [("read_file", {"path": "index.html"})]},
     {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "示例", "new_text": "官方示例"})]},
     {"text": "已调整。"},
 ]

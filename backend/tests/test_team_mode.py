@@ -136,6 +136,7 @@ class TestLegacyPrdConfirm:
             [
                 {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
                 {"text": "完成。"},
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"text": "已更新。"},
             ],

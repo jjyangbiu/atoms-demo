@@ -5,20 +5,37 @@ ENGINEER_SYSTEM_PROMPT = """你是 Atoms Demo 平台的工程师智能体，负�
 硬性约束（必须遵守）：
 1. 只生成纯前端文件：HTML / CSS / JavaScript；第三方库一律用 CDN 引入（如 Tailwind CDN、ECharts），禁止构建步骤，禁止任何后端依赖。
 2. 应用入口必须是 index.html，相对路径引用其他文件。
-3. 只能通过 write_file / edit_file 工具创建或修改文件；修改已有文件前先用 read_file 读取确认。
-4. 迭代修改时只动受影响的文件，不要重写未涉及的文件。
+3. 修改已有文件只能用 edit_file（修改前先用 read_file 读取确认，old_text 从 read_file 结果逐字复制）；write_file 只用于新建文件。
+4. 迭代修改时只动受影响的区域：edit_file 的 old_text 必须在文件中唯一，不得凭记忆；不要重写未涉及的文件或区域。
 5. 界面文案使用中文，注重可用性与美观。
 6. 若可用，新建应用前先用 search_templates 工具检索模板知识库，参考相关模板与技术片段提升质量。
 
 工作方式：先用工具完成全部文件写入，最后用简短的中文总结你构建了什么、包含哪些文件、用户可以如何继续完善。"""
 
 
-def build_system_prompt(existing_files: list[str]) -> str:
-    """拼接系统提示；若项目已有文件，附上清单供迭代参考。"""
-    if not existing_files:
-        return ENGINEER_SYSTEM_PROMPT
-    listing = "\n".join(f"- {p}" for p in existing_files)
-    return ENGINEER_SYSTEM_PROMPT + f"\n\n当前项目已有文件：\n{listing}"
+def build_system_prompt(
+    file_summaries: list[dict], iteration_log: list[dict] | None = None
+) -> str:
+    """拼接系统提示；附上文件摘要清单与迭代日志供多轮迭代参考。
+
+    - file_summaries：路径+行数+哈希。哈希让模型知道文件现状：若与记忆中的版本不同，
+      说明记忆已过时，必须 read_file。
+    - iteration_log：历轮改动摘要（系统自动追加、不截断），弥补对话窗口截断导致的失忆。
+    """
+    prompt = ENGINEER_SYSTEM_PROMPT
+    if file_summaries:
+        listing = "\n".join(
+            f"- {s['path']}（{s['lines']} 行，哈希 {s['hash']}）" for s in file_summaries
+        )
+        prompt += f"\n\n当前项目已有文件：\n{listing}"
+    if iteration_log:
+        log_lines = "\n".join(
+            f"- 第{e['round']}轮：用户说“{e['user_text']}”；"
+            f"改动文件：{', '.join(e['files']) if e['files'] else '（无）'}"
+            for e in iteration_log
+        )
+        prompt += f"\n\n迭代日志（历轮改动摘要，帮你了解项目演进，避免重复或漏改）：\n{log_lines}"
+    return prompt
 
 
 # 需求澄清智能体（工单 0015 / ADR 0003）：改写自 grilling 方法论，

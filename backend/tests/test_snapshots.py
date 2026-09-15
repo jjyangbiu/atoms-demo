@@ -50,7 +50,7 @@ class TestSnapshotCreation:
         )
         _generate(
             client, auth_headers, project["id"],
-            [{"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]}, {"text": "ok"}],
+            [{"tool_calls": [("read_file", {"path": "index.html"})]}, {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]}, {"text": "ok"}],
         )
 
         resp = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers)
@@ -126,6 +126,7 @@ class TestRollback:
         _generate(
             client, auth_headers, project["id"],
             [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
                 {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
                 {"text": "ok"},
             ],
@@ -269,3 +270,99 @@ class TestFileContent:
         resp = rel_client.get(f"/api/projects/{project['id']}/files/index.html", headers=headers)
         assert resp.status_code == 200, resp.text
         assert resp.json()["content"] == "<h1>rel</h1>"
+
+
+class TestSnapshotDiff:
+    """差异端点（Layer 6 安全网）：某版相对前一版的文件级改动，供用户核对“只改了该改的”。"""
+
+    def test_first_snapshot_diff_marks_all_added(self, app, client, auth_headers):
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                {"text": "ok"},
+            ],
+        )
+        snap = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]
+        resp = client.get(
+            f"/api/projects/{project['id']}/snapshots/{snap['id']}/diff", headers=auth_headers
+        )
+        assert resp.status_code == 200
+        diff = resp.json()
+        # 首版无基线：base_rev 为 None，全部文件标 added
+        assert diff["base_rev"] is None and diff["target_rev"] == 1
+        assert [(f["path"], f["status"]) for f in diff["files"]] == [("index.html", "added")]
+        assert diff["files"][0]["old"] == "" and diff["files"][0]["new"] == "v1"
+
+    def test_diff_shows_only_changed_files_between_revs(self, app, client, auth_headers):
+        project = _create_project(client, auth_headers)
+        # 首版：index.html + styles.css
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                {"tool_calls": [("write_file", {"path": "styles.css", "content": "body{}"})]},
+                {"text": "ok"},
+            ],
+        )
+        # 迭代：只改 index.html、新增 app.js；styles.css 不动
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
+                {"tool_calls": [("write_file", {"path": "app.js", "content": "// js"})]},
+                {"text": "ok"},
+            ],
+        )
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        rev2 = next(s for s in snaps if s["rev"] == 2)
+        diff = client.get(
+            f"/api/projects/{project['id']}/snapshots/{rev2['id']}/diff", headers=auth_headers
+        ).json()
+        assert diff["base_rev"] == 1 and diff["target_rev"] == 2
+        by_path = {f["path"]: f for f in diff["files"]}
+        # 未改动的 styles.css 不出现；改动/新增按状态标注（旧新内容齐备）
+        assert set(by_path) == {"index.html", "app.js"}
+        assert by_path["index.html"]["status"] == "modified"
+        assert by_path["index.html"]["old"] == "v1" and by_path["index.html"]["new"] == "v2"
+        assert by_path["app.js"]["status"] == "added" and by_path["app.js"]["new"] == "// js"
+
+    def test_diff_other_projects_snapshot_is_404(self, app, client, auth_headers):
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]}, {"text": "ok"},
+            ],
+        )
+        snap_id = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()[0]["id"]
+        client.post("/api/auth/register", json={"username": "eve_diff", "password": "secret123"})
+        eve_headers = {"Authorization": f"Bearer {login(client, 'eve_diff', 'secret123')}"}
+        assert client.get(
+            f"/api/projects/{project['id']}/snapshots/{snap_id}/diff", headers=eve_headers
+        ).status_code == 404
+
+
+def test_diff_snapshot_detects_removed_file(tmp_path):
+    """diff_snapshot 的 removed 分支：基线有、目标无的文件标 removed（生成无删除工具，直接验辅助函数）。"""
+    from types import SimpleNamespace
+
+    from app.snapshots import diff_snapshot, snapshots_root
+
+    # 手工铺两个快照留档：rev1 有 a.html + b.html，rev2 只剩 a.html（内容也改了）
+    for rev, files in [(1, {"a.html": "A", "b.html": "B"}), (2, {"a.html": "A2"})]:
+        d = snapshots_root(tmp_path) / str(rev)
+        d.mkdir(parents=True)
+        for name, content in files.items():
+            (d / name).write_text(content, encoding="utf-8")
+
+    changes = {c["path"]: c for c in diff_snapshot(tmp_path, SimpleNamespace(rev=1), SimpleNamespace(rev=2))}
+    assert changes["a.html"]["status"] == "modified"
+    assert changes["a.html"]["old"] == "A" and changes["a.html"]["new"] == "A2"
+    assert changes["b.html"]["status"] == "removed"
+    assert changes["b.html"]["old"] == "B" and changes["b.html"]["new"] == ""

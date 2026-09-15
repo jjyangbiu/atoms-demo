@@ -1,6 +1,7 @@
 """项目 CRUD、对话历史、生成消息（SSE 流式）、预览托管。"""
 
 import asyncio
+import hashlib
 import json
 import math
 import shutil
@@ -49,11 +50,13 @@ from ..schemas import (
     ProjectOut,
     SendMessageRequest,
     SnapshotDetailOut,
+    SnapshotDiffOut,
     SnapshotOut,
     TicketOut,
 )
 from ..snapshots import (
     create_snapshot,
+    diff_snapshot,
     iter_project_files,
     list_snapshot_files,
     restore_snapshot,
@@ -360,7 +363,7 @@ def _sync_file_index(db: Session, project_id: int, root: Path) -> None:
 
 
 def _existing_file_paths(db: Session, project_id: int) -> list[str]:
-    """项目当前文件索引的路径清单（按路径排序），供系统提示与分流判断共用。"""
+    """项目当前文件索引的路径清单（按路径排序），供分流判断用。"""
     return list(
         db.scalars(
             select(ProjectFile.path)
@@ -368,6 +371,30 @@ def _existing_file_paths(db: Session, project_id: int) -> list[str]:
             .order_by(ProjectFile.path)
         )
     )
+
+
+def _file_summaries(project_root: Path) -> list[dict]:
+    """计算项目目录下每个文件的摘要：路径、行数、内容哈希前 8 位。
+
+    供系统提示注入，让模型知道文件现状（哈希变了 = 记忆已过时，必须 read_file）。
+    """
+    summaries: list[dict] = []
+    if not project_root.is_dir():
+        return summaries
+    for f in sorted(project_root.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(project_root)
+        if "snapshots" in rel.parts:
+            continue
+        try:
+            content = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+        lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        summaries.append({"path": rel.as_posix(), "lines": lines, "hash": sha})
+    return summaries
 
 
 def _sse(event: dict) -> str:
@@ -445,10 +472,10 @@ async def _engineer_stream(
     project_id: int,
     user_text: str,
     history: list,
-    existing_files: list[str],
     result: dict | None = None,
     on_event: Callable[[dict], dict] | None = None,
     extra_finalize: Callable[[Session, Snapshot], None] | None = None,
+    record_iteration: bool = True,
 ):
     """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。
 
@@ -456,6 +483,8 @@ async def _engineer_stream(
     - result：记录收尾结果 {"ok": bool}，成功时附 snapshot（检查点），失败时附 error；
     - on_event：外发前改写事件（如把每单的 done 换成工单进度事件）；
     - extra_finalize：收尾落盘同一事务内的附加写入（如工单标 done 与检查点引用）。
+    - record_iteration：是否将本轮计入迭代日志（Layer 5）。团队工单执行是内部编排而非
+      用户对话轮，传 False——既不读也不写迭代日志，避免把工单指令当“用户说”注入后续提示。
     """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
@@ -476,10 +505,18 @@ async def _engineer_stream(
     sandbox = FileSandbox(project_dir(request, project_id))
     # 知识库可用时附带 search_templates 检索工具（工单 0009）；不可用时降级为纯文件工具
     tools = build_tools(sandbox, maybe_knowledge_store(request.app))
-    system_prompt = build_system_prompt(existing_files)
+    # 迭代日志（Layer 5）：读入历轮改动摘要注入系统提示，弥补对话窗口截断的失忆。
+    # 团队工单执行（record_iteration=False）是内部编排而非用户对话轮，不读迭代日志。
+    iteration_log: list = []
+    if record_iteration:
+        with session_factory() as session:
+            _row = session.get(Project, project_id)
+            iteration_log = list(_row.iteration_log) if _row and _row.iteration_log else []
+    system_prompt = build_system_prompt(_file_summaries(sandbox.root), iteration_log)
 
     done_data: dict | None = None
     thinking_parts: list[str] = []
+    touched_files: set[str] = set()
     try:
         async for event in run_generation(
             model,
@@ -502,8 +539,17 @@ async def _engineer_stream(
                     result["ok"] = False
                     result["error"] = event.data.get("detail", "")
                 yield _emit({"type": event.type, **event.data})
-                if event.type == "tool" and event.data.get("status") != "start":
-                    _persist_event(session_factory, project_id, event.data)
+                if event.type == "tool":
+                    # Layer 5：收集本轮成功改动的文件路径，收尾时写入迭代日志
+                    if event.data.get("status") == "done" and event.data.get("name") in (
+                        "write_file",
+                        "edit_file",
+                    ):
+                        _path = (event.data.get("args") or {}).get("path")
+                        if _path:
+                            touched_files.add(_path)
+                    if event.data.get("status") != "start":
+                        _persist_event(session_factory, project_id, event.data)
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
         if result is not None:
             result["ok"] = False
@@ -542,6 +588,17 @@ async def _engineer_stream(
             project_row = session.get(Project, project_id)
             if project_row is not None:
                 project_row.updated_at = _utcnow()
+                # Layer 5：仅成功的对话轮留痕；JSON 列整体重赋值以触发 SQLAlchemy 变更检测
+                if done_data is not None and record_iteration:
+                    log = list(project_row.iteration_log or [])
+                    log.append(
+                        {
+                            "round": len(log) + 1,
+                            "user_text": user_text[:100],
+                            "files": sorted(touched_files),
+                        }
+                    )
+                    project_row.iteration_log = log
             session.commit()
     except Exception as e:  # noqa: BLE001 — 收尾落盘失败也须以 error 事件告知，不得静默断流
         if result is not None:
@@ -851,7 +908,6 @@ async def _exec_tickets_stream(request: Request, project_id: int):
                 before_message_id=_ALL_MESSAGES,
                 window=settings.agent_history_window,
             )
-            existing_files = _existing_file_paths(session, project_id)
 
         yield _sse(
             {
@@ -886,10 +942,10 @@ async def _exec_tickets_stream(request: Request, project_id: int):
                 project_id,
                 _ticket_prompt(current_payload, payloads),
                 history,
-                existing_files,
                 result=result,
                 on_event=_rewrite,
                 extra_finalize=_mark_done,
+                record_iteration=False,
             ):
                 if chunk != _NOOP_CHUNK:
                     yield chunk
@@ -1226,7 +1282,7 @@ async def send_message(
                     yield chunk
             else:
                 async for chunk in _engineer_stream(
-                    request, project_id, body.content, history, existing_files
+                    request, project_id, body.content, history
                 ):
                     yield chunk
 
@@ -1290,9 +1346,8 @@ async def confirm_prd(
                     before_message_id=confirm_message.id,
                     window=settings.agent_history_window,
                 )
-                existing_files = _existing_file_paths(session, project_id)
             async for chunk in _engineer_stream(
-                request, project_id, confirm_content, history, existing_files
+                request, project_id, confirm_content, history
             ):
                 yield chunk
 
@@ -1348,14 +1403,13 @@ async def confirm_consensus(
                     before_message_id=confirm_message.id,
                     window=settings.agent_history_window,
                 )
-                existing_files = _existing_file_paths(session, project_id)
             if is_team:
                 # 团队模式：共识确认后进入需求规格阶段（工单 0016）
                 async for chunk in _spec_stream(request, project_id, confirm_content, history):
                     yield chunk
             else:
                 async for chunk in _engineer_stream(
-                    request, project_id, confirm_content, history, existing_files
+                    request, project_id, confirm_content, history
                 ):
                     yield chunk
 
@@ -1416,7 +1470,7 @@ async def confirm_spec(
             # 规格确认后进入拆单阶段（工单 0017）；克隆等已有文件的团队项目跳过拆单直接实现（同跳过 PRD）
             if existing_files:
                 async for chunk in _engineer_stream(
-                    request, project_id, confirm_content, history, existing_files
+                    request, project_id, confirm_content, history
                 ):
                     yield chunk
             else:
@@ -1683,6 +1737,27 @@ def get_snapshot(
         for path, size in list_snapshot_files(project_dir(request, project_id), snapshot)
     ]
     return payload
+
+
+@router.get("/{project_id}/snapshots/{snapshot_id}/diff", response_model=SnapshotDiffOut)
+def get_snapshot_diff(
+    project_id: int,
+    snapshot_id: int,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """安全网（Layer 6）：该快照相对前一版的文件级差异，供前端 diff 面板展开逐文件核对。"""
+    get_owned_project(project_id, user, db)
+    snapshot = _get_owned_snapshot(db, project_id, snapshot_id)
+    base = db.scalar(
+        select(Snapshot).where(Snapshot.project_id == project_id, Snapshot.rev == snapshot.rev - 1)
+    )
+    return {
+        "base_rev": base.rev if base is not None else None,
+        "target_rev": snapshot.rev,
+        "files": diff_snapshot(project_dir(request, project_id), base, snapshot),
+    }
 
 
 @router.post("/{project_id}/snapshots/{snapshot_id}/rollback", response_model=SnapshotOut)
