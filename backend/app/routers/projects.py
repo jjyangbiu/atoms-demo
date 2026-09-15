@@ -397,6 +397,11 @@ def _file_summaries(project_root: Path) -> list[dict]:
     return summaries
 
 
+def _fingerprint(summaries: list[dict]) -> dict[str, tuple[int, str]]:
+    """指纹表：路径 → (行数, 内容哈希)。轮前/轮末两份比对即得真实改动集（工单 0022）。"""
+    return {s["path"]: (s["lines"], s["hash"]) for s in summaries}
+
+
 # 磁盘事实注入的总量上限（字符）：只在口头完成升级链第二级使用，
 # 预算封顶防止大项目撑爆上下文；超预算文件给出 read_file 指引而非静默丢弃。
 _FACTS_BUDGET = 16000
@@ -571,11 +576,15 @@ async def _engineer_stream(
         with session_factory() as session:
             _row = session.get(Project, project_id)
             iteration_log = list(_row.iteration_log) if _row and _row.iteration_log else []
-    system_prompt = build_system_prompt(_file_summaries(sandbox.root), iteration_log)
+    # 轮前指纹（工单 0022 / ADR 0005「权威来源归位」）：改动集的权威来源是磁盘状态。
+    # _file_summaries 本就读磁盘（路径 + 行数 + 内容哈希），系统提示注入复用同一次扫描；
+    # 基准取磁盘而非上一个快照——越界轮不建快照会使快照序列与磁盘序列脱钩。
+    summaries = _file_summaries(sandbox.root)
+    system_prompt = build_system_prompt(summaries, iteration_log)
+    pre_round = _fingerprint(summaries)
 
     done_data: dict | None = None
     thinking_parts: list[str] = []
-    touched_files: set[str] = set()
     try:
         async for event in run_generation(
             model,
@@ -603,14 +612,9 @@ async def _engineer_stream(
                     result["error"] = event.data.get("detail", "")
                 yield _emit({"type": event.type, **event.data})
                 if event.type == "tool":
-                    # Layer 5：收集本轮成功改动的文件路径，收尾时写入迭代日志
-                    if event.data.get("status") == "done" and event.data.get("name") in (
-                        "write_file",
-                        "edit_file",
-                    ):
-                        _path = (event.data.get("args") or {}).get("path")
-                        if _path:
-                            touched_files.add(_path)
+                    # 事件行只是「给人看的过程记录」（工单 0022）：不再从 args.path
+                    # 解析改动集（summarize_args 会截断超长参数，那是运气不是设计），
+                    # 三处硬闸的判据一律来自轮末磁盘指纹比对。
                     if event.data.get("status") != "start":
                         _persist_event(session_factory, project_id, event.data)
     except Exception as e:  # noqa: BLE001 — 流式过程中的意外以 error 事件收尾，思考已流出部分仍落库（诊断修复）
@@ -625,6 +629,14 @@ async def _engineer_stream(
         # 不能在此 yield（已关闭），只把已流出的思考落库后照旧退出（诊断修复）
         _persist_partial_thinking(session_factory, project_id, "engineer", thinking_parts)
         raise
+
+    # 轮末重算指纹，与轮前指纹比对即得本轮真实改动的文件集（工单 0022）：
+    # 新增 / 内容变化 / 删除（工具虽无删除能力，外部改动同样被磁盘比对捕获）全部覆盖；
+    # 沙箱侧 modified_this_round 是同构辅助记录，三处硬闸的判据只看这里的磁盘比对结果。
+    post_round = _fingerprint(_file_summaries(sandbox.root))
+    touched_files = {
+        p for p in set(pre_round) | set(post_round) if pre_round.get(p) != post_round.get(p)
+    }
 
     try:
         with session_factory() as session:

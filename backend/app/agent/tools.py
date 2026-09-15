@@ -63,6 +63,16 @@ class FileSandbox:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self._read_this_round: set[str] = set()
+        # 本轮真实改动的文件集（工单 0022）：与「本轮已读文件集」同构的辅助记录，
+        # 路径统一为相对项目根的 posix 形式（已读集存的是模型传入的原始 path）。
+        # 只在 _write_to_disk 成功落盘后登记——编辑失败、被闸门拒绝、零 diff
+        # 空操作都在落盘前抛 SandboxViolation，天然不计入。
+        self._modified_this_round: set[str] = set()
+
+    @property
+    def modified_this_round(self) -> set[str]:
+        """本轮真实改动的文件路径集（相对项目根的 posix 形式）。"""
+        return set(self._modified_this_round)
 
     def read_file(self, path: str) -> str:
         target = resolve_sandboxed(self.root, path)
@@ -80,6 +90,7 @@ class FileSandbox:
             raise SandboxViolation("文件内容超过 512KB 上限")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        self._modified_this_round.add(target.relative_to(self.root.resolve()).as_posix())
         return f"已写入 {path}（{len(data)} 字节）"
 
     def write_file(self, path: str, content: str) -> str:
