@@ -1,5 +1,14 @@
 """智能体系统提示。"""
 
+from .verdicts import (
+    CONSISTENT,
+    FALLBACK,
+    FILE_SET_MISMATCH,
+    MISMATCH,
+    UNDECLARED_CHANGE,
+    VERBAL_COMPLETION,
+)
+
 ENGINEER_SYSTEM_PROMPT = """你是 Atoms Demo 平台的工程师智能体，负责根据用户描述生成或修改一个多文件的纯前端网页应用。
 
 硬性约束（必须遵守）：
@@ -13,6 +22,53 @@ ENGINEER_SYSTEM_PROMPT = """你是 Atoms Demo 平台的工程师智能体，负�
 工作方式：先用工具完成全部文件写入，最后必须调用 submit_turn_result 提交轮次产物收尾——payload 里 intent 写 "modify_code"（改动了代码）或 "no_change"（核实后确认无需改动，附 no_change_reason），summary 用简短的中文 Markdown 写给用户看：只讲本轮结论与现状（改了什么、现在是什么样、可以怎么继续完善），不复述“我先读了某文件、然后调用了某工具”的过程，changed_files 如实列出本轮改动的文件路径——系统会将你的申报与磁盘真实改动做自洽性核验，不符会被退回修正。不要用普通文本收尾。"""
 
 
+# 核验结论的模型侧渲染文案（工单 0026）：键取自 agent/verdicts.py 共享词表（与
+# 自洽性核验的产出同源，工单 0025）；0028 正确性裁判引入越界/未完成等值后在词表
+# 与此处补充文案，未知值原样输出。
+_VERDICT_LABELS = {
+    CONSISTENT: "自洽",
+    MISMATCH: "失配",
+    FALLBACK: "模型未按标准出口收尾，系统按磁盘事实兜底",
+}
+_MISMATCH_LABELS = {
+    VERBAL_COMPLETION: "声称有改动而磁盘零改动",
+    UNDECLARED_CHANGE: "未申报而磁盘实际有改动",
+    FILE_SET_MISMATCH: "申报文件集与磁盘实际不符",
+}
+
+
+def _verdict_suffix(entry: dict) -> str:
+    """条目的核验结论渲染段：无该字段（旧结构条目）时整段省略，不报错。"""
+    verdict = entry.get("verdict")
+    if verdict is None:
+        return ""
+    label = _VERDICT_LABELS.get(verdict, str(verdict))
+    kind = entry.get("mismatch_kind")
+    if kind:
+        label += f"（{_MISMATCH_LABELS.get(kind, kind)}）"
+    return f"；核验结论：{label}"
+
+
+def _render_log_entry(entry: dict, pos: int) -> str:
+    """渲染单条迭代日志。
+
+    存量旧结构条目兼容（工单 0026）：旧序号字段名 round、无核验结论字段——缺字段
+    不报错、不丢条目；未知核验结论值原样输出（前向兼容 0028 正确性裁判的扩展值）。
+    诉求截断只发生在渲染侧：落库的 user_text 是完整原话（权威数据），注入只花
+    头部 100 字（0027 起由分类器蒸馏的 user_goal 接管注入，原话仍完整留档）。
+    """
+    seq = entry.get("seq") or entry.get("round") or pos
+    files = entry.get("files") or []
+    # 空 files 渲染为系统核验事实（而非含义模糊的“（无）”）：
+    # 该轮没有产生任何文件改动是磁盘事实，模型不得据对话记忆断言“已生效”。
+    files_desc = ", ".join(files) if files else "（无——系统核验：该轮未产生任何文件改动）"
+    user_text = (entry.get("user_text") or "")[:100]
+    return (
+        f"- 第{seq}次改动：用户诉求“{user_text}”；"
+        f"改动文件：{files_desc}{_verdict_suffix(entry)}"
+    )
+
+
 def build_system_prompt(
     file_summaries: list[dict], iteration_log: list[dict] | None = None
 ) -> str:
@@ -20,7 +76,8 @@ def build_system_prompt(
 
     - file_summaries：路径+行数+哈希。哈希让模型知道文件现状：若与记忆中的版本不同，
       说明记忆已过时，必须 read_file。
-    - iteration_log：历轮改动摘要（系统自动追加、不截断），弥补对话窗口截断导致的失忆。
+    - iteration_log：按「改动」累积的摘要（系统自动追加、不截断），弥补对话窗口截断
+      导致的失忆。序号语义是「第 N 次改动」而非「第 N 轮对话」（工单 0026）。
     """
     prompt = ENGINEER_SYSTEM_PROMPT
     if file_summaries:
@@ -29,14 +86,10 @@ def build_system_prompt(
         )
         prompt += f"\n\n当前项目已有文件：\n{listing}"
     if iteration_log:
-        # 空 files 渲染为系统核验事实（而非含义模糊的“（无）”）：
-        # 该轮没有产生任何文件改动是磁盘事实，模型不得据对话记忆断言“已生效”。
         log_lines = "\n".join(
-            f"- 第{e['round']}轮：用户说“{e['user_text']}”；"
-            f"改动文件：{', '.join(e['files']) if e['files'] else '（无——系统核验：该轮未产生任何文件改动）'}"
-            for e in iteration_log
+            _render_log_entry(e, pos) for pos, e in enumerate(iteration_log, start=1)
         )
-        prompt += f"\n\n迭代日志（历轮改动摘要，帮你了解项目演进，避免重复或漏改）：\n{log_lines}"
+        prompt += f"\n\n迭代日志（按改动累积的摘要，帮你了解项目演进，避免重复或漏改）：\n{log_lines}"
     return prompt
 
 

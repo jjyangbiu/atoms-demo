@@ -36,6 +36,14 @@ from ..agent.tools import (
     recover_turn_result_payload,
     resolve_sandboxed,
 )
+from ..agent.verdicts import (
+    CONSISTENT,
+    FALLBACK,
+    FILE_SET_MISMATCH,
+    MISMATCH,
+    UNDECLARED_CHANGE,
+    VERBAL_COMPLETION,
+)
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
 from ..models import Message, Project, ProjectFile, Publication, Snapshot, Ticket, User, _utcnow
 from ..public_links import remove_link
@@ -498,10 +506,8 @@ class _SubmitTurnResultInvoked(Exception):
 # 取代已退役的中文措辞检测（固定短语表 + 正则族 + 三级升级链）：不猜模型说了什么，
 # 只比对模型申报的改动文件集与磁盘真实改动集（工单 0022 指纹 diff）。纯集合运算，
 # 判定零成本、确定性，对任何语言的任何措辞免疫。
-
-CONSISTENT = "consistent"
-MISMATCH = "mismatch"
-FALLBACK = "fallback"  # 模型始终未走唯一出口：产物由系统按磁盘事实兜底，无申报可比
+# 核验结论与失配种类的词表在 agent/verdicts.py（工单 0026：与迭代日志的模型侧
+# 渲染文案共用，消除字面量双写漂移）。
 
 
 def _norm_declared_paths(intent: str, paths: list[str]) -> set[str]:
@@ -534,11 +540,11 @@ def _consistency_verdict(
     - file_set_mismatch：申报文件集与磁盘真实文件集不符（两侧均非空）。
     """
     if not touched and (declared or intent == "modify_code"):
-        return MISMATCH, "verbal_completion"
+        return MISMATCH, VERBAL_COMPLETION
     if not declared and touched:
-        return MISMATCH, "undeclared_change"
+        return MISMATCH, UNDECLARED_CHANGE
     if declared != touched:
-        return MISMATCH, "file_set_mismatch"
+        return MISMATCH, FILE_SET_MISMATCH
     return CONSISTENT, None
 
 
@@ -829,14 +835,24 @@ async def _engineer_stream(
             project_row = session.get(Project, project_id)
             if project_row is not None:
                 project_row.updated_at = _utcnow()
-                # Layer 5：仅成功的对话轮留痕；JSON 列整体重赋值以触发 SQLAlchemy 变更检测
+                # Layer 5（工单 0026 / ADR 0005「迭代日志调整」）：仅成功的对话轮留痕，
+                # JSON 列整体重赋值以触发 SQLAlchemy 变更检测。条目按「改动」累积——
+                # seq 语义是「第 N 次改动」（咨询轮不入账后编号会与对话轮错位，继续叫
+                # 「第 N 轮」等于对模型说谎）；user_text 完整落库用户原话（蒸馏版是模型
+                # 写的、可能失真，原话才是权威数据；截断/蒸馏只发生在渲染注入侧）；
+                # verdict/mismatch_kind 把核验结论入账——失配（及 0028 引入的越界、
+                # 未完成）均须入账，日志追加不以快照留档为门槛：越界轮虽不留档快照，
+                # 改动却留在磁盘上，不留这条日志，后续轮次无从理解磁盘为什么是现在
+                # 这个样子。暂不设截断或聚合上限（净 token 账持平或更短，不预先优化）。
                 if completed and record_iteration:
                     log = list(project_row.iteration_log or [])
                     log.append(
                         {
-                            "round": len(log) + 1,
-                            "user_text": user_text[:100],
+                            "seq": len(log) + 1,
+                            "user_text": user_text,
                             "files": sorted(touched_files),
+                            "verdict": verdict,
+                            "mismatch_kind": mismatch_kind,
                         }
                     )
                     project_row.iteration_log = log
