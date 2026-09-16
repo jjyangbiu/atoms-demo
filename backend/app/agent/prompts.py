@@ -4,8 +4,12 @@ from .verdicts import (
     CONSISTENT,
     FALLBACK,
     FILE_SET_MISMATCH,
+    INCOMPLETE,
+    IN_SCOPE,
     MISMATCH,
+    OUT_OF_SCOPE,
     UNDECLARED_CHANGE,
+    UNVERIFIED,
     VERBAL_COMPLETION,
 )
 
@@ -23,8 +27,7 @@ ENGINEER_SYSTEM_PROMPT = """你是 Atoms Demo 平台的工程师智能体，负�
 
 
 # 核验结论的模型侧渲染文案（工单 0026）：键取自 agent/verdicts.py 共享词表（与
-# 自洽性核验的产出同源，工单 0025）；0028 正确性裁判引入越界/未完成等值后在词表
-# 与此处补充文案，未知值原样输出。
+# 自洽性核验、正确性裁判的产出同源，工单 0025/0028），未知值原样输出。
 _VERDICT_LABELS = {
     CONSISTENT: "自洽",
     MISMATCH: "失配",
@@ -35,18 +38,32 @@ _MISMATCH_LABELS = {
     UNDECLARED_CHANGE: "未申报而磁盘实际有改动",
     FILE_SET_MISMATCH: "申报文件集与磁盘实际不符",
 }
+_SCOPE_LABELS = {
+    IN_SCOPE: "范围内",
+    OUT_OF_SCOPE: "越界（含用户未要求的改动）",
+    INCOMPLETE: "未完成（改动方向合法，但诉求尚未做完）",
+    UNVERIFIED: "核验未完成",
+}
 
 
 def _verdict_suffix(entry: dict) -> str:
-    """条目的核验结论渲染段：无该字段（旧结构条目）时整段省略，不报错。"""
+    """条目的核验结论渲染段：无核验字段（旧结构条目）时整段省略，不报错。
+
+    自洽性结论（verdict）与正确性裁决（scope_verdict，工单 0028）各自独立
+    渲染：缺哪个省哪个分句；未知值原样输出（前向兼容词表扩展）。
+    """
+    parts: list[str] = []
     verdict = entry.get("verdict")
-    if verdict is None:
-        return ""
-    label = _VERDICT_LABELS.get(verdict, str(verdict))
-    kind = entry.get("mismatch_kind")
-    if kind:
-        label += f"（{_MISMATCH_LABELS.get(kind, kind)}）"
-    return f"；核验结论：{label}"
+    if verdict is not None:
+        label = _VERDICT_LABELS.get(verdict, str(verdict))
+        kind = entry.get("mismatch_kind")
+        if kind:
+            label += f"（{_MISMATCH_LABELS.get(kind, kind)}）"
+        parts.append(f"核验结论：{label}")
+    scope = entry.get("scope_verdict")
+    if scope:
+        parts.append(f"正确性裁决：{_SCOPE_LABELS.get(scope, str(scope))}")
+    return "".join(f"；{p}" for p in parts)
 
 
 def _render_log_entry(entry: dict, pos: int) -> str:
@@ -172,6 +189,23 @@ def build_consult_prompt(
     if iteration_log:
         prompt += f"\n\n迭代日志（项目演进摘要）：\n{_render_iteration_log(iteration_log)}"
     return prompt
+
+
+# 正确性裁判（工单 0028 / ADR 0005「第 8 层」）：不绑工具、JSON Mode 收尾，
+# 只裁决磁盘真实改动是否忠实于用户诉求，不评代码质量、不建议怎么改。
+# 用户原话、最近上下文与 diff 由调用方以消息追加（judge.py），提示词本身无状态。
+JUDGE_SYSTEM_PROMPT = """你是 Atoms Demo 平台的正确性裁判。工程师刚根据用户最新诉求改动了一个纯前端项目的代码，系统已把本轮磁盘真实改动的 diff 算好给你。你的唯一职责：裁决这些改动是否忠实于用户诉求。只输出一个 JSON 对象，不输出任何其他文字。
+
+JSON 字段：
+- verdict：只有三个合法值——"in_scope"（改动忠实覆盖用户诉求，没有越界）、"out_of_scope"（存在用户未要求的越界改动）、"incomplete"（改动方向合法，但未完成用户诉求）。
+- out_of_scope_segments：越界段落数组。verdict 为 "out_of_scope" 时必须非空，其余两个值时必须为空数组。每个元素含：file（文件路径）、start_line 与 end_line（越界区域在改动后文件中的行号，从 1 开始）、reason（一句话说明为何越界）。
+
+判定规则：
+1. 以用户原话为准绳；行号直接引用 diff hunk 头（@@ -a,b +c,d @@）给出的定位，不要自己数行。
+2. 越界指用户没有要求的实质性改动：顺带重写无关区域、擅自新增功能、大规模重排未涉及的代码。与诉求直接相关的必要连带改动（如调整结构后同步相关引用与样式）不算越界。
+3. 只裁决、不处置：不建议怎么改，不评价代码质量、风格与美观，不看工程师的任何自述。
+4. 改动方向合法但明显没做完（用户要三件事只做成一件）判 "incomplete"，此时 out_of_scope_segments 为空数组。
+5. 只输出 JSON 对象本身：不要解释，不要 Markdown 代码块。"""
 
 
 # 需求澄清智能体（工单 0015 / ADR 0003）：改写自 grilling 方法论，

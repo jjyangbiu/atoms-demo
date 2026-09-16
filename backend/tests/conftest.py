@@ -206,3 +206,39 @@ INTENT_CONSULT_STEP = _intent_step(
     intent="consult", user_goal="咨询应用现状，无改动诉求。", target_files=[]
 )
 """辅助伪模型脚本步：意图分类判为「咨询」（该轮只绑只读工具集）。"""
+
+
+# --- 正确性裁判的共享脚本步（规格 0021「共享脚本步常量」房规，工单 0028） ---
+
+
+def _judge_step(
+    verdict: str = "in_scope",
+    out_of_scope_segments: list[dict] | None = None,
+) -> dict:
+    """辅助伪模型脚本步：正确性裁判调用的 JSON 输出（裁判不绑工具、不流式）。"""
+    return {
+        "text": json.dumps(
+            {
+                "verdict": verdict,
+                "out_of_scope_segments": out_of_scope_segments or [],
+            },
+            ensure_ascii=False,
+        )
+    }
+
+
+JUDGE_IN_SCOPE_STEP = _judge_step(verdict="in_scope")
+"""辅助伪模型脚本步：裁判判为「范围内」——干净收尾，无额外打扰。"""
+
+JUDGE_OUT_OF_SCOPE_STEP = _judge_step(
+    verdict="out_of_scope",
+    out_of_scope_segments=[
+        {
+            "file": "index.html",
+            "start_line": 3,
+            "end_line": 8,
+            "reason": "顺带重写了页脚，用户未要求。",
+        }
+    ],
+)
+"""辅助伪模型脚本步：裁判判为「越界」并给出段落清单（阶段一：只标注不阻断）。"""

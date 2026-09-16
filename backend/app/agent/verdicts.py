@@ -17,3 +17,13 @@ FALLBACK = "fallback"  # 模型始终未走唯一出口：产物由系统按磁�
 VERBAL_COMPLETION = "verbal_completion"
 UNDECLARED_CHANGE = "undeclared_change"
 FILE_SET_MISMATCH = "file_set_mismatch"
+
+# 正确性裁决结论（工单 0028 / ADR 0005「第 8 层」）：卡片与迭代日志的
+# scope_verdict 字段同源。前三值是裁判的合法输出枚举；UNVERIFIED 不是模型
+# 裁决值，而是裁判失败（网络/超时/非法输出，重试耗尽）时系统标注的
+# 「核验未完成」——安全网故障必须显式化而非静默吞掉，且快照照建。
+IN_SCOPE = "in_scope"
+OUT_OF_SCOPE = "out_of_scope"
+INCOMPLETE = "incomplete"
+UNVERIFIED = "unverified"
+SCOPE_VERDICT_ENUM = (IN_SCOPE, OUT_OF_SCOPE, INCOMPLETE)

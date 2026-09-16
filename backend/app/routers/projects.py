@@ -15,10 +15,12 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..agent.intent import INTENT_CONSULT, classify_intent
+from ..agent.judge import build_diff_text, judge_correctness
 from ..agent.loop import run_generation
 from ..agent.prompts import (
     BREAKER_SYSTEM_PROMPT,
     CLARIFIER_SYSTEM_PROMPT,
+    JUDGE_SYSTEM_PROMPT,
     SPEC_AGENT_SYSTEM_PROMPT,
     build_consult_prompt,
     build_intent_prompt,
@@ -46,6 +48,7 @@ from ..agent.verdicts import (
     FILE_SET_MISMATCH,
     MISMATCH,
     UNDECLARED_CHANGE,
+    UNVERIFIED,
     VERBAL_COMPLETION,
 )
 from ..deps import COOKIE_NAME, get_current_user, get_db, resolve_user_by_token
@@ -427,6 +430,29 @@ def _fingerprint(summaries: list[dict]) -> dict[str, tuple[int, str]]:
     return {s["path"]: (s["lines"], s["hash"]) for s in summaries}
 
 
+def _file_contents(project_root: Path) -> dict[str, str]:
+    """项目目录下每个可解码文本文件的内容：路径 → 全文。
+
+    正确性裁判的轮前基准（工单 0028）：diff 要「改动前 → 改动后」的全文比对，
+    哈希指纹不够用。扫描与过滤规则同 _file_summaries（跳过 snapshots、跳过
+    不可解码文件——缺失即视为空文件，diff 呈现为整体新增）。
+    """
+    contents: dict[str, str] = {}
+    if not project_root.is_dir():
+        return contents
+    for f in sorted(project_root.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(project_root)
+        if "snapshots" in rel.parts:
+            continue
+        try:
+            contents[rel.as_posix()] = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+    return contents
+
+
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -567,18 +593,15 @@ def _consistency_feedback(kind: str, declared: set[str], touched: set[str]) -> s
     )
 
 
-# --- 意图识别与咨询轮（工单 0027 / ADR 0005「第 7 层」） ---
+# --- 意图识别、咨询轮与正确性裁判（工单 0027/0028 / ADR 0005「第 7/8 层」） ---
 
 
-async def _classify_round_intent(
-    request: Request, summaries: list, iteration_log: list, history: list, user_text: str
-) -> dict | None:
-    """经辅助模型注入点执行意图分类；任何失败返回 None（调用方静默降级为改动代码）。
+def _utility_model(request: Request):
+    """取辅助模型实例；不可用（如未配 Key）返回 None，绝不阻断用户轮次。
 
     注入点全仓唯一（app.state.utility_model_factory，规格 0021「辅助接缝」），供
-    分类器与后续正确性裁判（工单 0028）共用；取不到时回落既有 model_factory
-    （加法式接缝，既有调用点零改动）。分类不消耗生成名额：名额在 send_message
-    接受时已按「一轮一次」扣定，一轮里调用几次模型都与之无关（ADR 0005 成本边界）。
+    意图分类器与正确性裁判共用；取不到时回落既有 model_factory（加法式接缝，
+    既有调用点零改动）。本阶段不切换小模型：llm_utility_model 缺省即主模型。
     """
     settings = request.app.state.settings
     factory = (
@@ -586,11 +609,46 @@ async def _classify_round_intent(
         or request.app.state.model_factory
     )
     try:
-        utility_model = factory(settings)
-    except Exception:  # noqa: BLE001 — 辅助模型不可用（如未配 Key）不得阻断轮次
+        return factory(settings)
+    except Exception:  # noqa: BLE001 — 辅助模型不可用不得阻断轮次
+        return None
+
+
+async def _classify_round_intent(
+    request: Request, summaries: list, iteration_log: list, history: list, user_text: str
+) -> dict | None:
+    """经辅助模型注入点执行意图分类；任何失败返回 None（调用方静默降级为改动代码）。
+
+    分类不消耗生成名额：名额在 send_message 接受时已按「一轮一次」扣定，一轮里
+    调用几次模型都与之无关（ADR 0005 成本边界）。
+    """
+    utility_model = _utility_model(request)
+    if utility_model is None:
         return None
     return await classify_intent(
         utility_model, build_intent_prompt(summaries, iteration_log), history, user_text
+    )
+
+
+async def _judge_round(
+    request: Request, history: list, user_text: str, diff_text: str
+) -> dict | None:
+    """经辅助模型注入点执行正确性裁决；任何失败返回 None（调用方标注「核验未完成」）。
+
+    裁判不消耗生成名额（房规同分类器，ADR 0005 成本边界）；重试次数与退避语义
+    复用既有 agent_max_retries / RETRY_BACKOFF_SECONDS（judge 模块内实现）。
+    """
+    utility_model = _utility_model(request)
+    if utility_model is None:
+        return None
+    settings = request.app.state.settings
+    return await judge_correctness(
+        utility_model,
+        JUDGE_SYSTEM_PROMPT,
+        history,
+        user_text,
+        diff_text,
+        max_retries=settings.agent_max_retries,
     )
 
 
@@ -753,6 +811,14 @@ async def _engineer_stream(
     # _file_summaries 本就读磁盘（路径 + 行数 + 内容哈希），系统提示注入复用同一次扫描；
     # 基准取磁盘而非上一个快照——越界轮不建快照会使快照序列与磁盘序列脱钩。
     summaries = _file_summaries(sandbox.root)
+
+    # 正确性裁判的轮前内容基准（工单 0028）：只在裁判可能触发的轮次捕获——
+    # 用户对话迭代轮且项目已有文件；首建轮（summaries 为空）无旧文件、「越界」
+    # 无从谈起，确认驱动的流水线轮与团队工单执行不进裁判（规格 0021 作用域矩阵），
+    # 其余轮次零捕获成本。咨询轮虽捕获了基准，但提前 return，永不调用裁判。
+    pre_round_contents: dict[str, str] | None = (
+        _file_contents(sandbox.root) if user_round and summaries else None
+    )
 
     # 意图分类闸（工单 0027 / ADR 0005「第 7 层」）：只有「落到工程师智能体的用户对话轮」
     # 进分类器——user_round 仅由 send_message 置 True。首建轮（summaries 为空）、
@@ -921,6 +987,25 @@ async def _engineer_stream(
     else:
         verdict, mismatch_kind = None, None
 
+    # 正确性裁判（工单 0028 阶段一 / ADR 0005「第 8 层」）：只在改动代码轮且磁盘
+    # 确有改动时触发——咨询轮已提前 return，零改动轮 touched_files 为空，都不进
+    # 裁判（零调用成本）。输入是用户原话 + 最近若干轮上下文 + 代码算好的 diff；
+    # 智能体自述一概不给（judge 模块内滤除 AI 消息、也不携带卡片申报字段）。
+    # 失败（网络/超时/非法输出，重试语义在 judge 模块内复用既有次数与退避）→
+    # 标注「核验未完成」且快照照建：安全网故障不得扣住用户的劳动成果，且必须
+    # 显式化而非静默吞掉。阶段一只标注不阻断：越界轮快照照常留档（卡片列出
+    # 越界段落，交用户裁决），不自动回滚、不把裁决回喂返工。
+    scope_verdict: str | None = None
+    out_of_scope_segments: list[dict] = []
+    if pre_round_contents is not None and completed and touched_files:
+        diff_text = build_diff_text(touched_files, pre_round_contents, sandbox.root)
+        scope = await _judge_round(request, history, user_text, diff_text)
+        if scope is None:
+            scope_verdict = UNVERIFIED
+        else:
+            scope_verdict = scope["verdict"]
+            out_of_scope_segments = scope["out_of_scope_segments"]
+
     snapshot: Snapshot | None = None
     card_json: str | None = None
     final_summary = ""
@@ -960,6 +1045,12 @@ async def _engineer_stream(
                     "no_change_reason": turn_result_payload["no_change_reason"],
                     "consistency": verdict,
                     "mismatch_kind": mismatch_kind,
+                    # 正确性裁决（工单 0028 阶段一）：只标注不阻断。越界轮卡片
+                    # 列出越界段落清单（前端标红），快照照常留档；未触发裁判的
+                    # 轮次（零改动、首建、流水线）scope_verdict 为 null，前端
+                    # 干净收尾、无额外打扰。
+                    "scope_verdict": scope_verdict,
+                    "out_of_scope_segments": out_of_scope_segments,
                     "snapshot_id": snapshot.id if snapshot is not None else None,
                     "snapshot_rev": snapshot.rev if snapshot is not None else None,
                 }
@@ -998,6 +1089,9 @@ async def _engineer_stream(
                             "files": sorted(touched_files),
                             "verdict": verdict,
                             "mismatch_kind": mismatch_kind,
+                            # 正确性裁决入账（工单 0028）：失配、越界、未完成与
+                            # 「核验未完成」均须入账——日志追加不以快照留档为门槛。
+                            "scope_verdict": scope_verdict,
                         }
                     )
                     project_row.iteration_log = log
@@ -1028,6 +1122,10 @@ async def _engineer_stream(
         }
         if mismatch_kind is not None:
             done_payload["mismatch_kind"] = mismatch_kind
+        if scope_verdict is not None:
+            # 正确性裁决随收尾事件外发（工单 0028）：artifact 保持既有契约不动，
+            # 裁决作为独立字段并列——前端对既有字段的消费零改动。
+            done_payload["scope_verdict"] = scope_verdict
         yield _emit(done_payload)
 
 

@@ -92,6 +92,19 @@ interface ChatEntry {
 // declared_files 是模型申报（仅留档，卡片不展示），snapshot_* 为本轮快照引用；
 // consistency 是自洽性核验结论（consistent/mismatch/fallback，旧卡片无此字段为 null），
 // 核验结论只以卡片徽标呈现，不再追加进正文（工单 0025）
+// scope_verdict 是正确性裁决（工单 0028 阶段一）：in_scope/out_of_scope/incomplete，
+// 裁判失败（网络/超时/非法输出）为 unverified（「核验未完成」），未触发裁判
+// （首建轮、咨询轮、零改动轮）与旧卡片为 null；out_of_scope_segments 是裁判
+// 给出的越界段落清单（文件 + 改动后行号区间 + 理由）。阶段一只标注不阻断：
+// 越界段落标红列出交用户裁决（接受则被下次成功轮的快照吸收，或在版本历史回滚），
+// 快照照常留档。
+interface OutOfScopeSegment {
+  file: string
+  start_line: number
+  end_line: number
+  reason: string
+}
+
 interface TurnResultInfo {
   intent: 'modify_code' | 'no_change'
   summary: string
@@ -100,6 +113,8 @@ interface TurnResultInfo {
   no_change_reason: string
   consistency: 'consistent' | 'mismatch' | 'fallback' | null
   mismatch_kind: string | null
+  scope_verdict: 'in_scope' | 'out_of_scope' | 'incomplete' | 'unverified' | null
+  out_of_scope_segments: OutOfScopeSegment[]
   snapshot_id: number | null
   snapshot_rev: number | null
 }
@@ -109,6 +124,7 @@ function parseTurnResult(content: string): TurnResultInfo | null {
     const data = JSON.parse(content) as Record<string, unknown>
     if (typeof data !== 'object' || data === null) return null
     const consistency = data.consistency
+    const scopeVerdict = data.scope_verdict
     return {
       intent: data.intent === 'no_change' ? 'no_change' : 'modify_code',
       summary: String(data.summary ?? ''),
@@ -120,6 +136,24 @@ function parseTurnResult(content: string): TurnResultInfo | null {
           ? consistency
           : null,
       mismatch_kind: typeof data.mismatch_kind === 'string' ? data.mismatch_kind : null,
+      scope_verdict:
+        scopeVerdict === 'in_scope' ||
+        scopeVerdict === 'out_of_scope' ||
+        scopeVerdict === 'incomplete' ||
+        scopeVerdict === 'unverified'
+          ? scopeVerdict
+          : null,
+      out_of_scope_segments: Array.isArray(data.out_of_scope_segments)
+        ? data.out_of_scope_segments
+            .filter((s): s is Record<string, unknown> => typeof s === 'object' && s !== null)
+            .map((s) => ({
+              file: String(s.file ?? ''),
+              start_line: Number(s.start_line ?? 0),
+              end_line: Number(s.end_line ?? 0),
+              reason: String(s.reason ?? ''),
+            }))
+            .filter((s) => s.file !== '')
+        : [],
       snapshot_id: typeof data.snapshot_id === 'number' ? data.snapshot_id : null,
       snapshot_rev: typeof data.snapshot_rev === 'number' ? data.snapshot_rev : null,
     }
@@ -1334,6 +1368,33 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                   >
                     核验自洽
                   </el-tag>
+                  <!-- 正确性裁决徽标（工单 0028 阶段一）：范围内干净收尾不加徽标
+                       （无额外打扰）；越界/未完成/核验未完成各有一枚，null（未触发
+                       裁判或旧卡片）不渲染 -->
+                  <el-tag
+                    v-if="entry.turnResult?.scope_verdict === 'out_of_scope'"
+                    size="small"
+                    type="danger"
+                    data-testid="scope-badge-out-of-scope"
+                  >
+                    越界改动
+                  </el-tag>
+                  <el-tag
+                    v-else-if="entry.turnResult?.scope_verdict === 'incomplete'"
+                    size="small"
+                    type="warning"
+                    data-testid="scope-badge-incomplete"
+                  >
+                    未完成
+                  </el-tag>
+                  <el-tag
+                    v-else-if="entry.turnResult?.scope_verdict === 'unverified'"
+                    size="small"
+                    type="info"
+                    data-testid="scope-badge-unverified"
+                  >
+                    核验未完成
+                  </el-tag>
                 </div>
                 <div
                   class="bubble markdown prd-body"
@@ -1356,6 +1417,34 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     </div>
                   </template>
                   <div v-else class="turn-result-files-title">本轮无文件改动</div>
+                </div>
+                <!-- 越界段落清单（工单 0028 阶段一：只标注不阻断）：标红列出裁判
+                     认定的越界区域，交用户裁决——接受（被下次成功轮的快照吸收）
+                     或在版本历史回滚到上一版；本轮快照照常留档 -->
+                <div
+                  v-if="
+                    entry.turnResult?.scope_verdict === 'out_of_scope' &&
+                    entry.turnResult.out_of_scope_segments.length
+                  "
+                  class="turn-result-oos"
+                  data-testid="out-of-scope-segments"
+                >
+                  <div class="turn-result-oos-title">
+                    越界改动段落（{{ entry.turnResult.out_of_scope_segments.length }}）
+                  </div>
+                  <div
+                    v-for="(seg, i) in entry.turnResult.out_of_scope_segments"
+                    :key="i"
+                    class="turn-result-oos-item"
+                  >
+                    <span class="turn-result-oos-loc">
+                      {{ seg.file }} 第 {{ seg.start_line }}–{{ seg.end_line }} 行
+                    </span>
+                    <span class="turn-result-oos-reason">{{ seg.reason }}</span>
+                  </div>
+                  <div class="turn-result-oos-hint">
+                    本阶段只标注不阻断，本轮改动已照常留档：你可以接受这些改动（下次成功改动会将其一并纳入快照基线），或在版本历史中回滚到上一版。
+                  </div>
                 </div>
                 <el-button
                   v-if="entry.turnResult?.snapshot_id != null"
@@ -2374,6 +2463,45 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .turn-result-file::before {
   content: '· ';
   color: #67c23a;
+}
+
+/* 越界段落清单（工单 0028 阶段一）：整块标红，与绿色改动清单形成裁决对照 */
+.turn-result-oos {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #fbc4c4;
+  border-radius: 6px;
+  background: #fef0f0;
+}
+
+.turn-result-oos-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f56c6c;
+  margin-bottom: 4px;
+}
+
+.turn-result-oos-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
+  border-top: 1px dashed #fbc4c4;
+  font-size: 12px;
+  color: #f56c6c;
+}
+
+.turn-result-oos-loc {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.turn-result-oos-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.6;
 }
 
 .right-panel {

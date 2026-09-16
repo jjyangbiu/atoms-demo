@@ -19,6 +19,7 @@ from conftest import (
     FIRST_BUILD_CLARIFY_STEP,
     INTENT_CONSULT_STEP,
     INTENT_MODIFY_STEP,
+    JUDGE_IN_SCOPE_STEP,
     _intent_step,
     _turn_result_step,
     confirm_first_build,
@@ -248,7 +249,8 @@ class TestModifyRoundClassification:
             [
                 _intent_step(
                     intent="modify_code", user_goal="把标题调大。", target_files=["styles.css"]
-                )
+                ),
+                JUDGE_IN_SCOPE_STEP,  # 轮末正确性裁判（工单 0028）：改动轮照常触发
             ],
         )
         model = use_fake_model(
@@ -277,7 +279,8 @@ class TestModifyRoundClassification:
         # 预期文件只是参考、绝不当沙箱硬闸：申报 styles.css 而实际改 index.html 照常完成
         pdir = _project_dir(settings, project["id"])
         assert (pdir / "index.html").read_text(encoding="utf-8") == "v2"
-        assert len(utility.received_messages) == 1
+        # 分类 1 次 + 轮末裁判 1 次（工单 0028：改动轮磁盘有变即触发裁判）
+        assert len(utility.received_messages) == 2
 
     def test_user_goal_replaces_truncated_text_in_log_injection(
         self, app, client, auth_headers
@@ -291,6 +294,7 @@ class TestModifyRoundClassification:
                 _intent_step(
                     intent="modify_code", user_goal="标题改深色主题。", target_files=["index.html"]
                 ),
+                JUDGE_IN_SCOPE_STEP,  # 第 1 轮轮末裁判（工单 0028）
                 _intent_step(
                     intent="modify_code", user_goal="按钮改圆角。", target_files=["styles.css"]
                 ),
@@ -330,7 +334,12 @@ class TestClassifierDegradation:
     ):
         """非法输出回喂错误文案修正一次；仍非法 → 静默降级，轮次照常完整执行。"""
         utility = use_fake_utility_model(
-            app, [{"text": "我觉得这是咨询。"}, {"text": "intent: consult"}]
+            app,
+            [
+                {"text": "我觉得这是咨询。"},
+                {"text": "intent: consult"},
+                JUDGE_IN_SCOPE_STEP,  # 分类降级后轮末裁判照常触发（工单 0028）
+            ],
         )
         model = use_fake_model(
             app,
@@ -350,9 +359,10 @@ class TestClassifierDegradation:
         assert (pdir / "index.html").read_text(encoding="utf-8") == "v2"
         assert len(_load_log(app, project["id"])) == 1
 
-        # 恰好一次纠错回喂：辅助模型收到两次调用，第二次带「模型输出 + 错误文案」两条追加
-        assert len(utility.received_messages) == 2
-        first, second = utility.received_messages
+        # 恰好一次纠错回喂：分类收到两次调用，第二次带「模型输出 + 错误文案」两条
+        # 追加；轮末裁判再调一次（工单 0028），共三次
+        assert len(utility.received_messages) == 3
+        first, second = utility.received_messages[:2]
         assert len(second) == len(first) + 2
         feedback = second[-1]
         assert type(feedback).__name__ == "HumanMessage"
@@ -388,7 +398,9 @@ class TestClassifierDegradation:
 
     def test_classifier_exception_degrades_silently(self, app, client, auth_headers):
         """分类调用直接抛异常（如网络故障）：静默降级，不外发任何 error 事件。"""
-        utility = use_fake_utility_model(app, [RuntimeError("网络抖动")])
+        utility = use_fake_utility_model(
+            app, [RuntimeError("网络抖动"), JUDGE_IN_SCOPE_STEP]  # 轮末裁判照常（工单 0028）
+        )
         model = use_fake_model(
             app,
             [*EDIT_STEPS, _turn_result_step(summary="已完成。", changed_files=["index.html"])],
@@ -400,7 +412,7 @@ class TestClassifierDegradation:
 
         assert "error" not in [e["type"] for e in events]
         assert events[-1]["type"] == "done" and events[-1]["verdict"] == "consistent"
-        assert len(utility.received_messages) == 1
+        assert len(utility.received_messages) == 2  # 分类异常 1 + 裁判成功 1
 
 
 class TestScopeGates:
@@ -508,11 +520,13 @@ class TestQuotaAndClone:
     """成本边界与克隆场景（工单 0027 / ADR 0005）。"""
 
     def test_one_round_consumes_exactly_one_quota(self, app, client, auth_headers):
-        """一个迭代轮无论内部发起几次模型调用，只扣一个名额（分类不消耗名额）。"""
+        """一个迭代轮无论内部发起几次模型调用，只扣一个名额（分类与裁判都不消耗名额）。"""
         clock = FakeClock()
         app.state.rate_limiter.clock = clock
         app.state.rate_limiter.per_user_hourly = 2
-        utility = use_fake_utility_model(app, [INTENT_CONSULT_STEP, INTENT_MODIFY_STEP])
+        utility = use_fake_utility_model(
+            app, [INTENT_CONSULT_STEP, INTENT_MODIFY_STEP, JUDGE_IN_SCOPE_STEP]
+        )
         model = use_fake_model(
             app,
             [
@@ -529,8 +543,9 @@ class TestQuotaAndClone:
         first = _stream_messages(client, auth_headers, project["id"], "标题在哪定义的？")
         second = _stream_messages(client, auth_headers, project["id"], "把标题改一下")
         assert first[-1]["type"] == "done" and second[-1]["type"] == "done"
-        # 两轮共 2 次分类 + 4 次主模型调用；若分类也计名额，第 2 轮就该 429 了
-        assert len(utility.received_messages) == 2
+        # 两轮共 2 次分类 + 1 次裁判（工单 0028：第 2 轮磁盘有变）+ 4 次主模型调用；
+        # 若分类/裁判也计名额，第 2 轮就该 429 了
+        assert len(utility.received_messages) == 3
         assert len(model.received_messages) == 4
 
         # 名额恰好用尽：第 3 条消息被拒
