@@ -361,12 +361,16 @@ function ticketProgressText(p: {
   title?: string
   status: string
   snapshot_rev?: number | null
+  zero_change?: boolean
 }): string {
   const name = p.title ? `「${p.title}」` : ''
   if (p.status === 'running') return `▶ 正在执行工单 ${p.seq}${name}…`
   if (p.status === 'done') {
     const checkpoint = p.snapshot_rev ? `，检查点版本 ${p.snapshot_rev}` : ''
-    return `✓ 工单 ${p.seq}${name} 完成${checkpoint}`
+    // 零改动收尾（工单 0029）：经确认回喂的 no_change 合法关单，但交付为空
+    // 这一事实必须显式化，是否接受交人工判断
+    const zero = p.zero_change ? '（零改动收尾）' : ''
+    return `✓ 工单 ${p.seq}${name} 完成${zero}${checkpoint}`
   }
   return `✗ 工单 ${p.seq}${name} 执行失败`
 }
@@ -587,6 +591,7 @@ function toEntries(messages: MessageOut[]): ChatEntry[] {
           title?: string
           status: string
           snapshot_rev?: number | null
+          zero_change?: boolean
         }
         result.push({
           id: `msg-${m.id}`,
@@ -1251,6 +1256,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             title: typeof event.title === 'string' ? event.title : undefined,
             status: st,
             snapshot_rev: rev,
+            zero_change: event.zero_change === true,
           }),
           ticketStatus: st,
         })

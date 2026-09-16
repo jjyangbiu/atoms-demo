@@ -43,6 +43,28 @@ CONFIRM_EXEC_SCRIPT = [
     *TICKET2_STEPS,
 ]
 
+# --- 零交付闸脚本步（工单 0029）：两种「磁盘零改动」的非法出口与一种合法逃逸 ---
+
+PROSE_EXIT_STEPS = [
+    {"text": "骨架页面全部搞定了。"},
+    {"text": "真的搞定了。"},
+]
+"""伪模型脚本步：工单轮以两段散文收尾、始终未走唯一出口，且磁盘零写入（兜底 + 零改动）。"""
+
+VERBAL_CLAIM_STEPS = [
+    _turn_result_step(summary="骨架页面已完成。", changed_files=["index.html"]),
+    _turn_result_step(summary="骨架页面已完成。", changed_files=["index.html"]),
+]
+"""伪模型脚本步：申报改了 index.html 但磁盘零写入——自洽性回喂一次后仍申报（verbal_completion 放行）。"""
+
+NO_CHANGE_STEP = _turn_result_step(
+    intent="no_change",
+    summary="骨架已存在。",
+    changed_files=[],
+    no_change_reason="前次执行已完成本单交付，磁盘现状即满足交付内容。",
+)
+"""伪模型脚本步：磁盘零改动的结构化 no_change——须经工单级确认回喂后第二次提交才放行。"""
+
 
 def _confirm_tickets(client, headers, project_id, feedback: str = "") -> list[dict]:
     """确认工单清单（随即进入检查点串行执行）；返回 SSE 事件列表。"""
@@ -269,6 +291,141 @@ class TestFailureAndRetry:
         assert _confirm_tickets(client, auth_headers, project["id"])[-1]["type"] == "done"
         resp = client.post(f"/api/projects/{project['id']}/tickets/resume", json={}, headers=auth_headers)
         assert resp.status_code == 409
+
+
+class TestZeroDeliverableGate:
+    """工单 0029：磁盘零改动收尾的工单轮不得静默标 done。
+
+    唯一的零改动合法出口是经工单级确认回喂后的结构化 no_change（如「交付已在前次
+    中断轮完成」的重跑轮）：该出口照常 done + 检查点，但进度行显式标注「零改动收尾」
+    交人工判断；散文兜底收尾与 modify_code 申报零改动（verbal_completion 放行）
+    一律按执行失败处置——不建快照、不建卡片、不标 done，/tickets/resume 可从该单重试。
+    """
+
+    def test_prose_fallback_zero_change_fails_and_retries(
+        self, app, settings, client, auth_headers
+    ):
+        model = use_fake_model(
+            app,
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"text": SPEC_TEXT},
+                {"tool_calls": [("submit_tickets", {"tickets": TICKETS_PAYLOAD})]},
+                *PROSE_EXIT_STEPS,
+                *TICKET1_STEPS,
+                *TICKET2_STEPS,
+            ],
+        )
+        project = _create_project(client, auth_headers, mode="team")
+        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _confirm_consensus(client, auth_headers, project["id"])
+        _confirm_spec(client, auth_headers, project["id"])
+        events = _confirm_tickets(client, auth_headers, project["id"])
+
+        progress = [e for e in events if e["type"] == "ticket_progress"]
+        assert [(p["seq"], p["status"]) for p in progress] == [
+            (1, "running"),
+            (1, "failed"),
+        ]
+        assert events[-1]["type"] == "error"
+        assert "零改动收尾" in events[-1]["detail"]
+        assert "可从该工单重试" in events[-1]["detail"]
+        tickets = client.get(
+            f"/api/projects/{project['id']}/tickets", headers=auth_headers
+        ).json()
+        assert [t["status"] for t in tickets] == ["failed", "open"]
+        # 失败单不留检查点：零改动、无成果可留档
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert snaps == []
+
+        # resume 从该单重试：这次真实交付，两单全部 done
+        events = _resume_tickets(client, auth_headers, project["id"])
+        assert events[-1]["type"] == "done"
+        tickets = client.get(
+            f"/api/projects/{project['id']}/tickets", headers=auth_headers
+        ).json()
+        assert [t["status"] for t in tickets] == ["done", "done"]
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").exists() and (pdir / "timer.js").exists()
+
+    def test_verbal_completion_zero_change_fails(self, app, client, auth_headers):
+        """宣称改了文件但磁盘零写入：自洽性回喂救不回来时，零交付闸按失败处置。"""
+        use_fake_model(
+            app,
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"text": SPEC_TEXT},
+                {"tool_calls": [("submit_tickets", {"tickets": TICKETS_PAYLOAD})]},
+                *VERBAL_CLAIM_STEPS,
+                *TICKET1_STEPS,
+                *TICKET2_STEPS,
+            ],
+        )
+        project = _create_project(client, auth_headers, mode="team")
+        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _confirm_consensus(client, auth_headers, project["id"])
+        _confirm_spec(client, auth_headers, project["id"])
+        events = _confirm_tickets(client, auth_headers, project["id"])
+
+        assert (1, "failed") in [
+            (p["seq"], p["status"]) for p in events if p["type"] == "ticket_progress"
+        ]
+        assert events[-1]["type"] == "error" and "零改动收尾" in events[-1]["detail"]
+
+        events = _resume_tickets(client, auth_headers, project["id"])
+        assert events[-1]["type"] == "done"
+        tickets = client.get(
+            f"/api/projects/{project['id']}/tickets", headers=auth_headers
+        ).json()
+        assert [t["status"] for t in tickets] == ["done", "done"]
+
+    def test_confirmed_no_change_closes_with_annotation(self, app, client, auth_headers):
+        """合法逃逸：确认回喂后仍 no_change → done，但进度行标注「零改动收尾」。"""
+        model = use_fake_model(
+            app,
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"text": SPEC_TEXT},
+                {"tool_calls": [("submit_tickets", {"tickets": TICKETS_PAYLOAD})]},
+                NO_CHANGE_STEP,
+                NO_CHANGE_STEP,
+                *TICKET2_STEPS,
+            ],
+        )
+        project = _create_project(client, auth_headers, mode="team")
+        _stream_messages(client, auth_headers, project["id"], "做一个番茄钟")
+        _confirm_consensus(client, auth_headers, project["id"])
+        _confirm_spec(client, auth_headers, project["id"])
+        events = _confirm_tickets(client, auth_headers, project["id"])
+
+        assert events[-1]["type"] == "done"
+        progress = [e for e in events if e["type"] == "ticket_progress"]
+        done1 = next(p for p in progress if p["seq"] == 1 and p["status"] == "done")
+        done2 = next(p for p in progress if p["seq"] == 2 and p["status"] == "done")
+        assert done1["zero_change"] is True
+        assert "zero_change" not in done2
+
+        # 确认回喂确实到达模型（轮级预算一次，房规同自洽性核验）
+        assert any(
+            "磁盘零改动" in getattr(m, "content", "")
+            for call in model.received_messages
+            for m in call
+        )
+
+        tickets = client.get(
+            f"/api/projects/{project['id']}/tickets", headers=auth_headers
+        ).json()
+        assert [t["status"] for t in tickets] == ["done", "done"]
+
+        # 标注随进度行落库：刷新回看同样能识别「零改动收尾」
+        messages = client.get(
+            f"/api/projects/{project['id']}/messages", headers=auth_headers
+        ).json()
+        rows = [json.loads(m["content"]) for m in messages if m["kind"] == "ticket"]
+        seq1_done = next(r for r in rows if r["seq"] == 1 and r["status"] == "done")
+        assert seq1_done["zero_change"] is True
 
 
 class TestExecQuota:

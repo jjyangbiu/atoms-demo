@@ -747,6 +747,7 @@ async def _engineer_stream(
     extra_finalize: Callable[[Session, Snapshot], None] | None = None,
     record_iteration: bool = True,
     user_round: bool = False,
+    require_deliverable: bool = False,
 ):
     """工程师智能体生成流（SSE 块）：工程师模式与团队模式确认后共用（工单 0010）。
 
@@ -760,6 +761,11 @@ async def _engineer_stream(
       进意图分类器（ADR 0005 第 7 层「落到工程师智能体的用户对话轮」）——确认驱动的
       确定性流水线轮（共识/PRD/规格确认后的实现轮）不分类：其确认文案不携带用户诉求，
       交给分类器等于用 LLM 替换状态机，一旦判为咨询，实现轮被污染成只读问答。
+    - require_deliverable：本轮是否必须交付磁盘成果（团队工单执行，工单 0029）。
+      磁盘零改动的轮次只有一条合法出口——经工单级确认回喂后的结构化 no_change
+      （如「交付已在前次中断轮完成」的重跑轮），该出口照常收尾并在 result 附
+      zero_change 标注；其余零改动收尾（散文兜底、modify_code 申报零改动）一律
+      按失败处置：不建快照、不建卡片、不标 done。
     """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
@@ -794,7 +800,7 @@ async def _engineer_stream(
             parsed, reason = parse_turn_result_payload(raw)
             if parsed is None:
                 return False, f"轮次产物不合法：{reason} 请修正后重新调用 submit_turn_result。"
-            feedback = _check_consistency(parsed)
+            feedback = _check_consistency(parsed) or _ticket_exit_check(parsed)
             if feedback is not None:
                 return False, feedback
             raise _SubmitTurnResultInvoked(parsed)
@@ -845,6 +851,9 @@ async def _engineer_stream(
     # 自洽性核验状态（工单 0025）：每轮至多一次精确差异回喂，出口工具路径与
     # 正文恢复路径共用同一计数——回喂是轮级预算，不是按提交次数重置的。
     consistency = {"refeed_done": False}
+    # 零交付闸状态（工单 0029，仅 require_deliverable 轮生效）：确认回喂同为轮级
+    # 预算一次；confirmed_no_change 标记「回喂后仍 no_change」的合法逃逸出口。
+    ticket_exit = {"refeed_done": False, "confirmed_no_change": False}
 
     def _touched_now() -> set[str]:
         """以当前磁盘重算指纹，与轮前指纹比对即得本轮至此的真实改动集。"""
@@ -861,6 +870,27 @@ async def _engineer_stream(
         consistency["refeed_done"] = True
         return _consistency_feedback(kind or "", declared, touched_now)
 
+    def _ticket_exit_check(parsed: dict) -> str | None:
+        """零交付闸（工单 0029）：require_deliverable 轮的结构化 no_change 且磁盘
+        零改动时，先回喂一次确认；第二次提交仍 no_change 即放行并记 confirmed。
+
+        工单的成功信号（done + 检查点）不得建立在零交付上；但「前次执行中断、交付
+        已在磁盘」的重跑轮只能以 no_change 合法收尾（零 diff 闸禁止空编辑硬凑改动），
+        故不能一刀切失败——回喂给模型一次继续交付或说明理由的机会，确认后的逃逸
+        由路由层标注「零改动收尾」显式化交人工判断。磁盘有改动的提交不进本闸。
+        """
+        if not require_deliverable or parsed["intent"] != "no_change" or _touched_now():
+            return None
+        if not ticket_exit["refeed_done"]:
+            ticket_exit["refeed_done"] = True
+            return (
+                "工单要求交付可见成果，但本轮至此磁盘零改动。若前次执行已完成本单交付，"
+                "请在 no_change_reason 中说明磁盘现状已满足交付内容，重新调用 "
+                "submit_turn_result；否则请继续使用文件工具完成交付后再提交。"
+            )
+        ticket_exit["confirmed_no_change"] = True
+        return None
+
     # ADR 0005 降级链（工单 0025 完整落地）：模型试图以普通文本收尾时——
     # ① 按房规从累积正文恢复产物 JSON（成功即经自洽性核验后以终结信号收束）；
     # ② 恢复不了则回喂一次唯一出口提示；
@@ -870,7 +900,7 @@ async def _engineer_stream(
     def final_text_hook(final_text: str) -> str | None:
         recovered = recover_turn_result_payload("".join(raw_parts))
         if recovered is not None:
-            feedback = _check_consistency(recovered)
+            feedback = _check_consistency(recovered) or _ticket_exit_check(recovered)
             if feedback is not None:
                 return feedback
             raise _SubmitTurnResultInvoked(recovered)
@@ -970,6 +1000,23 @@ async def _engineer_stream(
         }
     completed = done_data is not None or turn_result_payload is not None
     no_change_round = bool(record_iteration and completed and not touched_files)
+
+    # 零交付闸（工单 0029）：require_deliverable 轮以磁盘零改动收尾时，唯一合法
+    # 出口是经确认回喂后的结构化 no_change（ticket_exit["confirmed_no_change"]）；
+    # 散文兜底收尾、modify_code 申报零改动（verbal_completion 放行）等其余零改动
+    # 出口一律按执行失败处置——不建快照、不建卡片、不标 done，工单留在 failed，
+    # /tickets/resume 从该单重试。判据全部来自磁盘指纹比对，不采信任何模型申报。
+    if (
+        require_deliverable
+        and completed
+        and not touched_files
+        and not ticket_exit["confirmed_no_change"]
+    ):
+        if result is not None:
+            result["ok"] = False
+            result["error"] = "零改动收尾，未确认交付"
+        yield _emit({"type": "error", "detail": "零改动收尾，未确认交付"})
+        return
 
     # 自洽性核验结论（工单 0025）：以轮末磁盘比对为权威，结构化字段呈现
     # （卡片徽标 + 收尾事件），不再往 summary 或回复正文追加说明文案。
@@ -1105,6 +1152,14 @@ async def _engineer_stream(
     if completed:
         if result is not None:
             result["ok"] = True
+            # 零改动收尾标注（工单 0029）：确认逃逸轮不静默 done——工单进度行
+            # （SSE 与落库同 payload）携 zero_change 标注，交付是否真为空交人工判断
+            if (
+                require_deliverable
+                and ticket_exit["confirmed_no_change"]
+                and not touched_files
+            ):
+                result["zero_change"] = True
         # 结构化收尾（工单 0024/0025）：卡片事件携完整 payload 外发；收尾事件
         # 移除随措辞机器退役的 warning/no_change 布尔与文案字段，改为携带核验
         # 结论（verdict，失配时附 mismatch_kind）与产物摘要（artifact）；
@@ -1395,6 +1450,9 @@ async def _exec_tickets_stream(request: Request, project_id: int):
     单张工单复用工程师流（_engineer_stream）：完成在工程师收尾同一事务内标 done
     并记录检查点快照引用（要么都成要么都不成）；其 done/单内 error 经 on_event 压下，
     由本流统一发工单进度事件；失败标 failed 后终止，由 /tickets/resume 从该单起点重试。
+    零交付闸（工单 0029，require_deliverable=True）：磁盘零改动的工单轮只有经确认
+    回喂后的结构化 no_change 一条合法出口（done + 进度行 zero_change 标注），其余
+    零改动收尾按失败处置，从该单重试。
     """
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
@@ -1463,6 +1521,7 @@ async def _exec_tickets_stream(request: Request, project_id: int):
                 on_event=_rewrite,
                 extra_finalize=_mark_done,
                 record_iteration=False,
+                require_deliverable=True,
             ):
                 if chunk != _NOOP_CHUNK:
                     yield chunk
@@ -1502,6 +1561,10 @@ async def _exec_tickets_stream(request: Request, project_id: int):
             "total": total,
             "snapshot_rev": snapshot.rev if snapshot is not None else None,
         }
+        if result.get("zero_change"):
+            # 零改动收尾（工单 0029）：经确认回喂的 no_change 合法关单，但交付
+            # 为空这一事实必须显式化——标注随进度事件外发并落库，供人工判断
+            progress["zero_change"] = True
         _persist_ticket_progress(session_factory, project_id, progress)
         yield _sse(progress)
         # 进入下一单；每单重取历史与文件清单，前序交付成果自然进入上下文

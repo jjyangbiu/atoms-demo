@@ -23,6 +23,13 @@ ENGINEER_BUILD_STEPS = [
     _turn_result_step(summary="已按规格完成。", changed_files=["index.html"]),
 ]
 
+TICKET2_BUILD_STEPS = [
+    {"tool_calls": [("write_file", {"path": "timer.js", "content": "// 计时核心"})]},
+    _turn_result_step(summary="计时核心已完成。", changed_files=["timer.js"]),
+]
+"""伪模型脚本步：工单 2 的真实交付。零交付闸（工单 0029）后每张工单都必须
+真实写盘才能关单——两张工单的清单不能只排一张的脚本步。"""
+
 
 class FakeClock:
     """可控时钟：注入限流器验证名额语义（与 test_clarification 同构）。"""
@@ -134,6 +141,7 @@ class TestSpecRedraft:
                 {"text": "规格二：深色主题。"},
                 BREAK_STEP,
                 *ENGINEER_BUILD_STEPS,
+                *TICKET2_BUILD_STEPS,
             ],
         )
         project = _create_project(client, auth_headers, mode="team")
@@ -290,6 +298,7 @@ class TestTeamPipelineQuota:
                 {"text": SPEC_TEXT},
                 BREAK_STEP,
                 *ENGINEER_BUILD_STEPS,
+                *TICKET2_BUILD_STEPS,
                 _turn_result_step(
                     intent="no_change",
                     summary="迭代完成。",
