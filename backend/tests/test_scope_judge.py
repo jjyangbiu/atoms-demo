@@ -146,9 +146,12 @@ class TestVerdictDisposal:
 
 
 class TestTriggerGates:
-    """触发闸（工单 0028 验收）：只在改动代码轮且磁盘确有改动时触发裁判。
+    """触发闸（工单 0028 验收 + 0030 修订）：改动代码轮且磁盘确有改动时触发裁判；
+    分类判 modify_code 却以 no_change + 磁盘零改动收尾的「可疑零改动轮」同样触发
+    （工单 0030：谎称无需改动的唯一逃逸口，裁判带空 diff 裁决）。
 
-    首建轮、咨询轮、零改动轮一律不触发——辅助模型注入点零调用即零成本。
+    首建轮、咨询轮一律不触发；分类缺席（辅助模型降级）的零改动轮无嫌疑信号，
+    不触发——辅助模型注入点零调用即零成本。
     """
 
     def test_first_build_round_never_triggers_judge(self, app, client, auth_headers):
@@ -195,8 +198,12 @@ class TestTriggerGates:
         assert events[-1]["type"] == "done"
         assert len(utility.received_messages) == 1  # 仅分类，裁判预排步原封未动
 
-    def test_zero_change_round_triggers_zero_judge_calls(self, app, client, auth_headers):
-        """改动代码轮但磁盘零改动：不触发裁判，卡片 scope_verdict 为 null。"""
+    def test_benign_zero_change_round_judged_in_scope(self, app, client, auth_headers):
+        """可疑零改动轮（工单 0030）：modify 分类 + no_change 收尾 + 磁盘零改动 → 进裁判。
+
+        良性场景（「确认下标题，不要改。」）由裁判读用户原话判 in_scope，不误伤；
+        裁判输入的 diff 为空，占位文案明示无可解码的文本改动。
+        """
         utility = use_fake_utility_model(app, [INTENT_MODIFY_STEP, JUDGE_IN_SCOPE_STEP])
         use_fake_model(
             app,
@@ -216,11 +223,115 @@ class TestTriggerGates:
         events = _stream_messages(client, auth_headers, project["id"], "确认下标题，不要改。")
 
         assert events[-1]["type"] == "done"
-        assert len(utility.received_messages) == 1  # 仅分类，裁判预排步原封未动
+        assert len(utility.received_messages) == 2  # 分类 1 + 裁判 1
+        judge_joined = _joined(utility.received_messages[1])
+        assert "确认下标题，不要改。" in judge_joined
+        assert "无可解码的文本改动" in judge_joined
+        card = _last_card(client, auth_headers, project["id"])
+        assert card["scope_verdict"] == "in_scope"
+        assert card["out_of_scope_segments"] == []
+        assert events[-1]["scope_verdict"] == "in_scope"
+        # 零改动轮不留档快照：硬闸语义不变（不制造假进展版本）
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert snaps == []
+
+
+class TestZeroChangeJudgeFallback:
+    """可疑零改动轮的裁判兜底（工单 0030）：分类器判 modify_code、模型以 no_change
+    收尾且磁盘零改动——谎称「无需改动」的唯一逃逸口，此前拿绿色 CONSISTENT 徽标
+    直接过关。裁判带空 diff 照常裁决：诉求要求改动 → incomplete（卡片「未完成」
+    徽标）；分类缺席（辅助模型降级）的 no_change 收尾无嫌疑信号，不触发裁判。"""
+
+    def test_false_no_change_on_modify_request_judged_incomplete(
+        self, app, client, auth_headers
+    ):
+        utility = use_fake_utility_model(
+            app, [INTENT_MODIFY_STEP, _judge_step(verdict="incomplete")]
+        )
+        use_fake_model(
+            app,
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="标题已经改好了。",
+                    changed_files=[],
+                    no_change_reason="目标状态已存在于磁盘。",
+                ),
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+
+        events = _stream_messages(client, auth_headers, project["id"], "把标题改成「原子钟」")
+
+        assert events[-1]["type"] == "done"
+        assert len(utility.received_messages) == 2  # 分类 1 + 裁判 1
+        card = _last_card(client, auth_headers, project["id"])
+        # 逃逸口不再以绿色徽标收官：自洽性仍为 consistent（无申报可比），
+        # 但正确性裁决 incomplete——「说改好了但没改」被显式标注
+        assert card["consistency"] == "consistent"
+        assert card["scope_verdict"] == "incomplete"
+        assert card["out_of_scope_segments"] == []
+        assert events[-1]["scope_verdict"] == "incomplete"
+        # 零改动轮不留档快照（硬闸不变）；裁决写入迭代日志
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert snaps == []
+        assert _load_log(app, project["id"])[-1]["scope_verdict"] == "incomplete"
+
+    def test_prose_fallback_zero_change_also_judged(self, app, client, auth_headers):
+        """散文兜底收尾的零改动轮（intent 由系统按磁盘事实合成 no_change）同样进裁判。"""
+        utility = use_fake_utility_model(
+            app, [INTENT_MODIFY_STEP, _judge_step(verdict="incomplete")]
+        )
+        use_fake_model(
+            app,
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"text": "标题已经改好了。"},
+                {"text": "真的改好了。"},
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+
+        events = _stream_messages(client, auth_headers, project["id"], "把标题改成「原子钟」")
+
+        assert events[-1]["type"] == "done"
+        assert len(utility.received_messages) == 2
+        card = _last_card(client, auth_headers, project["id"])
+        assert card["consistency"] == "fallback"
+        assert card["scope_verdict"] == "incomplete"
+
+    def test_classifier_absent_zero_change_skips_judge(self, app, client, auth_headers):
+        """分类失败静默降级（房规）：无嫌疑信号，零改动轮不进裁判，scope_verdict 为 null。"""
+        utility = use_fake_utility_model(app, [RuntimeError("辅助模型不可用")])
+        use_fake_model(
+            app,
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                _turn_result_step(
+                    intent="no_change",
+                    summary="核实后无需改动。",
+                    changed_files=[],
+                    no_change_reason="现状已满足诉求。",
+                ),
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+
+        events = _stream_messages(client, auth_headers, project["id"], "把标题改成「原子钟」")
+
+        assert events[-1]["type"] == "done"
+        # 分类异常快速失败（classify_intent 不重试）：仅 1 次调用，裁判零调用
+        assert len(utility.received_messages) == 1
         card = _last_card(client, auth_headers, project["id"])
         assert card["scope_verdict"] is None
-        assert card["out_of_scope_segments"] == []
-        # 未触发裁判的轮次，收尾事件不携裁决字段
         assert "scope_verdict" not in events[-1]
 
 
@@ -441,7 +552,13 @@ class TestLogRendering:
             ],
         )
         use_fake_utility_model(
-            app, [INTENT_MODIFY_STEP, JUDGE_OUT_OF_SCOPE_STEP, INTENT_MODIFY_STEP]
+            app,
+            [
+                INTENT_MODIFY_STEP,
+                JUDGE_OUT_OF_SCOPE_STEP,
+                INTENT_MODIFY_STEP,
+                JUDGE_IN_SCOPE_STEP,  # 第 2 轮是可疑零改动轮：照常进裁判（工单 0030）
+            ],
         )
         project = _create_project(client, auth_headers)
         seed_project_files(app, project["id"], {"index.html": "v1"})

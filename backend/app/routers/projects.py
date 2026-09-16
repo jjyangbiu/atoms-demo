@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..agent.intent import INTENT_CONSULT, classify_intent
+from ..agent.intent import INTENT_CONSULT, INTENT_MODIFY_CODE, classify_intent
 from ..agent.judge import build_diff_text, judge_correctness
 from ..agent.loop import run_generation
 from ..agent.prompts import (
@@ -1034,18 +1034,34 @@ async def _engineer_stream(
     else:
         verdict, mismatch_kind = None, None
 
-    # 正确性裁判（工单 0028 阶段一 / ADR 0005「第 8 层」）：只在改动代码轮且磁盘
-    # 确有改动时触发——咨询轮已提前 return，零改动轮 touched_files 为空，都不进
-    # 裁判（零调用成本）。输入是用户原话 + 最近若干轮上下文 + 代码算好的 diff；
-    # 智能体自述一概不给（judge 模块内滤除 AI 消息、也不携带卡片申报字段）。
+    # 正确性裁判（工单 0028 阶段一 / ADR 0005「第 8 层」，0030 修订触发闸）：
+    # 咨询轮已提前 return；改动代码轮磁盘确有改动 → 带 diff 进裁判；分类
+    # modify_code 却以 no_change 收尾且磁盘零改动的「可疑零改动轮」→ 带空 diff
+    # 照常进裁判（此前这是「说改好了但没改」拿绿色徽标过关的唯一逃逸口）。
+    # 首建轮（无分类）与分类缺席（辅助模型降级）的零改动轮无嫌疑信号，不进
+    # 裁判。输入是用户原话 + 最近若干轮上下文 + 代码算好的 diff；智能体自述
+    # 一概不给（judge 模块内滤除 AI 消息、也不携带卡片申报字段）——空 diff 轮
+    # 判 in_scope 还是 incomplete，由裁判读用户原话裁决（「不要改」类诉求本就
+    # 不要求改动），分类器偏向 modify_code 的误报由裁判兜住而非硬闸误伤。
     # 失败（网络/超时/非法输出，重试语义在 judge 模块内复用既有次数与退避）→
     # 标注「核验未完成」且快照照建：安全网故障不得扣住用户的劳动成果，且必须
     # 显式化而非静默吞掉。阶段一只标注不阻断：越界轮快照照常留档（卡片列出
     # 越界段落，交用户裁决），不自动回滚、不把裁决回喂返工。
+    suspect_no_change = bool(
+        classification is not None
+        and classification["intent"] == INTENT_MODIFY_CODE
+        and turn_result_payload is not None
+        and turn_result_payload["intent"] == "no_change"
+        and not touched_files
+    )
     scope_verdict: str | None = None
     out_of_scope_segments: list[dict] = []
-    if pre_round_contents is not None and completed and touched_files:
-        diff_text = build_diff_text(touched_files, pre_round_contents, sandbox.root)
+    if pre_round_contents is not None and completed and (touched_files or suspect_no_change):
+        diff_text = (
+            build_diff_text(touched_files, pre_round_contents, sandbox.root)
+            if touched_files
+            else ""
+        )
         scope = await _judge_round(request, history, user_text, diff_text)
         if scope is None:
             scope_verdict = UNVERIFIED

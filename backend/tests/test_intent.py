@@ -192,6 +192,7 @@ class TestConsultRound:
                     user_goal="调大标题字号。",
                     target_files=["styles.css"],
                 ),
+                JUDGE_IN_SCOPE_STEP,  # 第 2 轮是可疑零改动轮：照常进裁判（工单 0030）
             ],
         )
         model = use_fake_model(
@@ -222,8 +223,9 @@ class TestConsultRound:
         _stream_messages(client, auth_headers, project["id"], "标题颜色是在哪里定义的？")
         _stream_messages(client, auth_headers, project["id"], "确认下标题样式，不要改。")
 
-        assert len(utility.received_messages) == 2
-        second = _joined(utility.received_messages[-1])
+        # 分类 1 + 轮末裁判 1（第 2 轮 modify 分类 + no_change 零改动收尾 = 可疑轮，工单 0030）
+        assert len(utility.received_messages) == 3
+        second = _joined(utility.received_messages[1])
         # 文件清单（路径+行数+哈希）与用户当前话
         assert "index.html" in second and "哈希" in second
         assert "确认下标题样式，不要改。" in second
@@ -298,6 +300,7 @@ class TestModifyRoundClassification:
                 _intent_step(
                     intent="modify_code", user_goal="按钮改圆角。", target_files=["styles.css"]
                 ),
+                JUDGE_IN_SCOPE_STEP,  # 第 2 轮可疑零改动轮裁判（工单 0030）
             ],
         )
         model = use_fake_model(
