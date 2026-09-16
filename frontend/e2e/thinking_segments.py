@@ -110,6 +110,10 @@ def chat_seq(page) -> list[str]:
               if (el.querySelector('.thinking-card')) return 'thinking';
               if (el.querySelector('.agent-bubble')) return 'text';
               if (el.querySelector('.user-bubble')) return 'user';
+              // 工具事件默认折叠为轮次摘要组（工单 0023）：顶层是 .tool-group，
+              // 逐条 .tool-line 明细嵌于其内，故按 .tool-group 识别为 'tool'。
+              if (el.classList.contains('tool-group')) return 'tool';
+              // 工单执行进度行仍是顶层 .tool-line（kind=ticket_progress，不参与工具折叠）
               if (el.classList.contains('tool-line')) {
                 return el.textContent.includes('工单') ? 'progress' : 'tool';
               }

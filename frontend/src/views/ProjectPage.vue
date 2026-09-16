@@ -46,6 +46,7 @@ interface ChatEntry {
     | 'user'
     | 'text'
     | 'tool'
+    | 'tool_group'
     | 'prd'
     | 'consensus'
     | 'spec'
@@ -85,6 +86,19 @@ interface ChatEntry {
   superseded?: boolean
   // 轮次产物卡片（工单 0024）：一句话总结 + 磁盘权威的改动文件清单 + 本轮 diff 入口
   turnResult?: TurnResultInfo
+  // 工具调用记录折叠组（工单 0023）：同一轮连续的工具事件折叠成一行摘要，
+  // 仅存在于 displayEntries 派生视图，entries 源数据仍逐条保留 kind='tool'
+  toolGroup?: ToolGroupInfo
+}
+
+// 工具调用折叠组（工单 0023 / ADR 0005「前端渲染」）：anchorId 为组内首条工具
+// 事件的稳定 id（历史为 msg-{id}、流式为 local-{n}），用作展开态键与 Vue key；
+// toolEntries 是组内逐条工具事件（仍为 kind='tool' 的 ChatEntry，展开明细按序渲染）；
+// summary 是折叠时的一行轮次摘要（读取/修改文件数）。
+interface ToolGroupInfo {
+  anchorId: string
+  toolEntries: ChatEntry[]
+  summary: string
 }
 
 // 轮次产物卡片字段（工单 0024/0025 / ADR 0005「第 8 层」）：
@@ -282,6 +296,46 @@ const isEmpty = computed(
   () => entries.value.length === 0 && !generating.value,
 )
 
+// 工具调用折叠组的展开态（工单 0023）：键为组的 anchorId，缺省即折叠（默认态）。
+// 历史组的 anchorId 是稳定的 msg-{id}，跨 loadHistory 重建不丢；流式组以 local-{n}
+// 为键，流结束重建时换键、展开态随之回落为默认折叠（与刷新后一致）。整页刷新
+// 清空 JS 态后一律回到默认折叠，与「折叠摘要 + 可展开明细」一致。
+const expandedToolGroups = ref<Record<string, boolean>>({})
+
+function toggleToolGroup(anchorId: string) {
+  expandedToolGroups.value[anchorId] = !expandedToolGroups.value[anchorId]
+}
+
+// 对话主流渲染视图（工单 0023）：把 entries 里连续的 kind='tool' 事件折叠成一个
+// 合成 kind='tool_group' 条目，其余条目原样透传。entries 仍是唯一真源（流式合并
+// 逻辑按逐条工具事件工作），此处只做派生：同一轮的工具事件在落库历史里天然连续
+// （thinking 合并为一块、turn_result 均排在工具之后），故「连续折叠」==「按轮折叠」。
+const displayEntries = computed<ChatEntry[]>(() => {
+  const out: ChatEntry[] = []
+  let run: ChatEntry[] = []
+  const flushRun = (): void => {
+    if (run.length === 0) return
+    const anchorId = run[0].id
+    const tools = run.map((e) => e.tool).filter((t): t is ToolInfo => t != null)
+    out.push({
+      id: `toolgroup-${anchorId}`,
+      kind: 'tool_group',
+      content: '',
+      toolGroup: { anchorId, toolEntries: run, summary: toolGroupSummary(tools) },
+    })
+    run = []
+  }
+  for (const e of entries.value) {
+    if (e.kind === 'tool') run.push(e)
+    else {
+      flushRun()
+      out.push(e)
+    }
+  }
+  flushRun()
+  return out
+})
+
 // rev 参数在每次生成/迭代完成后递增，强制 iframe 刷新到最新版本（工单 0005）；
 // 预览鉴权靠登录 Cookie 自动携带，无需在 URL 里暴露令牌
 const previewSrc = computed(() =>
@@ -367,9 +421,55 @@ function toolLabel(tool: ToolInfo): string {
     const query = typeof tool.args.query === 'string' ? tool.args.query : ''
     return `检索模板 ${query}`
   }
-  const verb = { write_file: '写入', edit_file: '修改', read_file: '读取' }[tool.name] ?? tool.name
+  const verb =
+    {
+      write_file: '写入',
+      edit_file: '修改',
+      read_file: '读取',
+      // 终结出口（工单 0024）：不计入摘要，仅在展开明细里作为证据链留档
+      submit_turn_result: '提交轮次产物',
+    }[tool.name] ?? tool.name
   const path = typeof tool.args.path === 'string' ? tool.args.path : ''
-  return `${verb} ${path}`
+  return path ? `${verb} ${path}` : verb
+}
+
+// 工具调用折叠组的一行轮次摘要（工单 0023 / ADR 0005「前端渲染」）：
+// 反映本轮真实的读取/修改文件数（按去重路径计，重复读同一文件只算一个）。
+// 终结出口 submit_turn_result 不计入摘要——其结果已由产物卡片呈现，事件行仅作
+// 证据链留档于展开明细（后端只落库不外发，故摘要在流式与历史回看下口径一致）。
+function toolGroupSummary(tools: ToolInfo[]): string {
+  const readPaths = new Set<string>()
+  const modPaths = new Set<string>()
+  let searchCount = 0
+  let otherCount = 0
+  let running = false
+  let failed = false
+  for (const t of tools) {
+    if (t.name === 'submit_turn_result') continue
+    if (t.status === 'start') running = true
+    if (t.status === 'error') failed = true
+    const path = typeof t.args.path === 'string' ? t.args.path : ''
+    if (t.name === 'read_file') {
+      if (path) readPaths.add(path)
+      else otherCount++
+    } else if (t.name === 'write_file' || t.name === 'edit_file') {
+      if (path) modPaths.add(path)
+      else otherCount++
+    } else if (t.name === 'search_templates') {
+      searchCount++
+    } else {
+      otherCount++
+    }
+  }
+  const parts: string[] = []
+  if (readPaths.size) parts.push(`读取 ${readPaths.size} 个文件`)
+  if (modPaths.size) parts.push(`修改 ${modPaths.size} 个文件`)
+  if (searchCount) parts.push(`检索 ${searchCount} 次`)
+  if (otherCount) parts.push(`其他 ${otherCount} 项`)
+  let text = parts.length ? `本轮${parts.join('、')}` : '本轮工具调用'
+  if (failed) text += '（含失败）'
+  else if (running) text += '…'
+  return text
 }
 
 function scrollToBottom() {
@@ -1276,7 +1376,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             v-if="isEmpty"
             description="描述你想构建的应用，例如：做一个番茄钟，带统计功能"
           />
-          <template v-for="entry in entries" :key="entry.id">
+          <template v-for="entry in displayEntries" :key="entry.id">
             <div v-if="entry.kind === 'user'" class="msg user-msg">
               <div class="bubble user-bubble">{{ entry.content }}</div>
             </div>
@@ -1585,19 +1685,45 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                 {{ entry.content }}
               </el-tag>
             </div>
-            <div v-else-if="entry.kind === 'tool'" class="tool-line">
-              <el-tag
-                :type="entry.tool?.status === 'error' ? 'danger' : 'success'"
-                size="small"
-                effect="plain"
-              >
-                <span v-if="entry.tool?.status === 'start'" class="tool-running">⚙ {{ toolLabel(entry.tool) }}…</span>
-                <span v-else-if="entry.tool?.status === 'error'">✗ {{ entry.tool ? toolLabel(entry.tool) : '' }}</span>
-                <span v-else>✓ {{ entry.tool ? toolLabel(entry.tool) : '' }}</span>
-              </el-tag>
-              <span v-if="entry.tool?.status === 'error'" class="tool-error-text">
-                {{ entry.tool.result }}
-              </span>
+            <div v-else-if="entry.kind === 'tool_group'" class="tool-group">
+              <!-- 工具调用记录默认折叠为轮次摘要（工单 0023 / ADR 0005「前端渲染」）：
+                   同一轮的工具事件折叠成一行摘要（读取/修改文件数），点击展开看完整明细；
+                   落库契约不变，变化只在渲染层。明细逐条复用原工具行样式。 -->
+              <template v-if="entry.toolGroup">
+                <button
+                  type="button"
+                  class="tool-group-toggle"
+                  data-testid="tool-group-toggle"
+                  @click="toggleToolGroup(entry.toolGroup.anchorId)"
+                >
+                  <span class="tool-group-caret">
+                    {{ expandedToolGroups[entry.toolGroup.anchorId] ? '▾' : '▸' }}
+                  </span>
+                  <span class="tool-group-summary" data-testid="tool-group-summary">
+                    {{ entry.toolGroup.summary }}
+                  </span>
+                </button>
+                <div
+                  v-show="expandedToolGroups[entry.toolGroup.anchorId]"
+                  class="tool-group-detail"
+                  data-testid="tool-group-detail"
+                >
+                  <div v-for="t in entry.toolGroup.toolEntries" :key="t.id" class="tool-line">
+                    <el-tag
+                      :type="t.tool?.status === 'error' ? 'danger' : 'success'"
+                      size="small"
+                      effect="plain"
+                    >
+                      <span v-if="t.tool?.status === 'start'" class="tool-running">⚙ {{ t.tool ? toolLabel(t.tool) : '' }}…</span>
+                      <span v-else-if="t.tool?.status === 'error'">✗ {{ t.tool ? toolLabel(t.tool) : '' }}</span>
+                      <span v-else>✓ {{ t.tool ? toolLabel(t.tool) : '' }}</span>
+                    </el-tag>
+                    <span v-if="t.tool?.status === 'error'" class="tool-error-text">
+                      {{ t.tool.result }}
+                    </span>
+                  </div>
+                </div>
+              </template>
             </div>
             <div v-else-if="entry.kind === 'thinking'" class="msg agent-msg">
               <!-- 思考过程（诊断修复）：小一号文字，可收起/展开，随打字机逐字显现 -->
@@ -2184,6 +2310,46 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .tool-error-text {
   color: #f56c6c;
   font-size: 12px;
+}
+
+/* 工具调用记录折叠为轮次摘要（工单 0023）：默认一行摘要，展开看逐条明细。
+   摘要按钮沿用思考过程折叠的弱化配色，明细左侧细线区分层次、缩进对齐。 */
+.tool-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 4px;
+}
+
+.tool-group-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: #909399;
+  font-size: 12px;
+}
+
+.tool-group-toggle:hover {
+  color: #606266;
+}
+
+.tool-group-caret {
+  display: inline-block;
+  width: 10px;
+}
+
+.tool-group-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: 4px;
+  padding-left: 12px;
+  border-left: 2px solid #ebeef5;
 }
 
 /* 思考过程（诊断修复）：比正文小一号、弱化配色，左侧细线区分层次 */
