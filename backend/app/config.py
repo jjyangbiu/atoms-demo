@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     llm_model: str = "MiniMax-M3"
     llm_api_key: str = ""
     llm_temperature: float = 0.2
+    # 是否请求模型输出思考过程（推理链）。Qwen3 等经 OpenAI 兼容端点的推理模型需要
+    # 通过 extra_body={"enable_thinking": true} 显式开启，思考文本以增量 reasoning_content
+    # 回流（见 app/agent/model.py 的 ThinkingChatOpenAI）。MiniMax 用行内 <think> 标签，
+    # 不需要本开关。对不支持该参数的端点保持默认 False 以免请求被拒。
+    llm_enable_thinking: bool = False
     # 辅助模型（工单 0027 / ADR 0005「成本边界」）：意图分类与后续正确性裁判这类
     # 「输入小、输出小、不需要强推理」的独立小调用使用的模型；默认（置空）等于
     # llm_model——本次不切实测过的小模型，实测成本或延迟有问题时改这一项即可切。

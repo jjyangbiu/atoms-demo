@@ -23,6 +23,58 @@ INTENT_ENUM = (INTENT_MODIFY_CODE, INTENT_CONSULT)
 # user_goal 蒸馏上限（工单 0027 验收）：超长在解析侧截断，不算校验失败
 USER_GOAL_MAX_CHARS = 50
 
+# 版本回退语（分类器 prompt 规则 3）：这类请求即便含「改」字也应留在 consult——
+# 版本回退有专门的历史入口，不属于本轮代码改动。负向标记优先于改动动词判定。
+_ROLLBACK_MARKERS = (
+    "改回",
+    "回上一版",
+    "回上个版",
+    "回到上一",
+    "恢复以前",
+    "恢复之前",
+    "恢复到",
+    "回滚",
+    "还原",
+    "退回",
+)
+# 改动动词（子串命中即视为带改动诉求）：只在分类器判 consult 时作二次防线用。
+# 房规（intent 模块头注）：假阳性（咨询被救成改动）有轮内自愈——终结出口可自报
+# no_change；假阴性（改动被判成咨询）落进只读轮物理上改不了、且无回退机制。故此处
+# 刻意偏向改动，宁可多绑工具，词表从宽。
+_MODIFY_MARKERS = (
+    "改",
+    "换",
+    "加",
+    "增",
+    "删",
+    "去掉",
+    "调整",
+    "优化",
+    "修复",
+    "替换",
+    "更新",
+    "变成",
+    "设成",
+    "设为",
+    "实现",
+    "支持",
+    "做一个",
+    "做个",
+)
+
+
+def looks_like_modify_request(user_text: str) -> bool:
+    """确定性关键词判定：这条用户话是否明显带改动诉求（分类器判 consult 时的二次防线）。
+
+    先排除版本回退语（含「改」字也保持 consult，尊重分类器 prompt 规则 3），再看是否
+    命中改动动词。纯确定性、零成本，只在分类器意外把明确改动诉求判成 consult 时兜底，
+    绝不覆盖真正的提问/回退轮。
+    """
+    text = user_text or ""
+    if any(m in text for m in _ROLLBACK_MARKERS):
+        return False
+    return any(m in text for m in _MODIFY_MARKERS)
+
 
 def parse_intent_payload(raw: str) -> tuple[dict | None, str]:
     """校验分类输出 JSON；非法时返回 (None, 错误文案) 交还模型修正（房规同其他 parse_*）。

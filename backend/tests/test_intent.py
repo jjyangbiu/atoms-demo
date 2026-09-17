@@ -41,6 +41,7 @@ from test_team_tickets import (
 from test_world import _generate_and_publish, _register_and_login
 
 from app.agent.tools import FileSandbox, build_readonly_tools
+from app.agent.intent import looks_like_modify_request
 
 
 class _StubKnowledgeStore:
@@ -586,3 +587,72 @@ class TestQuotaAndClone:
         pdir = _project_dir(settings, cloned["id"])
         assert (pdir / "index.html").read_text(encoding="utf-8") == "<h1>v1</h1>"
         assert _load_log(app, cloned["id"]) == []
+
+
+class TestIntentKeywordFallback:
+    """意图误判的二次防线（补 ADR 0005「第 7 层」薄弱点）：分类器把明确带改动
+    动词的诉求自信地判成 consult 时，确定性关键词规则把它救回 modify_code。"""
+
+    def test_modify_verbs_detected(self):
+        for text in (
+            "把标题改成深色主题",
+            "加一个重置按钮",
+            "新增一栏导航",
+            "把布局优化一下",
+            "修复页脚重叠的问题",
+            "把按钮颜色换成红色",
+        ):
+            assert looks_like_modify_request(text), text
+
+    def test_rollback_and_pure_question_stay_consult(self):
+        # 版本回退语（含「改」字也保持 consult，尊重分类器 prompt 规则 3）
+        for text in ("改回上一版", "恢复以前的样子", "回滚到之前的版本"):
+            assert not looks_like_modify_request(text), text
+        # 纯提问（无改动动词）不被误判为改动
+        for text in ("标题颜色是在哪里定义的？", "当前页面长什么样？", ""):
+            assert not looks_like_modify_request(text), text
+
+    def test_misclassified_modify_request_rescued_to_engineer_stream(
+        self, app, settings, client, auth_headers
+    ):
+        """分类器误判 consult，但用户明确要改 → 关键词兜底救回，走工程师流真实改文件。
+
+        这是用户报告的症状 1（明确增改诉求被当成只读咨询）的回归防护：咨询是死胡同
+        （只读轮物理上改不了、无回退机制），兜底确保它仍落到工程师流产卡片且真改盘。
+        """
+        utility = use_fake_utility_model(app, [INTENT_CONSULT_STEP, JUDGE_IN_SCOPE_STEP])
+        model = use_fake_model(
+            app, [*EDIT_STEPS, _turn_result_step(changed_files=["index.html"])]
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+
+        events = _stream_messages(
+            client, auth_headers, project["id"], "把标题改成深色主题"
+        )
+
+        # 走了工程师流（consult 轮不产卡片），且磁盘真实改动
+        types = [e["type"] for e in events]
+        assert "turn_result" in types and types[-1] == "done"
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v2"
+        # 分类器仍只调一次（兜底是路由层确定性规则，不额外调模型），裁判因真改动而触发
+        assert len(utility.received_messages) == 2
+
+    def test_rollback_misclassified_consult_not_rescued(
+        self, app, settings, client, auth_headers
+    ):
+        """回退语即便含「改」字也不被兜底救回：仍走只读咨询轮，磁盘零改动。"""
+        use_fake_utility_model(app, [INTENT_CONSULT_STEP])
+        use_fake_model(
+            app, [{"text": "版本回退请使用页面上的版本历史回滚入口。"}]
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v2"})
+
+        events = _stream_messages(client, auth_headers, project["id"], "改回上一版")
+
+        types = [e["type"] for e in events]
+        assert "turn_result" not in types and types[-1] == "done"
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v2"

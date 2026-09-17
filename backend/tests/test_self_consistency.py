@@ -19,9 +19,12 @@ import json
 from conftest import (
     EDIT_STEPS,
     FIRST_BUILD_CLARIFY_STEP,
+    INTENT_MODIFY_STEP,
+    JUDGE_IN_SCOPE_STEP,
     _turn_result_step,
     seed_project_files,
     use_fake_model,
+    use_fake_utility_model,
 )
 from test_changed_set import _load_log
 from test_generation import _stream_messages
@@ -508,3 +511,94 @@ class TestCoverageScope:
         # 保留（压缩后）的编辑纪律：只能用编辑工具改文件、替换文本须唯一、只动受影响区域
         assert "edit_file" in content and "read_file" in content
         assert "old_text" in content and "唯一" in content
+
+
+class TestReworkOnUnfinishedModify:
+    """未完成自动返工（用户诉求「未完成 → 返工」）：分类器确信本轮意在改动，模型却
+    用文字声称改完而磁盘零改动——先回喂一次逼它真正动文件，动了再按自洽收尾。
+
+    仅在分类器确信 modify_code 时生效（散文兜底路径不经自洽性核验，是「口头声称改完
+    但没改」唯一绕过实质回喂的出口，此处补一次实质返工闸）；分类降级（None）不触发
+    本闸，仍走既有散文降级链兜底成诚实卡片（见 TestDegradationChain）。返工与自洽性
+    回喂各自独立计一次预算。
+    """
+
+    def test_prose_claim_zero_change_reworked_then_real_edit(
+        self, app, client, auth_headers
+    ):
+        """散文声称完成、磁盘零改动 → 返工回喂一次 → 模型真正改盘 → 自洽收尾、留快照。"""
+        utility = use_fake_utility_model(app, [INTENT_MODIFY_STEP, JUDGE_IN_SCOPE_STEP])
+        model = use_fake_model(
+            app,
+            [
+                {"text": "我已经把标题改成深色主题了。"},  # 散文声称完成，磁盘零改动
+                *EDIT_STEPS,  # 返工回喂后真正动文件（v1 → v2）
+                _turn_result_step(summary="标题已换成深色主题。", changed_files=["index.html"]),
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+        events = _stream_messages(client, auth_headers, project["id"], "把标题改成深色主题")
+
+        # 返工回喂恰好一次：散文步之后追加一条 HumanMessage 逼真改盘（点名写文件工具）
+        assert len(model.received_messages) == 4  # 散文、read、edit、出口
+        feedback = model.received_messages[1][-1]
+        assert type(feedback).__name__ == "HumanMessage"
+        assert "write_file" in feedback.content and "edit_file" in feedback.content
+
+        # 真改盘且按自洽收尾（不是散文兜底的 fallback，也不是失配）
+        messages = client.get(
+            f"/api/projects/{project['id']}/messages", headers=auth_headers
+        ).json()
+        card = json.loads(messages[-1]["content"])
+        assert card["consistency"] == "consistent" and card["mismatch_kind"] is None
+        assert card["intent"] == "modify_code"
+        assert card["changed_files"] == ["index.html"]
+        assert events[-1]["verdict"] == "consistent"
+        # 分类一次 + 裁判一次（真改动触发裁判）
+        assert len(utility.received_messages) == 2
+        # 真实改动轮留快照
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert len(snaps) == 1
+
+    def test_rework_budget_once_then_falls_to_prose_fallback(
+        self, app, client, auth_headers
+    ):
+        """返工预算轮级一次：回喂后仍散文不动手 → 落回既有散文降级链兜底成诚实卡片。
+
+        返工回喂（1 次）与散文出口回喂（1 次）各自独立：三段散文分别触发返工回喂、
+        散文出口回喂，第三段放行兜底。兜底卡片按磁盘事实为 no_change，绝不谎报完成。
+        """
+        utility = use_fake_utility_model(app, [INTENT_MODIFY_STEP, JUDGE_IN_SCOPE_STEP])
+        model = use_fake_model(
+            app,
+            [
+                {"text": "我已经改好了。"},  # 返工回喂（磁盘零改动）
+                {"text": "确实改好了，真的。"},  # 仍零改动 → 散文出口回喂
+                {"text": "我就是不调工具。"},  # 仍不听 → 放行兜底
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        seed_project_files(app, project["id"], {"index.html": "v1"})
+        events = _stream_messages(client, auth_headers, project["id"], "把标题改成深色主题")
+
+        # 两次回喂（返工 + 散文出口）后第三段放行：共三次模型调用
+        assert len(model.received_messages) == 3
+        # 兜底卡片按磁盘事实诚实呈现零改动，不谎报完成
+        messages = client.get(
+            f"/api/projects/{project['id']}/messages", headers=auth_headers
+        ).json()
+        card = json.loads(messages[-1]["content"])
+        assert card["consistency"] == "fallback"
+        assert card["intent"] == "no_change"
+        assert card["changed_files"] == []
+        assert events[-1]["verdict"] == "fallback"
+        # 分类 modify_code 的零改动兜底轮属可疑零改动（合成 no_change 申报），仍进裁判
+        # （工单 0030）：分类一次 + 裁判一次
+        assert len(utility.received_messages) == 2
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert snaps == []

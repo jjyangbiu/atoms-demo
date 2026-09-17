@@ -116,6 +116,11 @@ async def _attempt_stream(bound, messages: list, holder: dict) -> AsyncIterator[
         splitter = ThinkSplitter()
         accumulated = None
         async for chunk in bound.astream(messages):
+            # Qwen3 等经 extra_body 开启思考的模型，思考文本走独立的 reasoning_content
+            # 增量（由 ThinkingChatOpenAI 补进 additional_kwargs），已是纯思考、无需再拆标签
+            reasoning = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
+            if reasoning:
+                yield AgentEvent("thinking", {"content": reasoning})
             content = getattr(chunk, "content", "") or ""
             if content:
                 for kind, piece in splitter.feed(content):

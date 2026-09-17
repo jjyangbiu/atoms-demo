@@ -14,7 +14,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..agent.intent import INTENT_CONSULT, INTENT_MODIFY_CODE, classify_intent
+from ..agent.intent import (
+    INTENT_CONSULT,
+    INTENT_MODIFY_CODE,
+    classify_intent,
+    looks_like_modify_request,
+)
 from ..agent.judge import build_diff_text, judge_correctness
 from ..agent.loop import run_generation
 from ..agent.prompts import (
@@ -837,6 +842,16 @@ async def _engineer_stream(
         classification = await _classify_round_intent(
             request, summaries, iteration_log, history, user_text
         )
+    if (
+        classification is not None
+        and classification["intent"] == INTENT_CONSULT
+        and looks_like_modify_request(user_text)
+    ):
+        # 意图误判的二次防线（补 ADR 0005「第 7 层」薄弱点）：分类器把明确带改动
+        # 动词的诉求自信地判成 consult 时，用确定性关键词规则救回 modify_code——
+        # consult 是死胡同（只读轮物理上改不了、无回退机制），而误救成改动有轮内
+        # 自愈（终结出口可自报 no_change）。只覆盖 intent，保留 user_goal/target_files。
+        classification = {**classification, "intent": INTENT_MODIFY_CODE}
     if classification is not None and classification["intent"] == INTENT_CONSULT:
         # 咨询轮：只绑只读工具集，流式纯文本收尾——不产卡片、不核验、不入日志、不留快照
         async for chunk in _consult_stream(
@@ -896,6 +911,15 @@ async def _engineer_stream(
     # ② 恢复不了则回喂一次唯一出口提示；
     # ③ 仍不听 → 放行 done，路由层以首段散文作 summary、按磁盘事实兜底成卡片。
     exit_state: dict = {"prose_refeed_done": False, "first_prose": None}
+    # 实质返工闸（用户诉求「未完成→返工」）：本轮意在改动（分类器判 modify_code）
+    # 却在收尾时磁盘零改动——散文兜底路径不经自洽性核验，是「口头声称改完但没改」
+    # 唯一绕过实质回喂的出口。此处补一次轮级返工回喂，逼模型真正动文件后再收尾；
+    # 仍不动手才落回散文兜底卡片（结论仍为 fallback，不没收既有成果、不硬失败，
+    # 保持既有标注不阻断的契约）。轮级预算一次，与自洽性回喂各自独立计一次。
+    intends_modify = (
+        classification is not None and classification["intent"] == INTENT_MODIFY_CODE
+    )
+    rework_state = {"refeed_done": False}
 
     def final_text_hook(final_text: str) -> str | None:
         recovered = recover_turn_result_payload("".join(raw_parts))
@@ -904,6 +928,16 @@ async def _engineer_stream(
             if feedback is not None:
                 return feedback
             raise _SubmitTurnResultInvoked(recovered)
+        # 实质返工（散文收尾且本轮意在改动却磁盘零改动）：轮级一次，逼真正动文件
+        if intends_modify and not rework_state["refeed_done"] and not _touched_now():
+            rework_state["refeed_done"] = True
+            return (
+                "本轮意在修改应用，但到此磁盘上没有产生任何文件改动，你却在用文字收尾。"
+                "不要只用文字声称已完成——请立即用 write_file / edit_file 工具做出真实改动，"
+                "完成后再调用 submit_turn_result 提交轮次产物；若确认现状已满足诉求、本轮"
+                "无需改动，则以 intent=no_change 调用 submit_turn_result 并在 no_change_reason "
+                "中说明理由。"
+            )
         if not exit_state["prose_refeed_done"]:
             exit_state["prose_refeed_done"] = True
             exit_state["first_prose"] = final_text

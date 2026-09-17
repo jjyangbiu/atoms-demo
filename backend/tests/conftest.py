@@ -27,6 +27,13 @@ def settings(tmp_path) -> Settings:
         milvus_uri=str(tmp_path / "milvus" / "atoms.db"),
         jwt_secret="test-secret-key-for-jwt-0123456789abcdef",
         cors_origins="http://localhost:5173",
+        # 显式清空 LLM/embedding 凭据（不止关掉 .env 文件）：宿主 shell 或 os.environ
+        # 里若存在真实 ATOMS_LLM_API_KEY，_env_file=None 挡不住 os.environ 来源，会让
+        # default_*_model_factory 构造出真实 ChatOpenAI，意图分类器/裁判发起真实
+        # MiniMax 调用（违反「任何测试不得调用真实 API」）。init 参数优先级最高，
+        # 置空后未注入桩的辅助模型确定性降级为 None，测试回到纯桩驱动。
+        llm_api_key="",
+        embedding_api_key="",
         _env_file=None,
     )
 
