@@ -326,6 +326,9 @@ const displayEntries = computed<ChatEntry[]>(() => {
     run = []
   }
   for (const e of entries.value) {
+    // 纯空白正文不占位（诊断修复）：推理模型常在思考块与工具调用之间只吐换行，
+    // 流式期会据此建出正文条目，渲染即空气泡；历史里的空正文行同理不渲染
+    if (e.kind === 'text' && !(e.raw ?? e.content).trim()) continue
     if (e.kind === 'tool') run.push(e)
     else {
       flushRun()
@@ -1195,7 +1198,11 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
       if (event.type === 'thinking') {
         pushText(ensureThinkingEntry(), String(event.content ?? ''))
       } else if (event.type === 'text') {
-        pushText(ensureTextEntry(), String(event.content ?? ''))
+        // 段首纯空白增量（思考块与工具调用之间的换行/空格）不建正文条目：
+        // 否则空气泡会占位到流结束（诊断修复）；正文已开始则空白照常追加
+        const piece = String(event.content ?? '')
+        if (!textHolder.entry && !piece.trim()) return
+        pushText(ensureTextEntry(), piece)
       } else if (event.type === 'prd') {
         pushText(ensurePrdEntry(), String(event.content ?? ''))
       } else if (event.type === 'consensus') {
