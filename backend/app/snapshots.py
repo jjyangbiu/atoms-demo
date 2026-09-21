@@ -71,9 +71,10 @@ def create_snapshot(
 
 
 def restore_snapshot(project_root: Path, snapshot: Snapshot) -> None:
-    """用快照留档整体替换项目目录当前文件（回滚）。
+    """用快照留档整体替换项目目录当前文件（回滚的文件恢复部分）。
 
-    回滚不产生新快照；后续成功迭代会在恢复后的基线上留档新版本。
+    是否留档新版本由调用方（rollback 路由）按零改动闸决定：恢复后状态与
+    最新快照内容一致时不留档，否则回滚本身留档为新版本，历史只增不减。
     """
     source = snapshots_root(project_root) / str(snapshot.rev)
     for f in iter_project_files(project_root):
@@ -90,6 +91,27 @@ def restore_snapshot(project_root: Path, snapshot: Snapshot) -> None:
             dest = project_root / f.relative_to(source)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(f, dest)
+
+
+def snapshots_equivalent(project_root: Path, a: Snapshot, b: Snapshot) -> bool:
+    """两个快照留档的内容是否完全一致（路径集合与逐文件字节）。
+
+    回滚留档的零改动闸：目标版本内容与最新快照一致（回滚到最新版、
+    重复回滚同一版）时不留档新版本，不制造「版本 N+1」的假进展。
+    """
+    roots = [snapshots_root(project_root) / str(s.rev) for s in (a, b)]
+    listings = [
+        sorted(f.relative_to(r).as_posix() for f in r.rglob("*") if f.is_file())
+        if r.is_dir()
+        else []
+        for r in roots
+    ]
+    if listings[0] != listings[1]:
+        return False
+    return all(
+        (roots[0] / rel).read_bytes() == (roots[1] / rel).read_bytes()
+        for rel in listings[0]
+    )
 
 
 def _prune_old_snapshots(

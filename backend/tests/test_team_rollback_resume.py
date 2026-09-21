@@ -122,7 +122,7 @@ class TestResumeAfterRollback:
         assert events[-1]["type"] == "done"
         progress = [e for e in events if e["type"] == "ticket_progress"]
         assert [(p["seq"], p["status"]) for p in progress] == [(2, "running"), (2, "done")]
-        assert progress[-1]["snapshot_rev"] == 3  # 续跑生成新检查点，版本号续增
+        assert progress[-1]["snapshot_rev"] == 4  # 回滚已留档 rev3，续跑新检查点版本号续增
 
         # 续跑只执行了工单 2（写文件 + 收尾两次模型调用），指令里没有工单 1 的执行
         resume_calls = model.received_messages[calls_before:]
@@ -134,7 +134,7 @@ class TestResumeAfterRollback:
 
         statuses, revs = _ticket_states(client, auth_headers, pid)
         assert statuses == ["done", "done"]
-        assert revs == [1, 3]
+        assert revs == [1, 4]
         assert (_project_dir(settings, pid) / "timer.js").exists()
 
     def test_resume_only_available_with_unfinished_tickets(self, app, client, auth_headers):
@@ -173,7 +173,8 @@ class TestRepeatedRollbackResume:
         pid = project["id"]
         pdir = _project_dir(settings, pid)
 
-        for expected_rev in (3, 4):
+        # 回滚每轮先留档一版（rev3 / rev5），续跑新检查点随后续增：4 与 6
+        for expected_rev in (4, 6):
             checkpoint1 = _snapshot_by_rev(client, auth_headers, pid, 1)
             _rollback(client, auth_headers, pid, checkpoint1["id"])
             statuses, revs = _ticket_states(client, auth_headers, pid)
@@ -193,7 +194,8 @@ class TestRepeatedRollbackResume:
         by_rev = {s["rev"]: s for s in snaps}
         assert by_rev[1]["ticket_seq"] == 1
         assert by_rev[2]["ticket_seq"] == 2  # 被取代的旧检查点不失标注
-        assert by_rev[4]["ticket_seq"] == 2
+        assert by_rev[4]["ticket_seq"] == 2  # 第一轮续跑形成的新检查点
+        assert by_rev[6]["ticket_seq"] == 2  # 第二轮续跑形成的检查点
 
 
 class TestRollbackResumeQuota:

@@ -786,11 +786,16 @@ async function onRollback(snapshot: SnapshotOut) {
   }
   rollingBackId.value = snapshot.id
   try {
-    await store.rollbackSnapshot(projectId.value, snapshot.id)
+    const archived = await store.rollbackSnapshot(projectId.value, snapshot.id)
     // 回滚可能重置工单状态（工单 0019）：工单态一并重拉，继续执行入口据最新状态重建
     await Promise.all([loadFiles(), loadSnapshots(), loadTickets()])
     previewRev.value += 1
-    ElMessage.success(`已回滚到版本 ${snapshot.rev}`)
+    // 回滚留档为新版本（零改动闸命中时不留档、返回即目标版本）：历史只增不减
+    ElMessage.success(
+      archived.rev > snapshot.rev
+        ? `已回滚到版本 ${snapshot.rev}（已留档为版本 ${archived.rev}）`
+        : `已回滚到版本 ${snapshot.rev}`,
+    )
     historyVisible.value = false
   } catch (e) {
     ElMessage.error(e instanceof ApiError ? e.detail : '回滚失败')

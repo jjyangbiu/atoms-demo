@@ -83,6 +83,7 @@ from ..snapshots import (
     iter_project_files,
     list_snapshot_files,
     restore_snapshot,
+    snapshots_equivalent,
 )
 from ..serving import serve_project_file
 
@@ -2445,7 +2446,11 @@ def rollback_snapshot(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Snapshot:
-    """把当前文件恢复为该快照状态；后续迭代以其为基线。
+    """把当前文件恢复为该快照状态，并留档为新版本；后续迭代以其为基线。
+
+    回滚留档使版本历史只增不减：「最新」始终如实反映磁盘现状，新版本相对
+    前一版的 diff 即回滚效果。零改动闸与生成轮同款——目标版本内容与最新
+    快照一致（回滚到最新版、重复回滚同一版）时不留档，不制造假进展。
 
     团队模式检查点回滚（工单 0019）：该检查点之后的工单重置为未完成，由用户手动
     「继续执行」从第一个未完成工单续跑（续跑不占新名额）；有工单执行中（running）
@@ -2467,13 +2472,27 @@ def rollback_snapshot(
     root = project_dir(request, project_id)
     restore_snapshot(root, snapshot)
     _sync_file_index(db, project_id, root)
+    # 回滚留档（用户报告：历史到 rev4 回滚到 rev3 后列表仍 [4,3,2,1]、rev4 仍标
+    # 「最新」而磁盘已是 rev3 状态，历史不再反映现状）。恢复完成后按零改动闸
+    # 决定是否留档：与最新快照内容一致则返回目标快照本身。
+    latest = db.scalar(
+        select(Snapshot)
+        .where(Snapshot.project_id == project_id)
+        .order_by(Snapshot.rev.desc())
+        .limit(1)
+    )
+    archived = snapshot
+    if latest is None or not snapshots_equivalent(root, latest, snapshot):
+        archived = create_snapshot(
+            db, project_id, root, request.app.state.settings.snapshot_max_kept
+        )
     if project is not None:
         if project.mode == "team":
             _reset_tickets_after_checkpoint(db, project_id, snapshot.rev)
         project.updated_at = _utcnow()
     db.commit()
-    db.refresh(snapshot)
-    return snapshot
+    db.refresh(archived)
+    return archived
 
 
 # --- 预览托管（工单 0005）：属主项目的当前版本文件按真实 MIME 类型提供 ---

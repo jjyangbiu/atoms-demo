@@ -149,6 +149,7 @@ class TestRollback:
         assert {f["path"] for f in files} == {"index.html", "extra.html"}
 
         # 后续迭代以回滚后的基线继续：模型读到的是 v1，并留档新版本
+        # （回滚本身已留档 rev 3，本轮迭代再留 rev 4，历史只增不减）
         events = _generate(
             client, auth_headers, project["id"],
             [
@@ -161,7 +162,187 @@ class TestRollback:
         assert read_done and "v1" in read_done[0]["result"]
         assert (pdir / "index.html").read_text(encoding="utf-8") == "v3"
         snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
-        assert [s["rev"] for s in snaps] == [3, 2, 1]
+        assert [s["rev"] for s in snaps] == [4, 3, 2, 1], "回滚留档 rev3，迭代留档 rev4"
+
+    def test_rollback_preserves_history_and_iteration_log(self, app, settings, client, auth_headers):
+        """验收点：版本回滚后恢复且历史不丢失。
+
+        回滚是文件级操作：磁盘回到目标版本，但对话历史与迭代日志必须原样保留——
+        日志是「磁盘为什么是现在这个样子」的脉络（工单 0026），回滚不得清史。
+        """
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                _turn_result_step(summary="首建完成。", changed_files=["index.html"]),
+            ],
+        )
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
+                _turn_result_step(summary="已改为 v2。", changed_files=["index.html"]),
+            ],
+            text="把内容改成 v2",
+        )
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        oldest = next(s for s in snaps if s["rev"] == 1)
+
+        resp = client.post(
+            f"/api/projects/{project['id']}/snapshots/{oldest['id']}/rollback",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+
+        # 磁盘恢复到 rev 1 基线
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v1"
+
+        # 对话历史不丢失：用户消息与轮次产物卡片都在，回滚不删历史
+        msgs = client.get(f"/api/projects/{project['id']}/messages", headers=auth_headers).json()
+        texts = [m["content"] for m in msgs if m["kind"] == "text"]
+        assert any("把内容改成 v2" in t for t in texts), "回滚不得删除用户消息"
+        cards = [m for m in msgs if m["kind"] == "turn_result"]
+        assert len(cards) >= 2, "回滚不得删除轮次产物卡片"
+
+        # 迭代日志保留：两次改动的脉络原样在账（含已回滚的 v2 轮）
+        from app.models import Project
+
+        with app.state.session_factory() as session:
+            row = session.get(Project, project["id"])
+            log = list(row.iteration_log or [])
+        assert [e["seq"] for e in log] == [1, 2]
+        assert log[1]["files"] == ["index.html"]
+
+        # 回滚后的下一轮仍能基于恢复的基线继续迭代，日志继续累积、历史只增不减
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v3"})]},
+                _turn_result_step(summary="基于 v1 继续迭代。", changed_files=["index.html"]),
+            ],
+            text="基于旧版本继续",
+        )
+        with app.state.session_factory() as session:
+            row = session.get(Project, project["id"])
+            log_after = list(row.iteration_log or [])
+        assert [e["seq"] for e in log_after] == [1, 2, 3], "回滚后日志继续累积，不清史"
+        msgs_after = client.get(
+            f"/api/projects/{project['id']}/messages", headers=auth_headers
+        ).json()
+        assert len(msgs_after) > len(msgs), "历史只增不减"
+
+    def test_rollback_archives_new_version(self, app, settings, client, auth_headers):
+        """验收点：回滚本身留档为新版本，历史只增不减、「最新」标记如实反映磁盘现状。
+
+        用户报告的缺陷：历史到版本 4、回滚到版本 3 后列表仍是 [4,3,2,1]，rev 4
+        仍标「最新」而磁盘已是 rev 3 状态。修复后回滚留档 rev 5（内容与目标版本
+        逐字一致），diff(rev5 vs rev4) 即回滚效果，后续迭代从 rev 6 续增。
+        """
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
+            ],
+        )
+        for i in (2, 3, 4):
+            _generate(
+                client, auth_headers, project["id"],
+                [
+                    {"tool_calls": [("read_file", {"path": "index.html"})]},
+                    {"tool_calls": [("edit_file", {"path": "index.html", "old_text": f"v{i - 1}", "new_text": f"v{i}"})]},
+                    _turn_result_step(summary="ok", changed_files=["index.html"]),
+                ],
+                text=f"改成 v{i}",
+            )
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        target = next(s for s in snaps if s["rev"] == 3)
+
+        resp = client.post(
+            f"/api/projects/{project['id']}/snapshots/{target['id']}/rollback",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["rev"] == 5, "回滚响应返回留档的新版本"
+
+        # 磁盘恢复为目标版本状态；新版本条目内容与目标版本一致
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v3"
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        assert [s["rev"] for s in snaps] == [5, 4, 3, 2, 1], "回滚后出现版本 5"
+        assert snaps[0]["file_count"] == target["file_count"]
+
+    def test_rollback_to_latest_leaves_no_new_version(self, app, client, auth_headers):
+        """回滚到最新版本属零改动，不留档（与生成轮零改动硬闸同款语义）：
+        留档只会制造「版本 N+1」的假进展、污染回滚列表。"""
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
+            ],
+        )
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
+            ],
+        )
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        latest = snaps[0]
+        assert latest["rev"] == 2
+
+        resp = client.post(
+            f"/api/projects/{project['id']}/snapshots/{latest['id']}/rollback",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        assert [s["rev"] for s in snaps] == [2, 1], "回滚到最新版不产生重复版本"
+
+    def test_repeated_rollback_to_same_rev_archives_once(self, app, settings, client, auth_headers):
+        """重复回滚到同一版本：第二次时最新留档内容已与目标一致，不再留档。"""
+        project = _create_project(client, auth_headers)
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
+            ],
+        )
+        _generate(
+            client, auth_headers, project["id"],
+            [
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
+                _turn_result_step(summary="ok", changed_files=["index.html"]),
+            ],
+        )
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        target = next(s for s in snaps if s["rev"] == 1)
+
+        client.post(f"/api/projects/{project['id']}/snapshots/{target['id']}/rollback", headers=auth_headers)
+        resp = client.post(
+            f"/api/projects/{project['id']}/snapshots/{target['id']}/rollback",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v1"
+        snaps = client.get(f"/api/projects/{project['id']}/snapshots", headers=auth_headers).json()
+        assert [s["rev"] for s in snaps] == [3, 2, 1], "重复回滚同一版只留档一次"
 
     def test_rollback_unknown_snapshot_is_404(self, app, client, auth_headers):
         project = _create_project(client, auth_headers)
