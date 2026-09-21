@@ -219,4 +219,12 @@ async def run_generation(
             )
             messages.append(ToolMessage(content=result, tool_call_id=call_id))
 
-    yield AgentEvent("error", {"detail": f"智能体超过最大步数（{max_steps}）仍未完成"})
+    yield AgentEvent(
+        "error",
+        {
+            "detail": f"智能体超过最大步数（{max_steps}）仍未完成",
+            # 结构化原因：路由层据此区分「预算耗尽」（磁盘可能已有真实改动，
+            # 须按降级铁律兜底收尾）与「模型调用失败」（改动可能不完整）。
+            "reason": "max_steps_exhausted",
+        },
+    )

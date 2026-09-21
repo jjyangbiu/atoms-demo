@@ -32,8 +32,12 @@ class Settings(BaseSettings):
     # 「输入小、输出小、不需要强推理」的独立小调用使用的模型；默认（置空）等于
     # llm_model——本次不切实测过的小模型，实测成本或延迟有问题时改这一项即可切。
     llm_utility_model: str = ""
-    # 智能体单次生成的最大工具循环步数与失败重试次数
-    agent_max_steps: int = 20
+    # 智能体单次生成的最大工具循环步数与失败重试次数。
+    # 步数从 20 上调到 100（诊断工单）：迭代轮改已有文件必须 read→edit 两步，
+    # 每处修改至少烧 2 步，频繁修改轮次在 20 步预算下结构性易超步；超步
+    # 兑底收尾已保证磁盘成果不被没收（见 routers/projects.py），加大预算
+    # 旨在降低超步触发频率，代价是失控轮次耗时更长。
+    agent_max_steps: int = 100
     agent_max_retries: int = 2
     # 迭代时喂给模型的最近对话轮数（1 轮 = 一问一答）；持久化不受影响（工单 0004）
     agent_history_window: int = 10

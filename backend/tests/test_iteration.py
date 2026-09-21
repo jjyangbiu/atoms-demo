@@ -26,6 +26,15 @@ def _project_dir(settings, project_id) -> Path:
     return Path(settings.storage_root) / "projects" / str(project_id)
 
 
+def _iteration_log(app, project_id) -> list:
+    """直读项目行，取迭代日志（历史脉络的权威存储）。"""
+    from app.models import Project
+
+    with app.state.session_factory() as session:
+        row = session.get(Project, project_id)
+        return list(row.iteration_log or [])
+
+
 class TestIteration:
     def test_iteration_only_touches_affected_files(self, app, settings, client, auth_headers):
         use_fake_model(
@@ -61,6 +70,54 @@ class TestIteration:
         assert (pdir / "index.html").read_text(encoding="utf-8") == "v2"
         # 未涉及文件内容保持不变
         assert (pdir / "styles.css").read_text(encoding="utf-8") == "body{}"
+
+    def test_consecutive_modification_rounds_each_form_version(self, app, settings, client, auth_headers):
+        """验收点：连续两次修改正常完成——每轮 done 收尾、各留一版快照、日志按改动累积。
+
+        （诊断工单回归：频繁修改报「超过最大步数」后版本丢失的对照面——
+        正常路径的连续修改必须稳定形成版本序列。）
+        """
+        use_fake_model(
+            app,
+            [
+                FIRST_BUILD_CLARIFY_STEP,
+                {"tool_calls": [("write_file", {"path": "index.html", "content": "v1"})]},
+                _turn_result_step(summary="首建完成。", changed_files=["index.html"]),
+                # 第一次修改：v1 → v2
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v1", "new_text": "v2"})]},
+                _turn_result_step(summary="第一次修改完成。", changed_files=["index.html"]),
+                # 第二次修改：v2 → v3
+                {"tool_calls": [("read_file", {"path": "index.html"})]},
+                {"tool_calls": [("edit_file", {"path": "index.html", "old_text": "v2", "new_text": "v3"})]},
+                _turn_result_step(summary="第二次修改完成。", changed_files=["index.html"]),
+            ],
+        )
+        project = _create_project(client, auth_headers)
+        _stream_messages(client, auth_headers, project["id"], "做一个页面")
+        confirm_first_build(client, auth_headers, project["id"])
+        round1 = _stream_messages(client, auth_headers, project["id"], "第一次修改")
+        round2 = _stream_messages(client, auth_headers, project["id"], "第二次修改")
+
+        # 每轮都正常收尾：done 是流的最后一个事件，无 error
+        assert round1[-1]["type"] == "done" and not any(
+            e["type"] == "error" for e in round1
+        )
+        assert round2[-1]["type"] == "done" and not any(
+            e["type"] == "error" for e in round2
+        )
+        # 磁盘终态正确（第二次修改基于第一次的结果）
+        pdir = _project_dir(settings, project["id"])
+        assert (pdir / "index.html").read_text(encoding="utf-8") == "v3"
+        # 三次改动各留一版：rev 序列 1/2/3（最新在前）
+        snaps = client.get(
+            f"/api/projects/{project['id']}/snapshots", headers=auth_headers
+        ).json()
+        assert [s["rev"] for s in snaps] == [3, 2, 1]
+        # 迭代日志按「改动」累积：首建 + 两次修改 = 三条，逐轮递增
+        log = _iteration_log(app, project["id"])
+        assert [e["seq"] for e in log] == [1, 2, 3]
+        assert log[-1]["files"] == ["index.html"]
 
     def test_history_window_keeps_recent_messages_only(self, app, settings, client, auth_headers):
         settings.agent_history_window = 1  # 仅保留最近一轮问答

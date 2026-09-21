@@ -51,7 +51,7 @@ venv 装依赖 → 生成随机 `ATOMS_JWT_SECRET` → systemd 守护 uvicorn（
 | `ATOMS_LLM_BASE_URL` | 否 | 默认 `https://api.minimaxi.com/v1` |
 | `ATOMS_LLM_MODEL` | 否 | 默认 `MiniMax-M3` |
 | `ATOMS_LLM_TEMPERATURE` | 否 | 默认 `0.2` |
-| `ATOMS_AGENT_MAX_STEPS` / `ATOMS_AGENT_MAX_RETRIES` | 否 | 智能体工具循环步数 / 失败重试，默认 `20` / `2` |
+| `ATOMS_AGENT_MAX_STEPS` / `ATOMS_AGENT_MAX_RETRIES` | 否 | 智能体工具循环步数 / 失败重试，默认 `100` / `2`（迭代轮改文件需 read→edit 两步，预算过小易超步） |
 | `ATOMS_EMBEDDING_MODEL` | 否 | 默认 `embo-01`；支持 `provider:model` 前缀（自动取冒号后模型名） |
 | `ATOMS_EMBEDDING_BASE_URL` | 否 | 独立 OpenAI 兼容 embedding 端点；置空复用 LLM 端点 |
 | `ATOMS_EMBEDDING_API_KEY` | 否 | 置空复用 `ATOMS_LLM_API_KEY` |

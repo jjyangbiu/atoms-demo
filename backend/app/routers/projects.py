@@ -952,6 +952,11 @@ async def _engineer_stream(
     turn_result_payload: dict | None = None
     thinking_parts: list[str] = []
     raw_parts: list[str] = []
+    # 步数预算耗尽（诊断修复）：循环以 error 收尾时磁盘上可能已堆着真实改动——
+    # 频繁修改轮次的常态恰恰是文件已改好、循环却没收尾。事件先扣下不外发，
+    # 轮末按磁盘事实裁决：有改动 → 降级铁律兜底收尾；零改动 → 补发裸 error。
+    budget_exhausted = False
+    budget_error_detail = ""
     try:
         async for event in run_generation(
             model,
@@ -968,6 +973,15 @@ async def _engineer_stream(
                 # done 先扣下：落盘完成后才外发，保证它是流的最后一个事件
                 done_data = event.data
             else:
+                if (
+                    event.type == "error"
+                    and event.data.get("reason") == "max_steps_exhausted"
+                ):
+                    # 超步不是模型失败：磁盘成果是否保留由轮末指纹比对裁决，
+                    # 不在此处置 result（误标 ok=False 会把有成果的轮次当失败）
+                    budget_exhausted = True
+                    budget_error_detail = event.data.get("detail", "")
+                    continue
                 if event.type == "thinking":
                     # 思考增量另存一份：正常收尾合并落库；中断时也据已流出部分落库（诊断修复）
                     thinking_parts.append(event.data.get("content", ""))
@@ -1014,11 +1028,35 @@ async def _engineer_stream(
     # 沙箱侧 modified_this_round 是同构辅助记录，各硬闸的判据只看这里的磁盘比对结果。
     touched_files = _touched_now()
 
+    # 步数预算耗尽的轮末裁决（诊断修复）：散文兜底路径遵守了「兜底不没收用户
+    # 工作成果」的降级铁律，超步路径此前是唯一漏网口——磁盘改动被裸 error 沉默
+    # 地留在工作区：可用，却不形成版本快照、不入迭代日志，回滚体系无从恢复。
+    # 有改动 → 按磁盘事实兜底成卡片轮（快照/日志照常，fallback 结论 +
+    # budget_exhausted 标注显式化，交用户核对完整性）；零改动 → 维持裸 error
+    # （防「零交付版本」假进展）。
+    fallback_used = False
+    if budget_exhausted and turn_result_payload is None and done_data is None:
+        if not touched_files:
+            if result is not None:
+                result["ok"] = False
+                result["error"] = budget_error_detail
+            yield _emit({"type": "error", "detail": budget_error_detail})
+            return
+        fallback_used = True
+        turn_result_payload = {
+            "intent": "modify_code",
+            "summary": (
+                "智能体达到最大步数预算仍未主动收尾，系统已按磁盘真实改动保留"
+                "本轮成果；建议核对改动完整性后继续对话。"
+            ),
+            "changed_files": [],
+            "no_change_reason": "",
+        }
+
     # 降级链末端（ADR 0005 / 工单 0025）：回喂一次后模型仍以普通文本收尾 →
     # 系统按磁盘事实兜底成卡片：首段散文作 summary，意图按磁盘真实改动判定，
     # 声明改动一律以磁盘真实值填充、绝不采信模型申报。兜底不没收用户的工作成果
     # （降级铁律）：磁盘有改动照样建快照、入迭代日志。
-    fallback_used = False
     if turn_result_payload is None and done_data is not None:
         prose = exit_state["first_prose"] or done_data.get("text", "")
         fallback_used = True
@@ -1148,6 +1186,10 @@ async def _engineer_stream(
                     # 干净收尾、无额外打扰。
                     "scope_verdict": scope_verdict,
                     "out_of_scope_segments": out_of_scope_segments,
+                    # 步数预算耗尽标注（诊断修复）：超步兜底轮的证据链字段，
+                    # 前端旧版宽容忽略；历史回看据此可辨「模型主动收尾」与
+                    # 「系统按磁盘事实兜底」的差异。
+                    "budget_exhausted": budget_exhausted,
                     "snapshot_id": snapshot.id if snapshot is not None else None,
                     "snapshot_rev": snapshot.rev if snapshot is not None else None,
                 }
@@ -1231,6 +1273,10 @@ async def _engineer_stream(
             # 正确性裁决随收尾事件外发（工单 0028）：artifact 保持既有契约不动，
             # 裁决作为独立字段并列——前端对既有字段的消费零改动。
             done_payload["scope_verdict"] = scope_verdict
+        if budget_exhausted:
+            # 超步兜底标注（诊断修复）：告知前端本轮是预算耗尽后的磁盘事实
+            # 兜底，非模型主动收尾；旧前端不认识该字段则仅由卡片 summary 表达。
+            done_payload["budget_exhausted"] = True
         yield _emit(done_payload)
 
 
