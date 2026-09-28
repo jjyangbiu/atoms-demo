@@ -1342,11 +1342,25 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 <template>
   <div class="project-page">
     <header class="topbar">
-      <el-button text @click="router.push('/workspace')">← 返回</el-button>
-      <span class="project-title">{{ projectName }}</span>
-      <el-tag size="small" :type="projectMode === 'team' ? 'warning' : 'info'">
-        {{ projectMode === 'team' ? '团队模式' : '工程师模式' }}
-      </el-tag>
+      <el-button text class="back-btn" @click="router.push('/workspace')">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+          <path
+            d="M10 3L5 8l5 5"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        返回
+      </el-button>
+      <div class="topbar-title">
+        <span class="title-dot" aria-hidden="true"></span>
+        <span class="project-title">{{ projectName }}</span>
+        <el-tag size="small" :type="projectMode === 'team' ? 'warning' : 'primary'" effect="light">
+          {{ projectMode === 'team' ? '团队模式' : '工程师模式' }}
+        </el-tag>
+      </div>
       <div class="publish-area">
         <template v-if="publishedSlug">
           <el-tag size="small" type="success">已发布</el-tag>
@@ -1714,8 +1728,10 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                   data-testid="tool-group-toggle"
                   @click="toggleToolGroup(entry.toolGroup.anchorId)"
                 >
-                  <span class="tool-group-caret">
-                    {{ expandedToolGroups[entry.toolGroup.anchorId] ? '▾' : '▸' }}
+                  <span class="tool-group-caret" :class="{ open: expandedToolGroups[entry.toolGroup.anchorId] }">
+                    <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
+                      <path d="M4 2.5L8 6l-4 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
                   </span>
                   <span class="tool-group-summary" data-testid="tool-group-summary">
                     {{ entry.toolGroup.summary }}
@@ -1732,9 +1748,15 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                       size="small"
                       effect="plain"
                     >
-                      <span v-if="t.tool?.status === 'start'" class="tool-running">⚙ {{ t.tool ? toolLabel(t.tool) : '' }}…</span>
-                      <span v-else-if="t.tool?.status === 'error'">✗ {{ t.tool ? toolLabel(t.tool) : '' }}</span>
-                      <span v-else>✓ {{ t.tool ? toolLabel(t.tool) : '' }}</span>
+                      <span v-if="t.tool?.status === 'start'" class="tool-running">
+                        <span class="tool-status-dot running" aria-hidden="true"></span>{{ t.tool ? toolLabel(t.tool) : '' }}…
+                      </span>
+                      <span v-else-if="t.tool?.status === 'error'">
+                        <span class="tool-status-dot error" aria-hidden="true"></span>{{ t.tool ? toolLabel(t.tool) : '' }}
+                      </span>
+                      <span v-else>
+                        <span class="tool-status-dot done" aria-hidden="true"></span>{{ t.tool ? toolLabel(t.tool) : '' }}
+                      </span>
                     </el-tag>
                     <span v-if="t.tool?.status === 'error'" class="tool-error-text">
                       {{ t.tool.result }}
@@ -1752,7 +1774,11 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                   data-testid="thinking-toggle"
                   @click="entry.collapsed = !entry.collapsed"
                 >
-                  <span class="thinking-caret">{{ entry.collapsed ? '▸' : '▾' }}</span>
+                  <span class="thinking-caret" :class="{ open: !entry.collapsed }">
+                    <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
+                      <path d="M4 2.5L8 6l-4 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
                   <span>思考过程</span>
                   <span v-if="entry.streaming" class="thinking-running">中…</span>
                 </button>
@@ -1767,9 +1793,14 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
               <div class="bubble agent-bubble markdown" v-html="renderMarkdown(entry.content || (entry.streaming ? '思考中…' : ''))" />
             </div>
           </template>
-          <div v-if="generating" class="generating-hint">智能体正在工作…</div>
+          <div v-if="generating" class="generating-hint">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span class="pulse-dot" aria-hidden="true"></span>
+            智能体正在工作…
+          </div>
           <div v-else-if="errorDetail" class="error-banner" data-testid="chat-error">
-            <span>⚠ {{ errorDetail }}</span>
+            <span class="error-text">{{ errorDetail }}</span>
             <el-button type="danger" size="small" data-testid="chat-retry" @click="retry">
               重新生成
             </el-button>
@@ -1779,7 +1810,9 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
             class="error-banner"
             data-testid="chat-interrupted"
           >
-            <span>⚠ 上一轮生成被中断（手动停止、页面刷新或连接断开），已产出的思考过程已保留</span>
+            <span class="error-text">
+              上一轮生成被中断（手动停止、页面刷新或连接断开），已产出的思考过程已保留
+            </span>
             <el-button type="danger" size="small" data-testid="chat-retry" @click="retry">
               重新生成
             </el-button>
@@ -1789,7 +1822,10 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
         <div class="chat-bottom">
           <!-- 待办重开入口（工单 0020）：弹窗取消收起后出现，点击恢复弹窗 -->
           <div v-if="pendingAction && !panelOpen" class="pending-reopen" data-testid="pending-reopen">
-            <span>⏳ {{ pendingLabel }}</span>
+            <span class="pending-reopen-label">
+              <span class="pending-reopen-dot" aria-hidden="true"></span>
+              {{ pendingLabel }}
+            </span>
             <el-button size="small" type="primary" data-testid="pending-reopen-button" @click="reopenPanel">
               处理
             </el-button>
@@ -1831,7 +1867,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
                     <span class="panel-option-badge">{{ String.fromCharCode(65 + oi) }}</span>
                     {{ opt }}
                     <span v-if="panelQuestions[panelPage]?.recommend === oi" class="clarify-recommend">
-                      ➤ 推荐
+                      推荐
                     </span>
                   </button>
                   <div
@@ -2028,27 +2064,66 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: var(--at-bg);
 }
 
+/* ---- 顶栏 ---- */
 .topbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
-  background: #fff;
-  border-bottom: 1px solid #e4e7ed;
+  gap: var(--at-space-3);
+  height: 56px;
+  padding: 0 var(--at-space-4);
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--at-border);
+  flex: none;
+  z-index: 20;
+}
+
+.back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--at-text-secondary);
+  font-weight: 500;
+  flex: none;
+}
+
+.back-btn:hover {
+  color: var(--at-primary);
+}
+
+.topbar-title {
+  display: flex;
+  align-items: center;
+  gap: var(--at-space-2);
+  min-width: 0;
+}
+
+.title-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--at-gradient-brand);
+  flex: none;
 }
 
 .project-title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
+  color: var(--at-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
 }
 
 .publish-area {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--at-space-2);
   min-width: 0;
 }
 
@@ -2057,32 +2132,44 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #409eff;
+  color: var(--at-primary);
   font-size: 12px;
+  text-decoration: none;
 }
 
+.public-link:hover {
+  text-decoration: underline;
+}
+
+/* ---- 主体两栏 ---- */
 .body {
   flex: 1;
   display: flex;
   min-height: 0;
+  gap: var(--at-space-3);
+  padding: var(--at-space-3);
 }
 
+/* ---- 左栏：对话 ---- */
 .chat-panel {
   width: 42%;
   min-width: 380px;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #e4e7ed;
-  background: #fff;
+  background: var(--at-card);
+  border: 1px solid var(--at-border);
+  border-radius: var(--at-radius-lg);
+  box-shadow: var(--at-shadow-sm);
+  overflow: hidden;
 }
 
 .chat-body {
   flex: 1;
   overflow-y: auto;
-  padding: 16px;
+  padding: var(--at-space-4) var(--at-space-4) var(--at-space-2);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--at-space-3);
 }
 
 .msg {
@@ -2096,28 +2183,33 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .bubble {
   max-width: 85%;
   padding: 10px 14px;
-  border-radius: 10px;
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.65;
 }
 
 .user-bubble {
-  background: #409eff;
+  background: var(--at-gradient-brand);
   color: #fff;
   white-space: pre-wrap;
+  border-radius: var(--at-radius-md) var(--at-radius-md) 4px var(--at-radius-md);
+  box-shadow: var(--at-shadow-glow);
 }
 
 .agent-bubble {
-  background: #f4f4f5;
-  color: #303133;
+  background: var(--at-bg-deep);
+  color: var(--at-text);
+  border: 1px solid var(--at-border);
+  border-radius: 4px var(--at-radius-md) var(--at-radius-md) var(--at-radius-md);
 }
 
+/* ---- 智能体结构卡片（PRD/共识/规格/工单/轮次产物共用壳） ---- */
 .prd-card {
   max-width: 92%;
-  border: 1px solid #ebeef5;
-  border-radius: 10px;
-  background: #fff;
-  padding: 12px 14px;
+  border: 1px solid var(--at-border);
+  border-radius: var(--at-radius-md);
+  background: var(--at-card);
+  box-shadow: var(--at-shadow-sm);
+  padding: var(--at-space-3) var(--at-space-4);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -2126,19 +2218,27 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .prd-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: var(--at-space-2);
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--at-border);
 }
 
 .prd-role {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  color: #606266;
+  color: var(--at-primary);
+  background: var(--at-primary-soft);
+  border: 1px solid var(--at-primary-border);
+  padding: 2px 10px;
+  border-radius: var(--at-radius-full);
 }
 
 .prd-body {
-  background: #f4f4f5;
-  color: #303133;
+  background: var(--at-bg-deep);
+  color: var(--at-text);
   max-width: none;
+  border-radius: var(--at-radius-sm);
 }
 
 .prd-body :deep(h1) {
@@ -2177,8 +2277,9 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
 .clarify-q-text {
   font-size: 13px;
-  color: #303133;
+  color: var(--at-text);
   margin-bottom: 6px;
+  line-height: 1.6;
 }
 
 .clarify-options {
@@ -2188,25 +2289,29 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 }
 
 .clarify-option {
-  border: 1px solid #dcdfe6;
-  border-radius: 16px;
-  background: #fff;
+  border: 1px solid var(--at-border-strong);
+  border-radius: var(--at-radius-full);
+  background: var(--at-card);
   padding: 4px 12px;
   font-size: 13px;
-  color: #606266;
+  color: var(--at-text-secondary);
   cursor: pointer;
   line-height: 1.5;
+  transition:
+    border-color var(--at-duration) var(--at-ease),
+    color var(--at-duration) var(--at-ease),
+    background-color var(--at-duration) var(--at-ease);
 }
 
 .clarify-option:hover:not(:disabled) {
-  border-color: #409eff;
-  color: #409eff;
+  border-color: var(--at-primary);
+  color: var(--at-primary);
 }
 
 .clarify-option.selected {
-  border-color: #409eff;
-  background: #ecf5ff;
-  color: #409eff;
+  border-color: var(--at-primary);
+  background: var(--at-primary-soft);
+  color: var(--at-primary);
 }
 
 .clarify-option.recommended {
@@ -2220,18 +2325,19 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
 .clarify-recommend {
   margin-left: 6px;
-  font-size: 12px;
-  color: #e6a23c;
+  font-size: 11px;
+  color: var(--at-warning);
+  font-weight: 600;
 }
 
 .clarify-empty {
   font-size: 13px;
-  color: #909399;
+  color: var(--at-text-muted);
 }
 
 .clarify-hint {
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-muted);
 }
 
 /* 工单清单卡片（工单 0017）：逐张工单卡片展示标题/交付内容/阻塞依赖 */
@@ -2242,10 +2348,15 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 }
 
 .ticket-item {
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  padding: 8px 12px;
-  background: #fafafa;
+  border: 1px solid var(--at-border);
+  border-radius: var(--at-radius-sm);
+  padding: 10px 12px;
+  background: var(--at-bg-deep);
+  transition: border-color var(--at-duration) var(--at-ease);
+}
+
+.ticket-item:hover {
+  border-color: var(--at-primary-border);
 }
 
 .ticket-head {
@@ -2255,33 +2366,34 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 }
 
 .ticket-seq {
-  font-weight: 600;
-  color: #409eff;
+  font-weight: 700;
+  color: var(--at-primary);
   font-size: 13px;
+  font-family: var(--at-font-mono);
 }
 
 .ticket-title {
   font-size: 14px;
   font-weight: 600;
-  color: #303133;
+  color: var(--at-text);
   flex: 1;
 }
 
 .ticket-deliverable {
   margin-top: 4px;
   font-size: 13px;
-  color: #606266;
+  color: var(--at-text-secondary);
   line-height: 1.6;
 }
 
 .ticket-blocked {
   margin-top: 4px;
   font-size: 12px;
-  color: #e6a23c;
+  color: var(--at-warning);
 }
 
 .ticket-empty {
-  color: #909399;
+  color: var(--at-text-muted);
   font-size: 13px;
 }
 
@@ -2291,13 +2403,14 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-top: 4px;
-  border-top: 1px dashed #ebeef5;
+  padding-top: 10px;
+  border-top: 1px dashed var(--at-border);
 }
 
 .ticket-progress {
   font-size: 13px;
-  color: #606266;
+  color: var(--at-text-secondary);
+  font-weight: 500;
 }
 
 .markdown :deep(p) {
@@ -2309,9 +2422,12 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 }
 
 .markdown :deep(code) {
-  background: #e9e9eb;
+  background: rgba(124, 58, 237, 0.08);
+  color: var(--at-primary-active);
   padding: 1px 5px;
   border-radius: 4px;
+  font-family: var(--at-font-mono);
+  font-size: 0.92em;
 }
 
 .tool-line {
@@ -2321,12 +2437,45 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   padding-left: 4px;
 }
 
+/* 工具状态小圆点：运行中呼吸闪烁/成功绿/失败红，不依赖字符图标 */
+.tool-status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+.tool-status-dot.running {
+  background: var(--at-warning);
+  animation: at-pulse 1.2s ease-in-out infinite;
+}
+
+.tool-status-dot.done {
+  background: var(--at-success);
+}
+
+.tool-status-dot.error {
+  background: var(--at-danger);
+}
+
+@keyframes at-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
 .tool-running {
-  opacity: 0.8;
+  opacity: 0.85;
 }
 
 .tool-error-text {
-  color: #f56c6c;
+  color: var(--at-danger);
   font-size: 12px;
 }
 
@@ -2346,19 +2495,28 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-self: flex-start;
   background: none;
   border: none;
-  padding: 2px 4px;
+  padding: 3px 8px;
+  border-radius: var(--at-radius-full);
   cursor: pointer;
-  color: #909399;
+  color: var(--at-text-muted);
   font-size: 12px;
+  transition:
+    color var(--at-duration) var(--at-ease),
+    background-color var(--at-duration) var(--at-ease);
 }
 
 .tool-group-toggle:hover {
-  color: #606266;
+  color: var(--at-primary);
+  background: var(--at-primary-soft);
 }
 
 .tool-group-caret {
-  display: inline-block;
-  width: 10px;
+  display: inline-flex;
+  transition: transform var(--at-duration) var(--at-ease);
+}
+
+.tool-group-caret.open {
+  transform: rotate(90deg);
 }
 
 .tool-group-detail {
@@ -2367,35 +2525,44 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   gap: 6px;
   margin-left: 4px;
   padding-left: 12px;
-  border-left: 2px solid #ebeef5;
+  border-left: 2px solid var(--at-border);
 }
 
 /* 思考过程（诊断修复）：比正文小一号、弱化配色，左侧细线区分层次 */
 .thinking-card {
   max-width: 92%;
-  border-left: 2px solid #dcdfe6;
+  border-left: 2px solid var(--at-secondary);
   padding: 2px 0 2px 10px;
 }
 
 .thinking-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   background: none;
   border: none;
-  padding: 0;
+  padding: 2px 8px 2px 4px;
+  border-radius: var(--at-radius-full);
   cursor: pointer;
-  color: #909399;
+  color: var(--at-text-muted);
   font-size: 12px;
+  transition:
+    color var(--at-duration) var(--at-ease),
+    background-color var(--at-duration) var(--at-ease);
 }
 
 .thinking-toggle:hover {
-  color: #606266;
+  color: var(--at-primary);
+  background: var(--at-primary-soft);
 }
 
 .thinking-caret {
-  display: inline-block;
-  width: 10px;
+  display: inline-flex;
+  transition: transform var(--at-duration) var(--at-ease);
+}
+
+.thinking-caret.open {
+  transform: rotate(90deg);
 }
 
 .thinking-running {
@@ -2405,17 +2572,51 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .thinking-body {
   font-size: 12px;
   line-height: 1.6;
-  color: #909399;
+  color: var(--at-text-muted);
   margin-top: 4px;
   max-width: none;
   padding: 0;
   background: transparent;
 }
 
+/* 生成中提示：三点呼吸动效，强化“智能体活着”的反馈 */
 .generating-hint {
-  color: #909399;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--at-text-muted);
   font-size: 12px;
-  padding-left: 4px;
+  padding: 2px 4px;
+}
+
+.pulse-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--at-secondary);
+  animation: at-bounce 1.2s ease-in-out infinite;
+}
+
+.pulse-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.pulse-dot:nth-child(3) {
+  animation-delay: 0.3s;
+  margin-right: 6px;
+}
+
+@keyframes at-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
 }
 
 .error-banner {
@@ -2423,25 +2624,55 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: #fef0f0;
-  color: #f56c6c;
+  padding: 10px 14px;
+  border-radius: var(--at-radius-sm);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: var(--at-danger);
   font-size: 13px;
 }
 
+.error-text {
+  line-height: 1.5;
+}
+
+.error-text::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--at-danger);
+  margin-right: 8px;
+  vertical-align: 1px;
+}
+
+/* ---- 输入区 ---- */
 .chat-input {
   display: flex;
   gap: 8px;
   /* 按钮与输入框垂直居中对齐（用户反馈调整） */
   align-items: center;
-  padding: 12px 16px;
+  padding: var(--at-space-3) var(--at-space-4) var(--at-space-4);
 }
 
-/* 弹窗式待办动作面板（工单 0020）：输入区容器作为定位错，面板悬浮其上、无遮罩 */
+.chat-input :deep(.el-textarea__inner) {
+  border-radius: var(--at-radius-md);
+  box-shadow: 0 0 0 1px var(--at-border-strong) inset;
+  transition: box-shadow var(--at-duration) var(--at-ease);
+}
+
+.chat-input :deep(.el-textarea__inner:focus) {
+  box-shadow:
+    0 0 0 1px var(--at-primary) inset,
+    0 0 0 3px rgba(124, 58, 237, 0.12);
+}
+
+/* 弹窗式待办动作面板（工单 0020）：输入区容器作为定位锚，面板悬浮其上、无遮罩 */
 .chat-bottom {
   position: relative;
-  border-top: 1px solid #e4e7ed;
+  border-top: 1px solid var(--at-border);
+  background: var(--at-card);
 }
 
 .pending-reopen {
@@ -2449,10 +2680,26 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 6px 16px;
-  background: #fdf6ec;
-  color: #e6a23c;
+  padding: 8px var(--at-space-4);
+  background: #fffbeb;
+  border-bottom: 1px solid #fde68a;
+  color: #b45309;
   font-size: 13px;
+}
+
+.pending-reopen-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.pending-reopen-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--at-warning);
+  animation: at-pulse 1.2s ease-in-out infinite;
 }
 
 .pending-panel {
@@ -2461,28 +2708,31 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   right: 8px;
   bottom: 100%;
   margin-bottom: 8px;
-  background: #fff;
-  border: 1px solid #e4e7ed;
-  border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--at-primary-border);
+  border-radius: var(--at-radius-lg);
+  box-shadow: var(--at-shadow-lg);
   display: flex;
   flex-direction: column;
   max-height: min(480px, 70vh);
   z-index: 10;
+  overflow: hidden;
 }
 
 .pending-panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid #ebeef5;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--at-border);
+  background: var(--at-primary-soft);
 }
 
 .pending-panel-title {
   font-size: 13px;
   font-weight: 600;
-  color: #606266;
+  color: var(--at-primary-active);
 }
 
 .pending-pager {
@@ -2490,17 +2740,25 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-secondary);
 }
 
 .pending-pager button {
-  border: 1px solid #dcdfe6;
-  background: #fff;
-  border-radius: 4px;
-  width: 20px;
-  height: 20px;
+  border: 1px solid var(--at-primary-border);
+  background: var(--at-card);
+  border-radius: 6px;
+  width: 22px;
+  height: 22px;
   cursor: pointer;
-  color: #606266;
+  color: var(--at-primary);
+  transition:
+    background-color var(--at-duration) var(--at-ease),
+    border-color var(--at-duration) var(--at-ease);
+}
+
+.pending-pager button:hover:not(:disabled) {
+  background: var(--at-primary-soft);
+  border-color: var(--at-primary);
 }
 
 .pending-pager button:disabled {
@@ -2510,7 +2768,7 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
 .pending-panel-body {
   overflow-y: auto;
-  padding: 12px;
+  padding: var(--at-space-3) var(--at-space-4);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -2518,7 +2776,9 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 
 .panel-q-text {
   font-size: 13px;
-  color: #303133;
+  color: var(--at-text);
+  font-weight: 500;
+  line-height: 1.6;
 }
 
 .panel-options {
@@ -2532,42 +2792,48 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   gap: 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
-  background: #f4f4f5;
-  padding: 8px 10px;
+  border-radius: var(--at-radius-sm);
+  background: var(--at-bg-deep);
+  padding: 9px 12px;
   font-size: 13px;
-  color: #303133;
+  color: var(--at-text);
   cursor: pointer;
   text-align: left;
+  transition:
+    background-color var(--at-duration) var(--at-ease),
+    border-color var(--at-duration) var(--at-ease),
+    color var(--at-duration) var(--at-ease);
 }
 
 .panel-option:hover {
-  background: #ecf5ff;
+  background: var(--at-primary-soft);
 }
 
 .panel-option.selected {
-  background: #ecf5ff;
-  border-color: #409eff;
-  color: #409eff;
+  background: var(--at-primary-soft);
+  border-color: var(--at-primary);
+  color: var(--at-primary-active);
 }
 
 .panel-option-badge {
   flex: none;
-  width: 18px;
-  height: 18px;
-  border: 1px solid #c0c4cc;
-  border-radius: 4px;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--at-border-strong);
+  border-radius: 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 11px;
-  color: #606266;
-  background: #fff;
+  font-weight: 600;
+  color: var(--at-text-secondary);
+  background: var(--at-card);
 }
 
 .panel-option.selected .panel-option-badge {
-  border-color: #409eff;
-  color: #409eff;
+  border-color: var(--at-primary);
+  background: var(--at-primary);
+  color: #fff;
 }
 
 .panel-option-custom {
@@ -2586,14 +2852,14 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 8px 12px;
-  border-top: 1px solid #ebeef5;
+  padding: 10px 14px;
+  border-top: 1px solid var(--at-border);
 }
 
 /* 确认记录卡折叠摘要与展开入口（工单 0020） */
 .record-excerpt {
   font-size: 13px;
-  color: #909399;
+  color: var(--at-text-muted);
   padding: 2px 4px;
 }
 
@@ -2601,67 +2867,73 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-self: flex-start;
   border: none;
   background: none;
-  color: #409eff;
+  color: var(--at-primary);
   font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
-  padding: 0 4px;
+  padding: 2px 8px;
+  border-radius: var(--at-radius-full);
+  transition: background-color var(--at-duration) var(--at-ease);
 }
 
 .record-toggle:hover {
-  color: #66b1ff;
+  background: var(--at-primary-soft);
 }
 
 /* 澄清问答一体记录卡的答案行（工单 0020） */
 .clarify-a-text {
   font-size: 13px;
-  color: #409eff;
+  color: var(--at-primary-active);
   padding-left: 12px;
+  line-height: 1.6;
 }
 
 /* 轮次产物卡片（工单 0024） */
 .turn-result-reason {
   font-size: 13px;
-  color: #909399;
+  color: var(--at-text-muted);
   line-height: 1.6;
 }
 
 .turn-result-files {
-  border-top: 1px dashed #ebeef5;
+  border-top: 1px dashed var(--at-border);
   padding-top: 8px;
 }
 
 .turn-result-files-title {
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-muted);
   margin-bottom: 4px;
+  font-weight: 500;
 }
 
 .turn-result-file {
-  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-family: var(--at-font-mono);
   font-size: 12px;
-  color: #303133;
+  color: var(--at-text-secondary);
   padding: 2px 0 2px 12px;
   word-break: break-all;
 }
 
 .turn-result-file::before {
   content: '· ';
-  color: #67c23a;
+  color: var(--at-success);
+  font-weight: 700;
 }
 
 /* 越界段落清单（工单 0028 阶段一）：整块标红，与绿色改动清单形成裁决对照 */
 .turn-result-oos {
   margin-top: 8px;
-  padding: 8px 10px;
-  border: 1px solid #fbc4c4;
-  border-radius: 6px;
-  background: #fef0f0;
+  padding: 10px 12px;
+  border: 1px solid #fecaca;
+  border-radius: var(--at-radius-sm);
+  background: #fef2f2;
 }
 
 .turn-result-oos-title {
   font-size: 12px;
   font-weight: 600;
-  color: #f56c6c;
+  color: var(--at-danger);
   margin-bottom: 4px;
 }
 
@@ -2670,13 +2942,13 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   flex-direction: column;
   gap: 2px;
   padding: 4px 0;
-  border-top: 1px dashed #fbc4c4;
+  border-top: 1px dashed #fecaca;
   font-size: 12px;
-  color: #f56c6c;
+  color: var(--at-danger);
 }
 
 .turn-result-oos-loc {
-  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-family: var(--at-font-mono);
   font-weight: 600;
   word-break: break-all;
 }
@@ -2684,24 +2956,29 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
 .turn-result-oos-hint {
   margin-top: 6px;
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-muted);
   line-height: 1.6;
 }
 
+/* ---- 右栏：预览/代码 ---- */
 .right-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: #fafafa;
+  background: var(--at-card);
+  border: 1px solid var(--at-border);
+  border-radius: var(--at-radius-lg);
+  box-shadow: var(--at-shadow-sm);
   min-width: 0;
+  overflow: hidden;
 }
 
 .panel-header {
   display: flex;
   align-items: center;
-  padding: 8px 12px;
-  border-bottom: 1px solid #e4e7ed;
-  background: #fff;
+  padding: 10px var(--at-space-4);
+  border-bottom: 1px solid var(--at-border);
+  background: var(--at-bg-deep);
 }
 
 .preview-frame {
@@ -2711,13 +2988,14 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   background: #fff;
 }
 
+/* ---- 版本历史抽屉 ---- */
 .snapshot-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .snapshot-item {
@@ -2725,9 +3003,18 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--at-border);
+  border-radius: var(--at-radius-md);
+  background: var(--at-card);
+  transition:
+    border-color var(--at-duration) var(--at-ease),
+    box-shadow var(--at-duration) var(--at-ease);
+}
+
+.snapshot-item:hover {
+  border-color: var(--at-primary-border);
+  box-shadow: var(--at-shadow-sm);
 }
 
 .snapshot-actions {
@@ -2747,11 +3034,12 @@ async function runSse(path: string, body: unknown): Promise<ApiError | null> {
   gap: 6px;
   font-size: 14px;
   font-weight: 600;
+  color: var(--at-text);
 }
 
 .snapshot-meta {
   margin-top: 2px;
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-muted);
 }
 </style>

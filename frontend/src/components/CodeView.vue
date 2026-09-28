@@ -131,8 +131,8 @@ watch(
 .file-tree {
   width: 200px;
   min-width: 160px;
-  border-right: 1px solid #e4e7ed;
-  background: #fafafa;
+  border-right: 1px solid var(--at-border);
+  background: var(--at-bg-deep);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -144,8 +144,8 @@ watch(
   justify-content: space-between;
   padding: 8px 12px;
   font-size: 12px;
-  color: #909399;
-  border-bottom: 1px solid #ebeef5;
+  color: var(--at-text-muted);
+  border-bottom: 1px solid var(--at-border);
 }
 
 .file-list {
@@ -163,19 +163,24 @@ watch(
   background: transparent;
   text-align: left;
   font-size: 12px;
-  font-family: 'Cascadia Code', Consolas, monospace;
-  color: #303133;
+  font-family: var(--at-font-mono);
+  color: var(--at-text-secondary);
   cursor: pointer;
   word-break: break-all;
+  transition:
+    background-color var(--at-duration) var(--at-ease),
+    color var(--at-duration) var(--at-ease);
 }
 
 .file-item:hover {
-  background: #ecf5ff;
+  background: var(--at-primary-soft);
 }
 
 .file-item.active {
-  background: #d9ecff;
-  color: #409eff;
+  background: var(--at-primary-soft);
+  color: var(--at-primary);
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--at-primary);
 }
 
 .code-main {
@@ -195,12 +200,12 @@ watch(
   inset: auto 0 0 0;
   padding: 4px 12px;
   background: rgba(255, 255, 255, 0.9);
-  border-top: 1px solid #ebeef5;
+  border-top: 1px solid var(--at-border);
   font-size: 12px;
-  color: #909399;
+  color: var(--at-text-muted);
 }
 
 .code-overlay.error {
-  color: #f56c6c;
+  color: var(--at-danger);
 }
 </style>

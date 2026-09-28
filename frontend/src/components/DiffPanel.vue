@@ -149,13 +149,13 @@ watch(() => [props.projectId, props.snapshotId] as const, () => void load())
   justify-content: space-between;
   padding: 8px 12px;
   font-size: 13px;
-  color: #606266;
-  border-bottom: 1px solid #ebeef5;
+  color: var(--at-text-secondary);
+  border-bottom: 1px solid var(--at-border);
 }
 
 .diff-range {
   font-weight: 600;
-  color: #303133;
+  color: var(--at-text);
 }
 
 .diff-body {
@@ -170,8 +170,8 @@ watch(() => [props.projectId, props.snapshotId] as const, () => void load())
   list-style: none;
   margin: 0;
   padding: 4px;
-  border-right: 1px solid #e4e7ed;
-  background: #fafafa;
+  border-right: 1px solid var(--at-border);
+  background: var(--at-bg-deep);
   overflow-y: auto;
 }
 
@@ -186,20 +186,25 @@ watch(() => [props.projectId, props.snapshotId] as const, () => void load())
   background: transparent;
   text-align: left;
   font-size: 12px;
-  color: #303133;
+  color: var(--at-text-secondary);
   cursor: pointer;
+  transition:
+    background-color var(--at-duration) var(--at-ease),
+    color var(--at-duration) var(--at-ease);
 }
 
 .diff-item:hover {
-  background: #ecf5ff;
+  background: var(--at-primary-soft);
 }
 
 .diff-item.active {
-  background: #d9ecff;
+  background: var(--at-primary-soft);
+  color: var(--at-primary);
+  box-shadow: inset 2px 0 0 var(--at-primary);
 }
 
 .diff-path {
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--at-font-mono);
   word-break: break-all;
 }
 
@@ -223,10 +228,10 @@ watch(() => [props.projectId, props.snapshotId] as const, () => void load())
   justify-content: center;
   background: rgba(255, 255, 255, 0.9);
   font-size: 13px;
-  color: #909399;
+  color: var(--at-text-muted);
 }
 
 .diff-overlay.error {
-  color: #f56c6c;
+  color: var(--at-danger);
 }
 </style>

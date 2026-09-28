@@ -1,0 +1,184 @@
+/**
+ * Atoms Demo 全局设计令牌与基础样式
+ * 风格：AI-Native UI —— 紫罗兰主色 + 青色强调，浅色氛围背景，克制 chrome、突出内容。
+ * 所有页面/组件的颜色、圆角、阴影、间距均引用这里的 CSS 变量，禁止再散落硬编码色值。
+ */
+
+:root {
+  /* ---- 品牌色 ---- */
+  --at-primary: #7c3aed;
+  --at-primary-hover: #8b5cf6;
+  --at-primary-active: #6d28d9;
+  --at-primary-soft: #f3eeff; /* 主色浅底（选中态/标签底） */
+  --at-primary-border: #ddd6fe;
+  --at-secondary: #a78bfa;
+  --at-accent: #0891b2;
+  --at-accent-soft: #ecfeff;
+
+  /* ---- 语义色 ---- */
+  --at-success: #10b981;
+  --at-warning: #f59e0b;
+  --at-danger: #ef4444;
+  --at-info: #64748b;
+
+  /* ---- 中性色 ---- */
+  --at-bg: #faf9fe; /* 页面氛围底色（微微偏紫的白） */
+  --at-bg-deep: #f3f1fa; /* 次级底色/右栏 */
+  --at-card: #ffffff;
+  --at-text: #1e1b4b; /* 深靛蓝主文本，对紫底更协调 */
+  --at-text-secondary: #55526e;
+  --at-text-muted: #8b88a3;
+  --at-border: #e7e3f3;
+  --at-border-strong: #d8d3ea;
+
+  /* ---- 渐变 ---- */
+  --at-gradient-brand: linear-gradient(135deg, #7c3aed 0%, #0891b2 100%);
+  --at-gradient-soft: linear-gradient(160deg, #f5f0ff 0%, #eef9fb 100%);
+
+  /* ---- 圆角 ---- */
+  --at-radius-sm: 8px;
+  --at-radius-md: 12px;
+  --at-radius-lg: 16px;
+  --at-radius-full: 999px;
+
+  /* ---- 阴影 ---- */
+  --at-shadow-sm: 0 1px 2px rgba(30, 27, 75, 0.05);
+  --at-shadow-md: 0 4px 16px rgba(30, 27, 75, 0.08);
+  --at-shadow-lg: 0 12px 40px rgba(30, 27, 75, 0.14);
+  --at-shadow-glow: 0 4px 20px rgba(124, 58, 237, 0.25);
+
+  /* ---- 间距节奏（4/8 体系） ---- */
+  --at-space-1: 4px;
+  --at-space-2: 8px;
+  --at-space-3: 12px;
+  --at-space-4: 16px;
+  --at-space-5: 24px;
+  --at-space-6: 32px;
+  --at-space-7: 48px;
+
+  /* ---- 字体 ---- */
+  --at-font-sans:
+    'Inter', 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', Arial, sans-serif;
+  --at-font-mono:
+    ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+
+  /* ---- 动效 ---- */
+  --at-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --at-duration: 200ms;
+
+  /* ==== Element Plus 主题变量覆盖（映射到设计令牌） ==== */
+  --el-color-primary: var(--at-primary);
+  --el-color-primary-light-3: #9d6bf2;
+  --el-color-primary-light-5: #b794f6;
+  --el-color-primary-light-7: #d4c2fa;
+  --el-color-primary-light-8: #e3d9fc;
+  --el-color-primary-light-9: var(--at-primary-soft);
+  --el-color-primary-dark-2: var(--at-primary-active);
+  --el-color-success: var(--at-success);
+  --el-color-warning: var(--at-warning);
+  --el-color-danger: var(--at-danger);
+  --el-color-error: var(--at-danger);
+  --el-color-info: var(--at-info);
+  --el-text-color-primary: var(--at-text);
+  --el-text-color-regular: var(--at-text-secondary);
+  --el-text-color-secondary: var(--at-text-muted);
+  --el-border-color: var(--at-border-strong);
+  --el-border-color-light: var(--at-border);
+  --el-border-color-lighter: var(--at-border);
+  --el-border-radius-base: var(--at-radius-sm);
+  --el-border-radius-small: 6px;
+  --el-fill-color-blank: #ffffff;
+  --el-fill-color-light: #f6f4fc;
+  --el-bg-color: var(--at-card);
+  --el-bg-color-page: var(--at-bg);
+  --el-font-family: var(--at-font-sans);
+  --el-box-shadow-light: var(--at-shadow-md);
+}
+
+/* ---- 基础重置 ---- */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--at-font-sans);
+  background-color: var(--at-bg);
+  color: var(--at-text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---- 全局滚动条（细窄、圆角、悬停加深） ---- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--at-border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--at-border-strong);
+  border-radius: var(--at-radius-full);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--at-text-muted);
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- 键盘焦点可见性（无障碍） ---- */
+:focus-visible {
+  outline: 2px solid var(--at-primary);
+  outline-offset: 2px;
+}
+
+/* ---- Element Plus 组件细节统一 ---- */
+.el-card {
+  --el-card-border-radius: var(--at-radius-md);
+  border-color: var(--at-border);
+}
+
+.el-button {
+  transition:
+    background-color var(--at-duration) var(--at-ease),
+    border-color var(--at-duration) var(--at-ease),
+    color var(--at-duration) var(--at-ease),
+    box-shadow var(--at-duration) var(--at-ease);
+}
+
+.el-button--primary:not(.is-text):not(.is-link):hover {
+  box-shadow: var(--at-shadow-glow);
+}
+
+.el-dialog {
+  --el-dialog-border-radius: var(--at-radius-lg);
+}
+
+.el-drawer {
+  --el-drawer-padding-primary: 20px;
+}
+
+.el-tag {
+  --el-tag-border-radius: var(--at-radius-full);
+}
+
+/* ---- 动效减弱偏好（无障碍） ---- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
